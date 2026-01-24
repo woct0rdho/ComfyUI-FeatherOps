@@ -7,12 +7,13 @@ import triton
 
 from kernel.kernel import scaled_mm_naive, scaled_mm_triton
 
-scaled_mm_naive = torch.compile(scaled_mm_naive, fullgraph=True, mode="max-autotune-no-cudagraphs")
-scaled_mm_triton = torch.compile(scaled_mm_triton, fullgraph=True, mode="max-autotune-no-cudagraphs")
+scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, mode="max-autotune-no-cudagraphs")
+scaled_mm_triton_compiled = torch.compile(scaled_mm_triton, fullgraph=True, mode="max-autotune-no-cudagraphs")
 
 providers = {
     "torch": scaled_mm_naive,
-    "triton": scaled_mm_triton,
+    "torch_compiled": scaled_mm_naive_compiled,
+    "triton": scaled_mm_triton_compiled,
 }
 provider_names = list(providers)
 
