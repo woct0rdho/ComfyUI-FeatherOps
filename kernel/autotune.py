@@ -53,6 +53,25 @@ def get_autotune_configs() -> list[triton.Config]:
     return configs
 
 
+def exceeds_smem_capacity(
+    num_stages: int,
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+    BLOCK_SIZE_K: int,
+    a_dtype: torch.dtype,
+    b_dtype: torch.dtype,
+    smem_size: int,
+) -> bool:
+    a_size = BLOCK_SIZE_M * BLOCK_SIZE_K * a_dtype.itemsize
+    b_size = BLOCK_SIZE_K * BLOCK_SIZE_N * b_dtype.itemsize
+    if num_stages <= 1:
+        size = max(a_size, b_size)
+    else:
+        # (num_stages - 1) stages of both tiles will be cached in smem
+        size = (num_stages - 1) * (a_size + b_size)
+    return size > smem_size
+
+
 def _common_prune_criteria(smem_criteria: Callable, config: triton.Config, kwargs: dict[str, Any]) -> bool:
     num_stages = config.num_stages
     BLOCK_SIZE_M = config.kwargs["BLOCK_SIZE_M"]
