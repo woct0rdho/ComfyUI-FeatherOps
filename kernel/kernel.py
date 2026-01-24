@@ -27,6 +27,26 @@ def scaled_mm_naive(
     return c
 
 
+# Flush subnormals to signed zero
+@triton.jit
+def fp8e4m3fn_to_fp16(x):
+    x_u16 = x.to(tl.uint8, bitcast=True).to(tl.uint16)
+    sign = (x_u16 & 0x80) << 8
+    exp_mant = (x_u16 & 0x7F) << 7
+    exp_mant += 0x2000  # bias adjust: (15 - 7) << 10
+    bits = sign | exp_mant
+    bits = tl.where((x_u16 & 0x78) == 0, sign, bits)
+    return bits.to(tl.float16, bitcast=True)
+
+
+@triton.jit
+def cast_dtype(x, dtype: tl.constexpr):
+    if x.dtype == tl.float8e4nv and dtype == tl.float16:
+        return fp8e4m3fn_to_fp16(x)
+    else:
+        return x.to(dtype)
+
+
 @triton.autotune(
     configs=get_autotune_configs(),
     key=["M", "N", "K"],
@@ -91,8 +111,10 @@ def _scaled_mm_kernel(
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         mask_k = offs_k < K - k * BLOCK_SIZE_K
-        a = tl.load(a_ptrs, mask=mask_k[None, :]).to(mm_dtype)
-        b = tl.load(b_ptrs, mask=mask_k[:, None]).to(mm_dtype)
+        a = tl.load(a_ptrs, mask=mask_k[None, :])
+        b = tl.load(b_ptrs, mask=mask_k[:, None])
+        a = cast_dtype(a, mm_dtype)
+        b = cast_dtype(b, mm_dtype)
         acc = tl.dot(a, b, acc)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
