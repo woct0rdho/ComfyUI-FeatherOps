@@ -7,7 +7,7 @@ from comfy.ops import (
     uncast_bias_weight,
 )
 
-from .kernel import scaled_mm
+from .kernel.kernel import scaled_mm
 
 
 def easy_mixed_precision_ops(compute_dtype=torch.bfloat16):

@@ -3,7 +3,7 @@
 
 import torch
 
-from kernel import scaled_mm, scaled_mm_naive
+from kernel.kernel import scaled_mm, scaled_mm_naive
 
 
 def main():
