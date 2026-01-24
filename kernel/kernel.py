@@ -1,12 +1,13 @@
+from functools import partial
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-from torch.library import triton_op, wrap_triton
+
+from .autotune import exceeds_smem_capacity, get_autotune_configs, prune_configs
 
 
-@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def scaled_mm_naive(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -26,6 +27,12 @@ def scaled_mm_naive(
     return c
 
 
+@triton.autotune(
+    configs=get_autotune_configs(),
+    key=["M", "N", "K"],
+    prune_configs_by={"early_config_prune": partial(prune_configs, exceeds_smem_capacity)},
+    cache_results=True,
+)
 @triton.jit
 def _scaled_mm_kernel(
     # Pointers
@@ -108,20 +115,12 @@ def _scaled_mm_kernel(
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
-@triton_op("feather::scaled_mm_triton", mutates_args={})
-def _scaled_mm_triton(
+def scaled_mm_triton(
     a: torch.Tensor,
     b: torch.Tensor,
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
-    # Metadata
-    BLOCK_SIZE_M: int = 64,
-    BLOCK_SIZE_N: int = 64,
-    BLOCK_SIZE_K: int = 64,
-    GROUP_SIZE_M: int = 8,
-    NUM_WARPS: int = 8,
-    NUM_STAGES: int = 4,
 ) -> torch.Tensor:
     assert a.is_cuda
     assert b.device == a.device
@@ -140,8 +139,8 @@ def _scaled_mm_triton(
     _, N = b.shape
     c = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-    wrap_triton(_scaled_mm_kernel)[grid](
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
+    _scaled_mm_kernel[grid](
         # Pointers
         a,
         b,
@@ -161,17 +160,8 @@ def _scaled_mm_triton(
         c.stride(1),
         HAS_SCALE=(scale is not None),
         HAS_BIAS=(bias is not None),
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES,
     )
     return c
-
-
-scaled_mm_triton = torch.ops.feather.scaled_mm_triton.default
 
 
 def scaled_mm(
