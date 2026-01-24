@@ -5,7 +5,7 @@ import gc
 import torch
 import triton
 
-from kernel import scaled_mm, scaled_mm_naive
+from kernel.kernel import scaled_mm, scaled_mm_naive
 
 providers = {
     "torch": scaled_mm_naive,
