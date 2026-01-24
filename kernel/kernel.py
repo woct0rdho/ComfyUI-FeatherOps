@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from torch.library import triton_op, wrap_triton
 
 
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
@@ -107,7 +108,8 @@ def _scaled_mm_kernel(
     tl.store(c_ptrs, acc, mask=c_mask)
 
 
-def scaled_mm(
+@triton_op("feather::scaled_mm_triton", mutates_args={})
+def _scaled_mm_triton(
     a: torch.Tensor,
     b: torch.Tensor,
     scale: Optional[torch.Tensor],
@@ -134,16 +136,12 @@ def scaled_mm(
         assert bias.is_contiguous()
         assert bias.numel() == b.shape[1]
 
-    native_dtypes = {torch.float16, torch.bfloat16, torch.float32}
-    if a.dtype in native_dtypes and b.dtype in native_dtypes:
-        return scaled_mm_naive(a, b, scale, bias, out_dtype)
-
     M, K = a.shape
     _, N = b.shape
     c = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
     grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-    _scaled_mm_kernel[grid](
+    wrap_triton(_scaled_mm_kernel)[grid](
         # Pointers
         a,
         b,
@@ -171,3 +169,20 @@ def scaled_mm(
         num_stages=NUM_STAGES,
     )
     return c
+
+
+scaled_mm_triton = torch.ops.feather.scaled_mm_triton.default
+
+
+def scaled_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    native_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+    if a.dtype in native_dtypes and b.dtype in native_dtypes:
+        return scaled_mm_naive(a, b, scale, bias, out_dtype)
+    else:
+        return scaled_mm_triton(a, b, scale, bias, out_dtype)

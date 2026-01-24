@@ -3,7 +3,7 @@
 
 import torch
 
-from kernel.kernel import scaled_mm, scaled_mm_naive
+from kernel.kernel import scaled_mm_naive, scaled_mm_triton
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
     a = a.to(a_dtype)
     b = b.to(b_dtype)
 
-    out_triton = scaled_mm(a, b, scale, bias, out_dtype)
+    out_triton = scaled_mm_triton(a, b, scale, bias, out_dtype)
 
     out_ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
 
