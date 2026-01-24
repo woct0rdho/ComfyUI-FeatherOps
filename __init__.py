@@ -4,6 +4,8 @@ import comfy.ops
 
 from .ops import easy_mixed_precision_ops
 
+logging.warning(f"The custom node ComfyUI-FeatherOps is enabled, which is currently WIP and overrides the native mixed precision ops. Use at your own risk.")
+
 
 def _pick_operations(weight_dtype, compute_dtype, *args, **kwargs):
     logging.info(f"Using easy_mixed_precision_ops({compute_dtype})")
