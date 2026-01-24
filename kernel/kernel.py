@@ -1,11 +1,8 @@
-from functools import partial
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
-from .autotune import get_autotune_configs, prune_configs
 
 
 @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
@@ -20,38 +17,14 @@ def scaled_mm_naive(
     a = a.to(mm_dtype)
     b = b.to(mm_dtype)
     c = a @ b
+    c = c.to(out_dtype)
     if scale is not None:
         c *= scale.to(c.dtype)
     if bias is not None:
         c += bias.to(c.dtype)
-    return c.to(out_dtype)
+    return c
 
 
-def exceeds_smem_capacity(
-    num_stages: int,
-    BLOCK_SIZE_M: int,
-    BLOCK_SIZE_N: int,
-    BLOCK_SIZE_K: int,
-    a_dtype: torch.dtype,
-    b_dtype: torch.dtype,
-    smem_size: int,
-) -> bool:
-    a_size = BLOCK_SIZE_M * BLOCK_SIZE_K * a_dtype.itemsize
-    b_size = BLOCK_SIZE_K * BLOCK_SIZE_N * b_dtype.itemsize
-    if num_stages <= 1:
-        size = max(a_size, b_size)
-    else:
-        # (num_stages - 1) stages of both tiles will be cached in smem
-        size = (num_stages - 1) * (a_size + b_size)
-    return size > smem_size
-
-
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=["M", "N", "K"],
-    prune_configs_by={"early_config_prune": partial(prune_configs, exceeds_smem_capacity)},
-    cache_results=True,
-)
 @triton.jit
 def _scaled_mm_kernel(
     # Pointers
@@ -74,10 +47,10 @@ def _scaled_mm_kernel(
     # Metadata
     HAS_SCALE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr = 64,
-    BLOCK_SIZE_N: tl.constexpr = 64,
-    BLOCK_SIZE_K: tl.constexpr = 64,
-    GROUP_SIZE_M: tl.constexpr = 8,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ) -> None:
     mm_dtype = tl.float16
 
@@ -116,6 +89,8 @@ def _scaled_mm_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
+    acc = acc.to(c_ptr.dtype.element_ty)
+
     if HAS_SCALE:
         scale = tl.load(scale_ptr).to(acc.dtype)
         acc *= scale
@@ -124,8 +99,6 @@ def _scaled_mm_kernel(
         bias_ptrs = bias_ptr + offs_bn
         bias = tl.load(bias_ptrs, mask=offs_bn < N).to(acc.dtype)
         acc += bias[None, :]
-
-    acc = acc.to(c_ptr.dtype.element_ty)
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -140,8 +113,13 @@ def scaled_mm(
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
-    # BLOCK_SIZE_M: tl.constexpr = 64,
-    # BLOCK_SIZE_N: tl.constexpr = 64,
+    # Metadata
+    BLOCK_SIZE_M: int = 64,
+    BLOCK_SIZE_N: int = 64,
+    BLOCK_SIZE_K: int = 64,
+    GROUP_SIZE_M: int = 8,
+    NUM_WARPS: int = 8,
+    NUM_STAGES: int = 4,
 ) -> torch.Tensor:
     assert a.is_cuda
     assert b.device == a.device
@@ -164,8 +142,7 @@ def scaled_mm(
     _, N = b.shape
     c = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
-    # grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
     _scaled_mm_kernel[grid](
         # Pointers
         a,
@@ -186,9 +163,11 @@ def scaled_mm(
         c.stride(1),
         HAS_SCALE=(scale is not None),
         HAS_BIAS=(bias is not None),
-        # BLOCK_SIZE_M=BLOCK_SIZE_M,
-        # BLOCK_SIZE_N=BLOCK_SIZE_N,
-        # BLOCK_SIZE_K=64,
-        # GROUP_SIZE_M=8,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        num_warps=NUM_WARPS,
+        num_stages=NUM_STAGES,
     )
     return c
