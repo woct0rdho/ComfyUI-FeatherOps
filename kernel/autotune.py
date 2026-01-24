@@ -12,12 +12,8 @@ DEFAULT_BLOCK_SIZES_M = [16, 32, 64, 128, 256]
 DEFAULT_BLOCK_SIZES_N = [16, 32, 64, 128, 256]
 DEFAULT_BLOCK_SIZES_K = [16, 32, 64, 128, 256]
 if torch.version.hip:
-    gcn_arch_name = getattr(torch.cuda.get_device_properties(), "gcnArchName", None)
-    if gcn_arch_name == "gfx1151":
-        DEFAULT_GROUP_SIZES_M = [4]
-    else:
-        DEFAULT_GROUP_SIZES_M = [4, 6, 8]
-    DEFAULT_NUM_WARPS = [4]
+    DEFAULT_GROUP_SIZES_M = [4, 6, 8]
+    DEFAULT_NUM_WARPS = [4, 8]
     DEFAULT_NUM_STAGES = [2]
 else:
     DEFAULT_GROUP_SIZES_M = [8]
