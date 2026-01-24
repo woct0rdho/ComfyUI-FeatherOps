@@ -4,8 +4,8 @@ import torch
 
 from kernel.kernel import scaled_mm_naive, scaled_mm_triton
 
-# scaled_mm_naive = torch.compile(scaled_mm_naive, fullgraph=True, mode="max-autotune-no-cudagraphs")
-# scaled_mm_triton = torch.compile(scaled_mm_triton, fullgraph=True, mode="max-autotune-no-cudagraphs")
+# scaled_mm_naive = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+# scaled_mm_triton = torch.compile(scaled_mm_triton, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
 def main():
