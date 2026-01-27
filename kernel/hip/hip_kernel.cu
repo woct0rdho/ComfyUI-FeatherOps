@@ -582,33 +582,29 @@ torch::Tensor scaled_mm_k0mk1(
     };
 
     bool launched =
-        // 128x128 tile matching CK's MT128x128x32 (various thread configs)
-        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||  // 128 threads
-        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||  // 256 threads
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||  // 256 threads
-        // try_launch(ConfigTagK0MK1<4, 4, 2, 2, 2, 2>{}) ||  // 512 threads
-        // Main configs: warps=(2,4), repeat=(4,4)
-        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<1, 4, 2, 2, 8, 2>{}) ||
+        try_launch(ConfigTagK0MK1<1, 4, 4, 4, 8, 2>{}) ||
+        try_launch(ConfigTagK0MK1<4, 1, 4, 4, 2, 8>{}) ||
+        try_launch(ConfigTagK0MK1<1, 2, 4, 4, 8, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 1, 4, 4, 4, 8>{}) ||
+        try_launch(ConfigTagK0MK1<1, 1, 4, 4, 8, 8>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 2, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
-        // Smaller tiles for small matrices
-        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 2, 2>{}) ||
-        // try_launch(ConfigTagK0MK1<2, 4, 2, 2, 2, 2>{}) ||
-        try_launch(ConfigTagK0MK1<4, 4, 4, 4, 2, 2>{}) ||
-        // Single stage for minimal LDS
-        // try_launch(ConfigTagK0MK1<2, 4, 1, 1, 4, 4>{}) ||
-        // Large matrix optimized: 1x4 warps for higher N coverage
+        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<1, 4, 4, 4, 8, 4>{}) ||
-        // Large matrix: 1x8 warps (matching original HIP best config)
         try_launch(ConfigTagK0MK1<1, 8, 4, 4, 8, 2>{}) ||
-        // 2x2 warps with larger repeat
-        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 8>{}) ||
-        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 8, 4>{}) ||
-        // Large matrix optimized: 4x4 warps for better load balancing
-        // try_launch(ConfigTagK0MK1<4, 4, 4, 4, 4, 4>{}) || // LDS overflow
-        // 2x8 warps for wide N coverage
         try_launch(ConfigTagK0MK1<2, 8, 4, 4, 4, 2>{}) ||
-        // 4x2 warps for tall M coverage
-        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 4, 4>{});
+        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 2, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 8, 4>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 8>{}) ||
+        try_launch(ConfigTagK0MK1<4, 4, 4, 4, 2, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 4, 4, 4>{});
 
     TORCH_CHECK(launched, "Unsupported K0MK1 config");
     return c;
