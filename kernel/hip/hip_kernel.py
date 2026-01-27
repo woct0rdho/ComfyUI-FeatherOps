@@ -89,34 +89,40 @@ def _load_hip_extension():
 # Constraint: kStages * kK0 * kBlockM * kK1 >= numWarps * 16 * 24 (C-shuffle buffer)
 # Simplified: kStages * 2 * kRepeatM >= kBlockWarpsN * 3
 _CONFIGS = []
-# 128x128 tile matching CK's MT128x128x32 (various thread configs)
-_CONFIGS.append((2, 2, 2, 2, 4, 4))  # BlockM=128, BlockN=128, 128 threads
-_CONFIGS.append((4, 2, 2, 2, 2, 4))  # BlockM=128, BlockN=128, 256 threads
-_CONFIGS.append((2, 4, 2, 2, 4, 2))  # BlockM=128, BlockN=128, 256 threads
-# _CONFIGS.append((4, 4, 2, 2, 2, 2))  # C-shuffle overflow: 2*2*2=8 < 4*3=12
-# Main configs: warps=(2,4), repeat=(4,4)
-_CONFIGS.append((2, 4, 4, 4, 4, 4))
+# 128x128 tile: baseline and low-LDS variants
+_CONFIGS.append((2, 2, 2, 2, 4, 4))  # 128 threads
+_CONFIGS.append((4, 2, 2, 2, 2, 4))  # 256 threads
+_CONFIGS.append((2, 4, 2, 2, 4, 2))  # 256 threads
+_CONFIGS.append((2, 2, 4, 4, 4, 4))  # 128 threads
+_CONFIGS.append((1, 4, 2, 2, 8, 2))  # 128 threads, low LDS
+_CONFIGS.append((1, 4, 4, 4, 8, 2))  # 128 threads, deeper unroll
+_CONFIGS.append((4, 1, 4, 4, 2, 8))  # 128 threads, tall M
+_CONFIGS.append((1, 2, 4, 4, 8, 4))  # 64 threads
+_CONFIGS.append((2, 1, 4, 4, 4, 8))  # 64 threads
+_CONFIGS.append((1, 1, 4, 4, 8, 8))  # 32 threads
+_CONFIGS.append((2, 4, 4, 4, 4, 2))  # 256 threads, blockN=128
+_CONFIGS.append((4, 2, 4, 4, 2, 4))  # 256 threads, blockN=128
+
+# 128x256 tile: main configs and variants
 _CONFIGS.append((2, 4, 2, 2, 4, 4))
-# Smaller tiles for small matrices
-_CONFIGS.append((2, 4, 4, 4, 2, 2))
-# _CONFIGS.append((2, 4, 2, 2, 2, 2))  # C-shuffle overflow: 2*2*2=8 < 4*3=12
-_CONFIGS.append((4, 4, 4, 4, 2, 2))
-# Single stage - disabled due to C-shuffle overflow
-# _CONFIGS.append((2, 4, 1, 1, 4, 4))  # C-shuffle overflow: 1*2*4=8 < 4*3=12
-# Large matrix optimized: 1x4 warps for higher N coverage
+_CONFIGS.append((2, 4, 4, 4, 4, 4))
 _CONFIGS.append((1, 4, 4, 4, 8, 4))
-# Large matrix: 1x8 warps (matching original HIP best config)
 _CONFIGS.append((1, 8, 4, 4, 8, 2))
-# 2x2 warps with larger repeat
-_CONFIGS.append((2, 2, 4, 4, 4, 8))
+_CONFIGS.append((2, 8, 4, 4, 4, 2))
+_CONFIGS.append((2, 4, 4, 4, 2, 2))  # 64x128
+
+# 256x128 tile: large-M coverage
 _CONFIGS.append((2, 2, 4, 4, 8, 4))
-# Large matrix optimized: 4x4 warps for better load balancing
-# _CONFIGS.append((4, 4, 4, 4, 4, 4))  # BlockM=256, BlockN=256 - LDS overflow
-# 2x8 warps for wide N coverage
-_CONFIGS.append((2, 8, 4, 4, 4, 2))  # BlockM=128, BlockN=256
-# 4x2 warps for tall M coverage
-_CONFIGS.append((4, 2, 4, 4, 4, 4))  # BlockM=256, BlockN=128
-_CONFIGS = sorted(set(_CONFIGS))
+_CONFIGS.append((4, 2, 4, 4, 4, 4))
+
+# 128x256 tile variants
+_CONFIGS.append((2, 2, 4, 4, 4, 8))
+
+# 128x128 tile with small K unroll
+_CONFIGS.append((4, 4, 4, 4, 2, 2))
+
+# Preserve order while removing duplicates
+_CONFIGS = list(dict.fromkeys(_CONFIGS))
 
 _AUTOTUNE_CACHE = {}
 
