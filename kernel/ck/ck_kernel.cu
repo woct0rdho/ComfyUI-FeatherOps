@@ -48,8 +48,8 @@ using S = ck::Sequence<Is...>;
 
 __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
 {
-    uint16_t x_u16 = static_cast<uint16_t>(x);
-    uint16_t sign = static_cast<uint16_t>((x_u16 & 0x80u) << 8);
+    const uint16_t x_u16 = static_cast<uint16_t>(x);
+    const uint16_t sign = static_cast<uint16_t>((x_u16 & 0x80u) << 8);
     uint16_t exp_mant = static_cast<uint16_t>((x_u16 & 0x7Fu) << 7);
     exp_mant = static_cast<uint16_t>(exp_mant + 0x2000u);
     uint16_t bits = static_cast<uint16_t>(sign | exp_mant);
@@ -63,7 +63,7 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
 
 __global__ void fp8_to_half_kernel(const uint8_t* src, half* dst, int64_t count)
 {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx < count) {
         dst[idx] = fp8e4m3fn_to_half(src[idx]);
     }
@@ -103,13 +103,13 @@ template <
     bool TRANSB = false>
 void gemm_impl_wmma_noswap(CUDABLAS_GEMM_ARGTYPES(Dtype))
 {
-    int M = m;
-    int N = n;
-    int K = k;
+    const int M = m;
+    const int N = n;
+    const int K = k;
 
-    int StrideA = lda;
-    int StrideB = ldb;
-    int StrideC = ldc;
+    const int StrideA = lda;
+    const int StrideB = ldb;
+    const int StrideC = ldc;
 
     using ADataType = typename at::native::CkMathType<Dtype>::dtype;
     using BDataType = typename at::native::CkMathType<Dtype>::dtype;
@@ -199,7 +199,7 @@ void gemm_impl_wmma_noswap(CUDABLAS_GEMM_ARGTYPES(Dtype))
         TORCH_CHECK(false, "device_gemm does not support this GEMM problem");
     }
 
-    auto stream = at::cuda::getCurrentHIPStream().stream();
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
     invoker.Run(argument, StreamConfig{stream, false});
 }
 
@@ -214,11 +214,11 @@ __global__ void scale_bias_kernel(
     int has_scale,
     int has_bias)
 {
-    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t total = M * N;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = M * N;
     if (idx < total) {
-        int64_t m = idx / N;
-        int64_t n = idx - m * N;
+        const int64_t m = idx / N;
+        const int64_t n = idx - m * N;
         half val = c[m * stride_cm + n * stride_cn];
         if (has_scale) {
             val = __hmul(val, __float2half_rn(scale[0]));
@@ -231,10 +231,10 @@ __global__ void scale_bias_kernel(
 }
 
 torch::Tensor scaled_mm_ck(
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor scale,
-    torch::Tensor bias,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scale,
+    const torch::Tensor& bias,
     bool has_scale,
     bool has_bias)
 {
@@ -263,8 +263,8 @@ torch::Tensor scaled_mm_ck(
     half* b_half_ptr = reinterpret_cast<half*>(b_half.data_ptr<at::Half>());
     auto stream = at::cuda::getCurrentCUDAStream();
     constexpr int kThreads = 256;
-    int64_t b_count = b.numel();
-    int64_t blocks = (b_count + kThreads - 1) / kThreads;
+    const int64_t b_count = b.numel();
+    const int64_t blocks = (b_count + kThreads - 1) / kThreads;
     hipLaunchKernelGGL(
         fp8_to_half_kernel,
         dim3(static_cast<uint32_t>(blocks), 1, 1),
@@ -275,14 +275,14 @@ torch::Tensor scaled_mm_ck(
         b_half_ptr,
         b_count);
 
-    bool use_padding = ((a.size(0) % 256 != 0) || (b.size(1) % 128 != 0) || (a.size(1) % 64 != 0));
-    auto a_ptr = reinterpret_cast<const at::Half*>(a.data_ptr<at::Half>());
-    auto b_gemm_ptr = reinterpret_cast<const at::Half*>(b_half.data_ptr<at::Half>());
+    const bool use_padding = ((a.size(0) % 256 != 0) || (b.size(1) % 128 != 0) || (a.size(1) % 64 != 0));
+    const auto a_ptr = reinterpret_cast<const at::Half*>(a.data_ptr<at::Half>());
+    const auto b_gemm_ptr = reinterpret_cast<const at::Half*>(b_half.data_ptr<at::Half>());
     auto c_ptr = reinterpret_cast<at::Half*>(c.data_ptr<at::Half>());
     constexpr auto transa = 'n';
     constexpr auto transb = 'n';
-    float alpha = 1.0f;
-    float beta = 0.0f;
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
 
     if (use_padding) {
         gemm_impl_wmma_noswap<
@@ -355,8 +355,8 @@ torch::Tensor scaled_mm_ck(
     }
 
     if (has_scale || has_bias) {
-        int64_t total = a.size(0) * b.size(1);
-        int64_t sb_blocks = (total + kThreads - 1) / kThreads;
+        const int64_t total = a.size(0) * b.size(1);
+        const int64_t sb_blocks = (total + kThreads - 1) / kThreads;
         hipLaunchKernelGGL(
             scale_bias_kernel,
             dim3(static_cast<uint32_t>(sb_blocks), 1, 1),

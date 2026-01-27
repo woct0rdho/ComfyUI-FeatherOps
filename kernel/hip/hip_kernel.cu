@@ -32,9 +32,9 @@ constexpr int kK0 = kWmmaK / kK1;
 
 __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
 {
-    uint16_t x_u16 = static_cast<uint16_t>(x);
-    uint16_t sign = (x_u16 & 0x80u) << 8;
-    uint16_t exp_mant = (x_u16 & 0x7Fu) << 7;
+    const uint16_t x_u16 = static_cast<uint16_t>(x);
+    const uint16_t sign = static_cast<uint16_t>((x_u16 & 0x80u) << 8);
+    uint16_t exp_mant = static_cast<uint16_t>((x_u16 & 0x7Fu) << 7);
     exp_mant = static_cast<uint16_t>(exp_mant + 0x2000u);
     uint16_t bits = static_cast<uint16_t>(sign | exp_mant);
     if ((x_u16 & 0x78u) == 0u) {
@@ -143,17 +143,17 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     __shared__ half sh_a[kStages][kK0][kBlockM][kK1];
     __shared__ half sh_b[kStages][kWmmaK][kBlockN + kBPad];
 
-    int block_m = static_cast<int>(blockIdx.y) * kBlockM;
-    int block_n = static_cast<int>(blockIdx.x) * kBlockN;
+    const int block_m = static_cast<int>(blockIdx.y) * kBlockM;
+    const int block_n = static_cast<int>(blockIdx.x) * kBlockN;
 
-    int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+    const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
     constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
 
     // Wave ID and position
-    int wave_id = (threadIdx.x / kWaveSize) + threadIdx.y * (blockDim.x / kWaveSize);
-    int warp_m = wave_id % kBlockWarpsM;
-    int warp_n = wave_id / kBlockWarpsM;
-    int lane = threadIdx.x % kWaveSize;
+    const int wave_id = (threadIdx.x / kWaveSize) + threadIdx.y * (blockDim.x / kWaveSize);
+    const int warp_m = wave_id % kBlockWarpsM;
+    const int warp_n = wave_id / kBlockWarpsM;
+    const int lane = threadIdx.x % kWaveSize;
 
     // Accumulator registers: 8 floats per WMMA tile in wave32 mode
     constexpr int kRepeatTiles = kRepeatM * kRepeatN;
@@ -175,15 +175,15 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         // Load A into K0×M×K1 layout
         // Each thread loads one vec8 (8 halfs = 16 bytes)
         for (int v = 0; v < kAVecsPerThread; ++v) {
-            int vec_idx = tid + v * kThreads;
+            const int vec_idx = tid + v * kThreads;
             if (vec_idx >= kAVecs) continue;
 
             // Decode vec_idx to [k0][m] position
-            int k0 = vec_idx / kBlockM;
-            int m = vec_idx % kBlockM;
+            const int k0 = vec_idx / kBlockM;
+            const int m = vec_idx % kBlockM;
 
-            int64_t a_row = block_m + m;
-            int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
+            const int64_t a_row = block_m + m;
+            const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
 
             bool row_in = true;
             if constexpr (kCheckBounds) {
@@ -198,11 +198,11 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             }
 
             // vec8 load (16 bytes)
-            bool can_vec = in_bounds && (stride_ak == 1) &&
+            const bool can_vec = in_bounds && (stride_ak == 1) &&
                 ((reinterpret_cast<uintptr_t>(a_ptr) & 0xFu) == 0u);
 
             if (can_vec) {
-                uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
+                const uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
                 *reinterpret_cast<uint4*>(&sh_a[stage][k0][m][0]) = packed;
             } else {
                 // Scalar fallback
@@ -231,14 +231,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     auto load_b_lds = [&](int stage, int64_t kk) {
         // Load B with vec16 fp8→fp16 conversion, store to K×N layout
         for (int v = 0; v < kBVecsPerThread; ++v) {
-            int vec_idx = tid + v * kThreads;
-            int elem_base = vec_idx * 16;
+            const int vec_idx = tid + v * kThreads;
+            const int elem_base = vec_idx * 16;
             if (elem_base >= kBElements) continue;
 
-            int row = elem_base / kBlockN;
-            int col = elem_base % kBlockN;
-            int64_t b_row = kk + row;
-            int64_t b_col = block_n + col;
+            const int row = elem_base / kBlockN;
+            const int col = elem_base % kBlockN;
+            const int64_t b_row = kk + row;
+            const int64_t b_col = block_n + col;
 
             bool row_in = true;
             if constexpr (kCheckBounds) {
@@ -250,12 +250,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             if constexpr (kCheckBounds) {
                 in_bounds = in_bounds && (b_col + 15 < N);
             }
-            bool can_vec = in_bounds && (stride_bn == 1) &&
+            const bool can_vec = in_bounds && (stride_bn == 1) &&
                 ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
 
             if (can_vec) {
-                uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
-                uint32_t* p32 = reinterpret_cast<uint32_t*>(&packed);
+                const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
+                const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
                 half h[16];
                 for(int j=0; j<4; ++j) {
                     uint32_t p = p32[j];
@@ -300,7 +300,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         if (valid_u0 > kUnrollK) valid_u0 = kUnrollK;
     }
     for (int u = 0; u < valid_u0; ++u) {
-        int64_t kk = k0_iter + static_cast<int64_t>(u) * kWmmaK;
+        const int64_t kk = k0_iter + static_cast<int64_t>(u) * kWmmaK;
         load_a_lds_k0mk1(u, kk);
         load_b_lds(u, kk);
     }
@@ -309,7 +309,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     // Main loop
     for (k0_iter = 0; k0_iter < K; k0_iter += kWmmaK * kUnrollK) {
         __builtin_amdgcn_sched_barrier(0);
-        int64_t k_next = k0_iter + static_cast<int64_t>(kUnrollK) * kWmmaK;
+        const int64_t k_next = k0_iter + static_cast<int64_t>(kUnrollK) * kWmmaK;
 
         if constexpr (kOverlap) {
             if (k_next < K) {
@@ -320,8 +320,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
                 }
                 for (int u = 0; u < valid_u_next; ++u) {
-                    int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    int stage = (stage_base + kUnrollK + u) % kStages;
+                    const int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    const int stage = (stage_base + kUnrollK + u) % kStages;
                     load_a_lds_k0mk1(stage, kk);
                     load_b_lds(stage, kk);
                 }
@@ -337,33 +337,33 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 if (valid_u > kUnrollK) valid_u = kUnrollK;
             }
             for (int u = 0; u < valid_u; ++u) {
-                int stage = (stage_base + u) % kStages;
+                const int stage = (stage_base + u) % kStages;
                 for (int rm = 0; rm < kRepeatM; ++rm) {
                     for (int rn = 0; rn < kRepeatN; ++rn) {
-                        int repeat_idx = rm * kRepeatN + rn;
-                        int tile_m = warp_m + rm * kBlockWarpsM;
-                        int tile_n = warp_n + rn * kBlockWarpsN;
+                        const int repeat_idx = rm * kRepeatN + rn;
+                        const int tile_m = warp_m + rm * kBlockWarpsM;
+                        const int tile_n = warp_n + rn * kBlockWarpsN;
 
                         // Load A from K0×M×K1 layout into registers
                         // WMMA needs 16 halfs per thread in wave32
                         // A matrix: swizzled access pattern matching CK
-                        int lane_in_subgroup = lane % 16;
+                        const int lane_in_subgroup = lane % 16;
 
                         // CK uses swizzled access: ((lane & 1) << 3) | (lane >> 1)
                         // This maps lane 0-15 to m positions: 0,8,1,9,2,10,3,11,4,12,5,13,6,14,7,15
                         // Even lanes get M rows 0-7, odd lanes get M rows 8-15
                         // Both subgroups (lanes 0-15 and 16-31) read the same M rows (duplication)
-                        int swizzled_lane = ((lane_in_subgroup & 1) << 3) | (lane_in_subgroup >> 1);
+                        const int swizzled_lane = ((lane_in_subgroup & 1) << 3) | (lane_in_subgroup >> 1);
 
                         // Load 16 K elements for this lane's A data
                         // From K0×M×K1: [k0][m][k1] where k0=0..1, k1=0..7
                         // m_row uses swizzled_lane directly (0-15), no subgroup offset
-                        int m_row = tile_m * kWmmaM + swizzled_lane;
+                        const int m_row = tile_m * kWmmaM + swizzled_lane;
                         half reg_a[16];
                         for (int k0 = 0; k0 < kK0; ++k0) {
                             // Read vec8 from LDS (this is the key optimization!)
-                            uint4 a_vec = *reinterpret_cast<uint4*>(&sh_a[stage][k0][m_row][0]);
-                            half* a_halfs = reinterpret_cast<half*>(&a_vec);
+                            const uint4 a_vec = *reinterpret_cast<uint4*>(&sh_a[stage][k0][m_row][0]);
+                            const half* a_halfs = reinterpret_cast<const half*>(&a_vec);
                             for (int k1 = 0; k1 < kK1; ++k1) {
                                 reg_a[k0 * kK1 + k1] = a_halfs[k1];
                             }
@@ -371,7 +371,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                         // Load B from K×N layout
                         _Float16 reg_b[16];
-                        int n_col = tile_n * kWmmaN + lane_in_subgroup;
+                        const int n_col = tile_n * kWmmaN + lane_in_subgroup;
                         for (int k = 0; k < kWmmaK; ++k) {
                             reg_b[k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
                         }
@@ -387,8 +387,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                             reg_a_fp16[i] = static_cast<_Float16>(reg_a[i]);
                         }
 
-                        fp16x16_t a_frag = *reinterpret_cast<fp16x16_t*>(reg_a_fp16);
-                        fp16x16_t b_frag = *reinterpret_cast<fp16x16_t*>(reg_b);
+                        const fp16x16_t a_frag = *reinterpret_cast<fp16x16_t*>(reg_a_fp16);
+                        const fp16x16_t b_frag = *reinterpret_cast<fp16x16_t*>(reg_b);
                         float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
 
                         c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
@@ -409,8 +409,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
                 }
                 for (int u = 0; u < valid_u_next; ++u) {
-                    int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    int stage = (stage_base + u) % kStages;
+                    const int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    const int stage = (stage_base + u) % kStages;
                     load_a_lds_k0mk1(stage, kk);
                     load_b_lds(stage, kk);
                 }
@@ -431,23 +431,23 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
         half* my_sh_c = reinterpret_cast<half*>(&sh_a[0][0][0][0]) + wave_id * kWmmaM * kCStride;
 
-        half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
-        int subgroup = lane / 16;
-        int lane_in_subgroup = lane % 16;
+        const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
+        const int subgroup = lane / 16;
+        const int lane_in_subgroup = lane % 16;
 
         for (int rm = 0; rm < kRepeatM; ++rm) {
             for (int rn = 0; rn < kRepeatN; ++rn) {
-                int repeat_idx = rm * kRepeatN + rn;
-                int tile_m = warp_m + rm * kBlockWarpsM;
-                int tile_n = warp_n + rn * kBlockWarpsN;
-                int64_t tile_m_base = block_m + tile_m * kWmmaM;
-                int64_t tile_n_base = block_n + tile_n * kWmmaN;
+                const int repeat_idx = rm * kRepeatN + rn;
+                const int tile_m = warp_m + rm * kBlockWarpsM;
+                const int tile_n = warp_n + rn * kBlockWarpsN;
+                const int64_t tile_m_base = block_m + tile_m * kWmmaM;
+                const int64_t tile_n_base = block_n + tile_n * kWmmaN;
 
                 // Step 1: Write acc to LDS in column-major order (WMMA layout)
                 // Each thread writes 8 values to one column
-                int col = lane_in_subgroup;
+                const int col = lane_in_subgroup;
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                    int row = subgroup * 8 + acc_idx;
+                    const int row = subgroup * 8 + acc_idx;
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     val = __hmul(val, scale_h);
                     my_sh_c[row * kCStride + col] = val;
@@ -458,12 +458,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                 // Step 2: Read from LDS in row-major order for coalesced global write
                 // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
-                int read_row = lane / 2;
-                int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
-                int read_col_base = col_half * 8;
+                const int read_row = lane / 2;
+                const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
+                const int read_col_base = col_half * 8;
 
-                int64_t out_row = tile_m_base + read_row;
-                int64_t out_col = tile_n_base + read_col_base;
+                const int64_t out_row = tile_m_base + read_row;
+                const int64_t out_col = tile_n_base + read_col_base;
 
                 bool row_ok = true;
                 bool col_ok = true;
@@ -487,7 +487,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     // vec8 write to global memory (coalesced!)
                     // Check alignment and stride for vectorized write
                     half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
-                    bool can_vec = (stride_cn == 1) &&
+                    const bool can_vec = (stride_cn == 1) &&
                         ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
 
                     if (can_vec) {
@@ -529,10 +529,10 @@ struct ConfigTagK0MK1 {
 };
 
 torch::Tensor scaled_mm_k0mk1(
-    torch::Tensor a,
-    torch::Tensor b,
-    torch::Tensor scale,
-    torch::Tensor bias,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scale,
+    const torch::Tensor& bias,
     bool has_scale,
     bool has_bias,
     int64_t block_warps_m,
@@ -580,7 +580,7 @@ torch::Tensor scaled_mm_k0mk1(
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
         constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-        bool check_bounds =
+        const bool check_bounds =
             (a.size(0) % kBlockM != 0) ||
             (b.size(1) % kBlockN != 0) ||
             (a.size(1) % (kWmmaK * kUnrollK) != 0);
