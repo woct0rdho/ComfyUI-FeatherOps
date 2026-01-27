@@ -132,6 +132,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     // B uses K×N layout for efficient vec16 stores during loading
     constexpr int kBPad = 8;
     // K0 = kWmmaK / kK1 = 16 / 8 = 2
+
+    // C-shuffle epilogue reuses sh_a memory. Each warp needs 16*24 halfs.
+    // Ensure sh_a is large enough: kStages * 2 * kBlockM * 8 >= numWarps * 16 * 24
+    constexpr int kShASize = kStages * kK0 * kBlockM * kK1;
+    constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * (kWmmaN + kBPad);
+    static_assert(kShASize >= kCShuffleSize,
+        "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
+
     __shared__ half sh_a[kStages][kK0][kBlockM][kK1];
     __shared__ half sh_b[kStages][kWmmaK][kBlockN + kBPad];
 
@@ -621,16 +629,16 @@ torch::Tensor scaled_mm_k0mk1(
         try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||  // 128 threads
         try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||  // 256 threads
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||  // 256 threads
-        try_launch(ConfigTagK0MK1<4, 4, 2, 2, 2, 2>{}) ||  // 512 threads
+        // try_launch(ConfigTagK0MK1<4, 4, 2, 2, 2, 2>{}) ||  // 512 threads
         // Main configs: warps=(2,4), repeat=(4,4)
         try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
         // Smaller tiles for small matrices
         try_launch(ConfigTagK0MK1<2, 4, 4, 4, 2, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 2, 2>{}) ||
+        // try_launch(ConfigTagK0MK1<2, 4, 2, 2, 2, 2>{}) ||
         try_launch(ConfigTagK0MK1<4, 4, 4, 4, 2, 2>{}) ||
         // Single stage for minimal LDS
-        try_launch(ConfigTagK0MK1<2, 4, 1, 1, 4, 4>{}) ||
+        // try_launch(ConfigTagK0MK1<2, 4, 1, 1, 4, 4>{}) ||
         // Large matrix optimized: 1x4 warps for higher N coverage
         try_launch(ConfigTagK0MK1<1, 4, 4, 4, 8, 4>{}) ||
         // Large matrix: 1x8 warps (matching original HIP best config)
