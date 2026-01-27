@@ -14,6 +14,33 @@
 #include <ck/tensor_operation/gpu/element/element_wise_operation.hpp>
 #include <ck/utility/sequence.hpp>
 
+namespace ck {
+namespace tensor_operation {
+namespace element_wise {
+
+template <index_t N>
+struct FastNumericArrayConverter<f8_t, half_t, N>
+{
+    using InputArray  = vector_type<f8_t, N>;
+    using OutputArray = vector_type<half_t, N>;
+
+    __device__ static OutputArray convert(InputArray const& Input)
+    {
+        OutputArray Output;
+        static_for<0, N, 1>{}([&](auto i) {
+            Output.template AsType<half_t>()(i) =
+                type_convert<half_t>(Input.template AsType<f8_t>()[i]);
+        });
+        return Output;
+    }
+
+    __device__ OutputArray operator()(InputArray const& Input) { return convert(Input); }
+};
+
+} // namespace element_wise
+} // namespace tensor_operation
+} // namespace ck
+
 namespace {
 
 template <ck::index_t... Is>

@@ -9,8 +9,6 @@ from kernel.naive import scaled_mm_naive
 def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=False):
     """Test a specific config and return (pass, error_msg)."""
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
-    block_m = 16 * warps_m * repeat_m
-    block_n = 16 * warps_n * repeat_n
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
@@ -19,21 +17,12 @@ def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=False):
     bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else torch.empty(0, device=device, dtype=torch.float16)
 
     try:
-        out_hip = ext.scaled_mm_k0mk1(
-            a, b, scale, bias,
-            with_scale, with_bias,
-            warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n
-        )
+        out_hip = ext.scaled_mm_k0mk1(a, b, scale, bias, with_scale, with_bias, warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
 
     # Compute reference
-    out_ref = scaled_mm_naive(
-        a, b,
-        scale if with_scale else None,
-        bias if with_bias else None,
-        torch.float16
-    )
+    out_ref = scaled_mm_naive(a, b, scale if with_scale else None, bias if with_bias else None, torch.float16)
 
     # Compare
     diff = (out_hip.float() - out_ref.float()).abs()
