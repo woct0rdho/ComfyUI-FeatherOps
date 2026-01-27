@@ -6,28 +6,10 @@ import triton
 import triton.language as tl
 
 from .autotune import exceeds_smem_capacity, get_autotune_configs, prune_configs
+from .naive import scaled_mm_naive
 
 
-def scaled_mm_naive(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    mm_dtype = torch.float16
-    a = a.to(mm_dtype)
-    b = b.to(mm_dtype)
-    c = a @ b
-    c = c.to(out_dtype)
-    if scale is not None:
-        c *= scale.to(c.dtype)
-    if bias is not None:
-        c += bias.to(c.dtype)
-    return c
-
-
-# Flush subnormals to signed zero
+# Flush denormalized values to signed zero, and ignore nan
 @triton.jit
 def fp8e4m3fn_to_fp16(x):
     x_u16 = x.to(tl.uint8, bitcast=True).to(tl.uint16)
