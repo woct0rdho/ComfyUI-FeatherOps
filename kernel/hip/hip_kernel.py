@@ -86,21 +86,23 @@ def _load_hip_extension():
 
 
 # K0MK1 configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
+# Constraint: kStages * kK0 * kBlockM * kK1 >= numWarps * 16 * 24 (C-shuffle buffer)
+# Simplified: kStages * 2 * kRepeatM >= kBlockWarpsN * 3
 _CONFIGS = []
 # 128x128 tile matching CK's MT128x128x32 (various thread configs)
 _CONFIGS.append((2, 2, 2, 2, 4, 4))  # BlockM=128, BlockN=128, 128 threads
 _CONFIGS.append((4, 2, 2, 2, 2, 4))  # BlockM=128, BlockN=128, 256 threads
 _CONFIGS.append((2, 4, 2, 2, 4, 2))  # BlockM=128, BlockN=128, 256 threads
-_CONFIGS.append((4, 4, 2, 2, 2, 2))  # BlockM=128, BlockN=128, 512 threads
+# _CONFIGS.append((4, 4, 2, 2, 2, 2))  # C-shuffle overflow: 2*2*2=8 < 4*3=12
 # Main configs: warps=(2,4), repeat=(4,4)
 _CONFIGS.append((2, 4, 4, 4, 4, 4))
 _CONFIGS.append((2, 4, 2, 2, 4, 4))
 # Smaller tiles for small matrices
 _CONFIGS.append((2, 4, 4, 4, 2, 2))
-_CONFIGS.append((2, 4, 2, 2, 2, 2))
+# _CONFIGS.append((2, 4, 2, 2, 2, 2))  # C-shuffle overflow: 2*2*2=8 < 4*3=12
 _CONFIGS.append((4, 4, 4, 4, 2, 2))
-# Single stage for minimal LDS
-_CONFIGS.append((2, 4, 1, 1, 4, 4))
+# Single stage - disabled due to C-shuffle overflow
+# _CONFIGS.append((2, 4, 1, 1, 4, 4))  # C-shuffle overflow: 1*2*4=8 < 4*3=12
 # Large matrix optimized: 1x4 warps for higher N coverage
 _CONFIGS.append((1, 4, 4, 4, 8, 4))
 # Large matrix: 1x8 warps (matching original HIP best config)
