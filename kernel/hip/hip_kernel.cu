@@ -12,10 +12,11 @@
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
-#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
+
+#include <type_traits>
 
 namespace {
 
@@ -43,48 +44,6 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
     __half_raw r;
     r.x = bits;
     return r;
-}
-
-template <typename T>
-__device__ __forceinline__ float to_float(T v);
-
-template <>
-__device__ __forceinline__ float to_float<half>(half v)
-{
-    return __half2float(v);
-}
-
-template <>
-__device__ __forceinline__ float to_float<float>(float v)
-{
-    return v;
-}
-
-template <>
-__device__ __forceinline__ float to_float<hip_bfloat16>(hip_bfloat16 v)
-{
-    return static_cast<float>(v);
-}
-
-template <typename T>
-__device__ __forceinline__ T from_float(float v);
-
-template <>
-__device__ __forceinline__ half from_float<half>(float v)
-{
-    return __float2half_rn(v);
-}
-
-template <>
-__device__ __forceinline__ float from_float<float>(float v)
-{
-    return v;
-}
-
-template <>
-__device__ __forceinline__ hip_bfloat16 from_float<hip_bfloat16>(float v)
-{
-    return hip_bfloat16(v);
 }
 
 // =============================================================================
@@ -590,24 +549,22 @@ torch::Tensor scaled_mm_k0mk1(
             (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
             (static_cast<uint32_t>(a.size(0)) + kBlockM - 1) / kBlockM);
 
+        auto dispatch_kernel = [&](auto kCheckBoundsVal) {
+            constexpr bool kCheckBounds = decltype(kCheckBoundsVal)::value;
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds>),
+                grid, block, 0, stream.stream(),
+                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                a.size(0), b.size(1), a.size(1),
+                a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+                c.stride(0), c.stride(1),
+                has_scale ? 1 : 0, has_bias ? 1 : 0);
+        };
+
         if (check_bounds) {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true>),
-                grid, block, 0, stream.stream(),
-                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), b.size(1), a.size(1),
-                a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-                c.stride(0), c.stride(1),
-                has_scale ? 1 : 0, has_bias ? 1 : 0);
+            dispatch_kernel(std::true_type{});
         } else {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false>),
-                grid, block, 0, stream.stream(),
-                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), b.size(1), a.size(1),
-                a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-                c.stride(0), c.stride(1),
-                has_scale ? 1 : 0, has_bias ? 1 : 0);
+            dispatch_kernel(std::false_type{});
         }
     };
 
