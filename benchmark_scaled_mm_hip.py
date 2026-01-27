@@ -5,16 +5,15 @@ import gc
 import torch
 import triton
 
-from kernel.kernel import scaled_mm_triton
+from kernel.hip.hip_kernel import scaled_mm_hip
 from kernel.naive import scaled_mm_naive
 
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
-# scaled_mm_triton_compiled = torch.compile(scaled_mm_triton, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 providers = {
     "torch": scaled_mm_naive,
     "torch_compiled": scaled_mm_naive_compiled,
-    "triton": scaled_mm_triton,
+    "hip": scaled_mm_hip,
 }
 provider_names = list(providers)
 
@@ -28,7 +27,7 @@ provider_names = list(providers)
             line_vals=provider_names,
             line_names=provider_names,
             ylabel="GFLOPS",
-            plot_name="scaled_mm",
+            plot_name="scaled_mm_hip",
             args={},
         )
     ]
@@ -43,13 +42,10 @@ def benchmark(N, provider):
     b_dtype = torch.float8_e4m3fn
     out_dtype = torch.float16
 
-    a = torch.randn((N, N), device=device, dtype=torch.float32)
-    b = torch.randn((N, N), device=device, dtype=torch.float32)
+    a = torch.randn((N, N), device=device, dtype=torch.float32).to(a_dtype)
+    b = torch.randn((N, N), device=device, dtype=torch.float32).to(b_dtype)
     scale = torch.tensor(2.34, device=device, dtype=torch.float32)
-    bias = torch.randn((N,), device=device, dtype=torch.float32)
-
-    a = a.to(a_dtype)
-    b = b.to(b_dtype)
+    bias = torch.randn((N,), device=device, dtype=out_dtype)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(lambda: providers[provider](a, b, scale, bias, out_dtype), quantiles=quantiles)
