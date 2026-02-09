@@ -4,7 +4,6 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDABlas.h>
-#include <ATen/native/hip/ck_types.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -111,14 +110,17 @@ void gemm_impl_wmma_noswap(CUDABLAS_GEMM_ARGTYPES(Dtype))
     const int StrideB = ldb;
     const int StrideC = ldc;
 
-    using ADataType = typename at::native::CkMathType<Dtype>::dtype;
-    using BDataType = typename at::native::CkMathType<Dtype>::dtype;
-    using CDataType = typename at::native::CkMathType<Dtype>::dtype;
+    using ADataType = ck::half_t;
+    using BDataType = ck::half_t;
+    using CDataType = ck::half_t;
     using AccDataType = float;
-    using CShuffleDataType = typename at::native::CkMathType<Dtype>::dtype;
+    using CShuffleDataType = ck::half_t;
 
-    using ALayout = typename at::native::CkTensorLayout<TRANSA, TRANSB>::a_layout;
-    using BLayout = typename at::native::CkTensorLayout<TRANSA, TRANSB>::b_layout;
+    using Row = ck::tensor_layout::gemm::RowMajor;
+    using Col = ck::tensor_layout::gemm::ColumnMajor;
+
+    using ALayout = typename std::conditional<TRANSA, Col, Row>::type;
+    using BLayout = typename std::conditional<TRANSB, Col, Row>::type;
     using CLayout = Row;
 
     using AElementOp = ck::tensor_operation::element_wise::PassThrough;
