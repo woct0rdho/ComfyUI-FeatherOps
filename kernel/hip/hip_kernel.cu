@@ -32,6 +32,37 @@ constexpr int kK1 = 8;
 // K0 = kWmmaK / K1 = 16 / 8 = 2
 constexpr int kK0 = kWmmaK / kK1;
 
+// -----------------------------------------------------------------------------
+// Phase 2.1 target contract (torch.compile Tensile kernel on gfx1151).
+// This freezes the intended kernel shape/schedule knobs in one place.
+//
+// Target name tokens:
+//   MT128x128x32, WG32_4_1, WS32, PGR1, PLR0, SIA3, 1LDSB1,
+//   SU32, SUS256, WSGRA1, WSGRB1, LRVW16
+//
+// Notes:
+// - Only a subset is currently asserted structurally here (tile/workgroup/depthU).
+// - Scheduling semantics (PGR1/SIA3/etc.) are implemented incrementally in Phase 2.x.
+// -----------------------------------------------------------------------------
+struct Gfx1151TorchContract {
+    static constexpr int kMacroTileM = 128;      // MT128x...
+    static constexpr int kMacroTileN = 128;      // MT...x128x...
+    static constexpr int kDepthU = 32;           // MT...x...x32
+    static constexpr int kWaveSize = 32;         // WS32
+    static constexpr int kWorkgroupWaves = 4;    // WG32_4_1
+    static constexpr int kWorkgroupSize = kWaveSize * kWorkgroupWaves; // 128 threads
+    static constexpr int kUnrollK = kDepthU / kWmmaK; // 2
+    static constexpr int kStaggerU = 32;         // SU32
+    static constexpr int kStaggerUStride = 256;  // SUS256
+    static constexpr int kPrefetchGlobalRead = 1; // PGR1
+    static constexpr int kPrefetchLocalRead = 0;  // PLR0
+    static constexpr int kScheduleIterAlg = 3;    // SIA3
+    static constexpr int kUseOneLdsBuffer = 1;    // 1LDSB1
+    static constexpr int kWaveSeparateGRA = 1;    // WSGRA1
+    static constexpr int kWaveSeparateGRB = 1;    // WSGRB1
+    static constexpr int kLocalReadVectorWidth = 16; // LRVW16
+};
+
 enum KernelMode : int {
     kModeFull = 0,
     kModeNoOverlap = 1,
@@ -103,6 +134,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+    constexpr bool kMatchesTorchContractShape =
+        (kBlockM == Gfx1151TorchContract::kMacroTileM) &&
+        (kBlockN == Gfx1151TorchContract::kMacroTileN) &&
+        (kUnrollK * kWmmaK == Gfx1151TorchContract::kDepthU) &&
+        (kBlockWarpsM == 2) &&
+        (kBlockWarpsN == 2) &&
+        (kRepeatM == 4) &&
+        (kRepeatN == 4);
     // K0×M×K1 layout for A matrix: sh_a[stage][K0][M][K1] where K0=2, K1=8
     // This enables vec8 LDS reads for A (8 halfs = 16 bytes)
     // B uses K×N layout for efficient vec16 stores during loading
@@ -124,6 +163,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     const int tid = static_cast<int>(threadIdx.x) + static_cast<int>(threadIdx.y) * static_cast<int>(blockDim.x);
     constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+    if constexpr (kMatchesTorchContractShape) {
+        static_assert(kWaveSize == Gfx1151TorchContract::kWaveSize,
+            "Target contract mismatch: expected WS32");
+        static_assert(kThreads == Gfx1151TorchContract::kWorkgroupSize,
+            "Target contract mismatch: expected WG32_4_1 (128 threads)");
+        static_assert(kUnrollK == Gfx1151TorchContract::kUnrollK,
+            "Target contract mismatch: expected DepthU=32 with kWmmaK=16");
+    }
 
     // Flattened wave mapping: use 1D thread blocks to mirror rocBLAS/Tensile WG32_4_1 style.
     const int wave_id = tid / kWaveSize;
@@ -349,7 +396,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 }
                 for (int u = 0; u < valid_u_next; ++u) {
                     const int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    const int stage = (stage_base + kUnrollK + u) % kStages;
+                    int stage = 0;
+                    if constexpr (kStages == kUnrollK) {
+                        stage = u;
+                    } else {
+                        stage = (stage_base + kUnrollK + u) % kStages;
+                    }
                     load_a_lds_k0mk1(stage, kk);
                     load_b_lds(stage, kk);
                 }
@@ -365,7 +417,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 if (valid_u > kUnrollK) valid_u = kUnrollK;
             }
             for (int u = 0; u < valid_u; ++u) {
-                const int stage = (stage_base + u) % kStages;
+                int stage = 0;
+                if constexpr (kStages == kUnrollK) {
+                    stage = u;
+                } else {
+                    stage = (stage_base + u) % kStages;
+                }
                 for (int rm = 0; rm < kRepeatM; ++rm) {
                     for (int rn = 0; rn < kRepeatN; ++rn) {
                         const int repeat_idx = rm * kRepeatN + rn;
@@ -434,28 +491,36 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
                     }
                 }
+
             }
         }
 
         if constexpr (!do_overlap) {
             if (has_next) {
-                __syncthreads();
                 int valid_u_next = kUnrollK;
                 if constexpr (kCheckBounds) {
                     int64_t rem = K - k_next;
                     valid_u_next = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
                     if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
                 }
+                int64_t kk = k_next;
                 for (int u = 0; u < valid_u_next; ++u) {
-                    const int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    const int stage = (stage_base + u) % kStages;
+                    int stage = 0;
+                    if constexpr (kStages == kUnrollK) {
+                        stage = u;
+                    } else {
+                        stage = (stage_base + u) % kStages;
+                    }
                     load_a_lds_k0mk1(stage, kk);
                     load_b_lds(stage, kk);
+                    kk += kWmmaK;
                 }
             }
         }
 
-        stage_base = (stage_base + kUnrollK) % kStages;
+        if constexpr (kStages != kUnrollK) {
+            stage_base = (stage_base + kUnrollK) % kStages;
+        }
         __syncthreads();
     }
 
@@ -628,6 +693,14 @@ torch::Tensor scaled_mm_k0mk1(
         constexpr int kRepeatN = decltype(tag)::kRepeatN;
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
         constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+        constexpr bool kMatchesTorchContractShape =
+            (kBlockM == Gfx1151TorchContract::kMacroTileM) &&
+            (kBlockN == Gfx1151TorchContract::kMacroTileN) &&
+            (kUnrollK * kWmmaK == Gfx1151TorchContract::kDepthU) &&
+            (kBlockWarpsM == 2) &&
+            (kBlockWarpsN == 2) &&
+            (kRepeatM == 4) &&
+            (kRepeatN == 4);
 
         const bool check_bounds =
             (a.size(0) % kBlockM != 0) ||
@@ -636,6 +709,10 @@ torch::Tensor scaled_mm_k0mk1(
 
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
         static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
+        if constexpr (kMatchesTorchContractShape) {
+            static_assert(kThreadsPerBlock == Gfx1151TorchContract::kWorkgroupSize,
+                "Target contract mismatch: expected 128-thread workgroup for MT128x128x32");
+        }
         dim3 block(kThreadsPerBlock, 1, 1);
         dim3 grid(
             (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
