@@ -374,9 +374,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         if (valid_u0 > kUnrollK) valid_u0 = kUnrollK;
     }
     for (int u = 0; u < valid_u0; ++u) {
-        const int64_t kk = k0_first + static_cast<int64_t>(u) * kWmmaK;
-        load_a_lds_k0mk1(u, kk);
-        load_b_lds(u, kk);
+        const int64_t k = k0_first + static_cast<int64_t>(u) * kWmmaK;
+        load_a_lds_k0mk1(u, k);
+    }
+    for (int u = 0; u < valid_u0; ++u) {
+        const int64_t k = k0_first + static_cast<int64_t>(u) * kWmmaK;
+        load_b_lds(u, k);
     }
     __syncthreads();
 
@@ -395,15 +398,24 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
                 }
                 for (int u = 0; u < valid_u_next; ++u) {
-                    const int64_t kk = k_next + static_cast<int64_t>(u) * kWmmaK;
                     int stage = 0;
                     if constexpr (kStages == kUnrollK) {
                         stage = u;
                     } else {
                         stage = (stage_base + kUnrollK + u) % kStages;
                     }
-                    load_a_lds_k0mk1(stage, kk);
-                    load_b_lds(stage, kk);
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    load_a_lds_k0mk1(stage, k);
+                }
+                for (int u = 0; u < valid_u_next; ++u) {
+                    int stage = 0;
+                    if constexpr (kStages == kUnrollK) {
+                        stage = u;
+                    } else {
+                        stage = (stage_base + kUnrollK + u) % kStages;
+                    }
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    load_b_lds(stage, k);
                 }
             }
         }
@@ -482,8 +494,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                             reg_a_fp16[i] = static_cast<_Float16>(reg_a[i]);
                         }
 
-                        const fp16x16_t a_frag = *reinterpret_cast<fp16x16_t*>(reg_a_fp16);
-                        const fp16x16_t b_frag = *reinterpret_cast<fp16x16_t*>(reg_b);
+                        const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
+                        const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(reg_b);
                         float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
 
                         c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
@@ -503,7 +515,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     valid_u_next = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
                     if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
                 }
-                int64_t kk = k_next;
                 for (int u = 0; u < valid_u_next; ++u) {
                     int stage = 0;
                     if constexpr (kStages == kUnrollK) {
@@ -511,9 +522,18 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     } else {
                         stage = (stage_base + u) % kStages;
                     }
-                    load_a_lds_k0mk1(stage, kk);
-                    load_b_lds(stage, kk);
-                    kk += kWmmaK;
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    load_a_lds_k0mk1(stage, k);
+                }
+                for (int u = 0; u < valid_u_next; ++u) {
+                    int stage = 0;
+                    if constexpr (kStages == kUnrollK) {
+                        stage = u;
+                    } else {
+                        stage = (stage_base + u) % kStages;
+                    }
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    load_b_lds(stage, k);
                 }
             }
         }
