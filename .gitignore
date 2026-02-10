@@ -207,3 +207,4 @@ __marimo__/
 *.hip
 *.html
 *.png
+/rocprof*/
