@@ -461,6 +461,10 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 } else {
                     stage = (stage_base + u) % kStages;
                 }
+                if constexpr (kMatchesTorchContractShape && !do_overlap && !mode_comm_only && !mode_comp_only) {
+                    // Bundle-C proto v7 baseline keep: per-U LDS wait before local-read + WMMA sequence.
+                    asm volatile("s_waitcnt lgkmcnt(0)\n\t" ::: "memory");
+                }
                 for (int rm = 0; rm < kRepeatM; ++rm) {
                     for (int rn = 0; rn < kRepeatN; ++rn) {
                         const int repeat_idx = rm * kRepeatN + rn;
@@ -662,7 +666,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                             if (out_col + i >= N) break;
                         }
                         half val = my_sh_c[read_row * kCStride + read_col_base + i];
-                        if (has_bias) val = __hadd(val, bias[out_col + i]);
+                        if (has_bias) {
+                            val = __hadd(val, bias[out_col + i]);
+                        }
                         c[out_row * stride_cm + (out_col + i) * stride_cn] = val;
                     }
                 }
@@ -858,9 +864,13 @@ torch::Tensor scaled_mm_k0mk1(
         return false;
     };
 
+    // Keep only the active fixed config; autotune configs are disabled to reduce compile time.
     bool launched =
+        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{});
+
+    /*
+    Disabled autotune configs:
         try_launch(ConfigTagK0MK1<2, 2, 2, 4, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
         try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 4>{}) ||
@@ -883,6 +893,7 @@ torch::Tensor scaled_mm_k0mk1(
         try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 8>{}) ||
         try_launch(ConfigTagK0MK1<4, 4, 4, 4, 2, 2>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 4, 4, 4>{});
+    */
 
     TORCH_CHECK(launched, "Unsupported K0MK1 config");
     return c;
