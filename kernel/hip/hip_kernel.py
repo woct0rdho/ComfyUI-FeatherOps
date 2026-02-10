@@ -113,10 +113,7 @@ def _get_fixed_config():
 
     values = tuple(int(v.strip()) for v in cfg.split(",") if v.strip())
     if len(values) != 6:
-        raise RuntimeError(
-            "HIP_K0MK1_FORCE_CONFIG must contain 6 comma-separated integers: "
-            "warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n"
-        )
+        raise RuntimeError("HIP_K0MK1_FORCE_CONFIG must contain 6 comma-separated integers: warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n")
     return values
 
 
@@ -161,9 +158,7 @@ def scaled_mm_hip(
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _get_fixed_config()
     mode_name = os.environ.get("HIP_K0MK1_MODE", mode).strip().lower()
     if mode_name not in _MODE_NAME_TO_ID:
-        raise RuntimeError(
-            f"Unsupported mode '{mode_name}'. Valid modes: {', '.join(sorted(_MODE_NAME_TO_ID))}"
-        )
+        raise RuntimeError(f"Unsupported mode '{mode_name}'. Valid modes: {', '.join(sorted(_MODE_NAME_TO_ID))}")
     mode_id = _MODE_NAME_TO_ID[mode_name]
     stagger_u_iters = _get_env_int("HIP_K0MK1_STAGGER_U", 0)
     stagger_stride_k = _get_env_int("HIP_K0MK1_STAGGER_STRIDE_K", 128)

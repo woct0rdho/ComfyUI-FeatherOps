@@ -103,6 +103,7 @@ template <int kBlockWarpsM,
           int kRepeatN,
           bool kCheckBounds,
           bool kUseStagger,
+          bool kContigFastPath,
           int kMode>
 __global__ void scaled_mm_kernel_wmma_k0mk1(
     const half* a,
@@ -131,6 +132,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 #endif
     static_assert(kStages == 1 || kStages == 2 || kStages == 4, "kStages must be 1, 2, or 4");
     static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
+    static_assert(!kContigFastPath || !kCheckBounds,
+        "Contiguous fast path requires no-bounds-check launch shape.");
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
@@ -219,39 +222,45 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t a_row = block_m + m;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
 
-            bool row_in = true;
-            if constexpr (kCheckBounds) {
-                row_in = (a_row < M);
-            }
-
-            const half* a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
-
-            bool in_bounds = row_in;
-            if constexpr (kCheckBounds) {
-                in_bounds = row_in && (a_k + kK1 - 1 < K);
-            }
-
-            // vec8 load (16 bytes)
-            const bool can_vec = in_bounds && (stride_ak == 1) &&
-                ((reinterpret_cast<uintptr_t>(a_ptr) & 0xFu) == 0u);
-
-            if (can_vec) {
+            if constexpr (kContigFastPath) {
+                const half* a_ptr = a + a_row * stride_am + a_k;
                 const uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
                 *reinterpret_cast<uint4*>(&sh_a[stage][k0][m][0]) = packed;
             } else {
-                // Scalar fallback
-                for (int i = 0; i < kK1; ++i) {
-                    half val = __float2half_rn(0.0f);
-                    if (row_in) {
-                        if constexpr (kCheckBounds) {
-                            if (a_k + i < K) {
+                bool row_in = true;
+                if constexpr (kCheckBounds) {
+                    row_in = (a_row < M);
+                }
+
+                const half* a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
+
+                bool in_bounds = row_in;
+                if constexpr (kCheckBounds) {
+                    in_bounds = row_in && (a_k + kK1 - 1 < K);
+                }
+
+                // vec8 load (16 bytes)
+                const bool can_vec = in_bounds && (stride_ak == 1) &&
+                    ((reinterpret_cast<uintptr_t>(a_ptr) & 0xFu) == 0u);
+
+                if (can_vec) {
+                    const uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
+                    *reinterpret_cast<uint4*>(&sh_a[stage][k0][m][0]) = packed;
+                } else {
+                    // Scalar fallback
+                    for (int i = 0; i < kK1; ++i) {
+                        half val = __float2half_rn(0.0f);
+                        if (row_in) {
+                            if constexpr (kCheckBounds) {
+                                if (a_k + i < K) {
+                                    val = a_ptr[i * stride_ak];
+                                }
+                            } else {
                                 val = a_ptr[i * stride_ak];
                             }
-                        } else {
-                            val = a_ptr[i * stride_ak];
                         }
+                        sh_a[stage][k0][m][i] = val;
                     }
-                    sh_a[stage][k0][m][i] = val;
                 }
             }
         }
@@ -285,20 +294,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t b_row = kk + row;
             const int64_t b_col = block_n + col;
 
-            bool row_in = true;
-            if constexpr (kCheckBounds) {
-                row_in = (b_row < K);
-            }
-            const uint8_t* b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
-
-            bool in_bounds = row_in && (col + 15 < kBlockN);
-            if constexpr (kCheckBounds) {
-                in_bounds = in_bounds && (b_col + 15 < N);
-            }
-            const bool can_vec = in_bounds && (stride_bn == 1) &&
-                ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
-
-            if (can_vec) {
+            if constexpr (kContigFastPath) {
+                const uint8_t* b_ptr = b + b_row * stride_bk + b_col;
                 const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
                 const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
                 half h[16];
@@ -313,19 +310,48 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
                 dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
             } else {
-                for (int i = 0; i < 16; ++i) {
-                    if (col + i < kBlockN) {
-                        half h = __float2half_rn(0.0f);
-                        if (row_in) {
-                            if constexpr (kCheckBounds) {
-                                if (b_col + i < N) {
+                bool row_in = true;
+                if constexpr (kCheckBounds) {
+                    row_in = (b_row < K);
+                }
+                const uint8_t* b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
+
+                bool in_bounds = row_in && (col + 15 < kBlockN);
+                if constexpr (kCheckBounds) {
+                    in_bounds = in_bounds && (b_col + 15 < N);
+                }
+                const bool can_vec = in_bounds && (stride_bn == 1) &&
+                    ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
+
+                if (can_vec) {
+                    const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
+                    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
+                    half h[16];
+                    for(int j=0; j<4; ++j) {
+                        uint32_t p = p32[j];
+                        h[4*j+0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
+                        h[4*j+1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
+                        h[4*j+2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
+                        h[4*j+3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
+                    }
+                    uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+                    dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
+                    dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                } else {
+                    for (int i = 0; i < 16; ++i) {
+                        if (col + i < kBlockN) {
+                            half h = __float2half_rn(0.0f);
+                            if (row_in) {
+                                if constexpr (kCheckBounds) {
+                                    if (b_col + i < N) {
+                                        h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
+                                    }
+                                } else {
                                     h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
                                 }
-                            } else {
-                                h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
                             }
+                            sh_b[stage][row][col + i] = h;
                         }
-                        sh_b[stage][row][col + i] = h;
                     }
                 }
             }
@@ -611,17 +637,22 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     }
 
                     // vec8 write to global memory (coalesced!)
-                    // Check alignment and stride for vectorized write
-                    half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
-                    const bool can_vec = (stride_cn == 1) &&
-                        ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
-
-                    if (can_vec) {
+                    if constexpr (kContigFastPath) {
+                        half* out_ptr = &c[out_row * stride_cm + out_col];
                         *reinterpret_cast<uint4*>(out_ptr) = data;
                     } else {
-                        // Scalar fallback for non-contiguous or unaligned output
-                        for (int i = 0; i < 8; ++i) {
-                            c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
+                        // Check alignment and stride for vectorized write.
+                        half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
+                        const bool can_vec = (stride_cn == 1) &&
+                            ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
+
+                        if (can_vec) {
+                            *reinterpret_cast<uint4*>(out_ptr) = data;
+                        } else {
+                            // Scalar fallback for non-contiguous or unaligned output
+                            for (int i = 0; i < 8; ++i) {
+                                c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
+                            }
                         }
                     }
                 } else if (row_ok) {
@@ -740,12 +771,13 @@ torch::Tensor scaled_mm_k0mk1(
 
         const bool enable_stagger = (stagger_u_iters > 0);
 
-        auto dispatch_kernel = [&](auto kCheckBoundsVal, auto kUseStaggerVal, auto kModeVal) {
+        auto dispatch_kernel = [&](auto kCheckBoundsVal, auto kUseStaggerVal, auto kContigFastPathVal, auto kModeVal) {
             constexpr bool kCheckBounds = decltype(kCheckBoundsVal)::value;
             constexpr bool kEnableStagger = decltype(kUseStaggerVal)::value;
+            constexpr bool kEnableContigFastPath = decltype(kContigFastPathVal)::value;
             constexpr int kKernelMode = decltype(kModeVal)::value;
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds, kEnableStagger, kKernelMode>),
+                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds, kEnableStagger, kEnableContigFastPath, kKernelMode>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 a.size(0), b.size(1), a.size(1),
@@ -756,19 +788,34 @@ torch::Tensor scaled_mm_k0mk1(
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         };
 
-        auto launch_mode = [&](auto kCheckBoundsVal, auto kUseStaggerVal) {
+        bool enable_contig_fastpath = false;
+        if constexpr (kMatchesTorchContractShape) {
+            const auto is_aligned_16 = [](const void* p) {
+                return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
+            };
+            enable_contig_fastpath =
+                !check_bounds &&
+                (a.stride(1) == 1) &&
+                (b.stride(1) == 1) &&
+                (c.stride(1) == 1) &&
+                is_aligned_16(a_ptr) &&
+                is_aligned_16(b_ptr) &&
+                is_aligned_16(c_ptr);
+        }
+
+        auto launch_mode = [&](auto kCheckBoundsVal, auto kUseStaggerVal, auto kContigFastPathVal) {
             switch (mode) {
                 case kModeFull:
-                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeFull>{});
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, kContigFastPathVal, std::integral_constant<int, kModeFull>{});
                     break;
                 case kModeNoOverlap:
-                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeNoOverlap>{});
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, kContigFastPathVal, std::integral_constant<int, kModeNoOverlap>{});
                     break;
                 case kModeCommOnly:
-                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeCommOnly>{});
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, kContigFastPathVal, std::integral_constant<int, kModeCommOnly>{});
                     break;
                 case kModeCompOnly:
-                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeCompOnly>{});
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, kContigFastPathVal, std::integral_constant<int, kModeCompOnly>{});
                     break;
                 default:
                     TORCH_CHECK(false, "Unsupported mode ", mode);
@@ -777,15 +824,23 @@ torch::Tensor scaled_mm_k0mk1(
 
         if (check_bounds) {
             if (enable_stagger) {
-                launch_mode(std::true_type{}, std::true_type{});
+                launch_mode(std::true_type{}, std::true_type{}, std::false_type{});
             } else {
-                launch_mode(std::true_type{}, std::false_type{});
+                launch_mode(std::true_type{}, std::false_type{}, std::false_type{});
             }
         } else {
             if (enable_stagger) {
-                launch_mode(std::false_type{}, std::true_type{});
+                if (enable_contig_fastpath) {
+                    launch_mode(std::false_type{}, std::true_type{}, std::true_type{});
+                } else {
+                    launch_mode(std::false_type{}, std::true_type{}, std::false_type{});
+                }
             } else {
-                launch_mode(std::false_type{}, std::false_type{});
+                if (enable_contig_fastpath) {
+                    launch_mode(std::false_type{}, std::false_type{}, std::true_type{});
+                } else {
+                    launch_mode(std::false_type{}, std::false_type{}, std::false_type{});
+                }
             }
         }
     };
