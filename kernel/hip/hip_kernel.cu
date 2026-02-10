@@ -533,12 +533,15 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
                     }
                 }
-
             }
         }
 
         if constexpr (!do_overlap) {
             if (has_next) {
+                if constexpr (kMatchesTorchContractShape && !mode_comm_only && !mode_comp_only) {
+                    // Step65: selective asm issue hint around no-overlap A/B load slice.
+                    asm volatile("s_setprio 1\n\t" ::: "memory");
+                }
                 int valid_u_next = kUnrollK;
                 if constexpr (kCheckBounds) {
                     int64_t rem = K - k_next;
@@ -564,6 +567,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     }
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     load_b_lds(stage, k);
+                }
+                if constexpr (kMatchesTorchContractShape && !mode_comm_only && !mode_comp_only) {
+                    asm volatile("s_setprio 0\n\t" ::: "memory");
                 }
             }
         }
