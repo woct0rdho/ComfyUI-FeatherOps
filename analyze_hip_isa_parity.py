@@ -156,7 +156,7 @@ def hip_token_projection(t: KernelTemplate) -> dict[str, object]:
     macro_m = 16 * t.warps_m * t.repeat_m
     macro_n = 16 * t.warps_n * t.repeat_n
     depth_u = 16 * t.unroll_k
-    wg_size = 32 * t.warps_m * t.warps_n
+    # wg_size = 32 * t.warps_m * t.warps_n
 
     projected = {
         "MT": f"MT{macro_m}x{macro_n}x{depth_u}",
