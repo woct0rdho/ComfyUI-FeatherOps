@@ -1,5 +1,4 @@
 import os
-import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -85,97 +84,40 @@ def _load_hip_extension():
     return module
 
 
-# K0MK1 configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
-# Constraint: kStages * kK0 * kBlockM * kK1 >= numWarps * 16 * 24 (C-shuffle buffer)
-# Simplified: kStages * 2 * kRepeatM >= kBlockWarpsN * 3
-_CONFIGS = []
-# 128x128 tile: baseline and low-LDS variants
-_CONFIGS.append((2, 2, 2, 2, 4, 4))  # 128 threads
-_CONFIGS.append((4, 2, 2, 2, 2, 4))  # 256 threads
-_CONFIGS.append((2, 4, 2, 2, 4, 2))  # 256 threads
-_CONFIGS.append((2, 2, 4, 4, 4, 4))  # 128 threads
-_CONFIGS.append((1, 4, 2, 2, 8, 2))  # 128 threads, low LDS
-_CONFIGS.append((1, 4, 4, 4, 8, 2))  # 128 threads, deeper unroll
-_CONFIGS.append((4, 1, 4, 4, 2, 8))  # 128 threads, tall M
-_CONFIGS.append((1, 2, 4, 4, 8, 4))  # 64 threads
-_CONFIGS.append((2, 1, 4, 4, 4, 8))  # 64 threads
-_CONFIGS.append((1, 1, 4, 4, 8, 8))  # 32 threads
-_CONFIGS.append((2, 4, 4, 4, 4, 2))  # 256 threads, blockN=128
-_CONFIGS.append((4, 2, 4, 4, 2, 4))  # 256 threads, blockN=128
-
-# 128x256 tile: main configs and variants
-_CONFIGS.append((2, 4, 2, 2, 4, 4))
-_CONFIGS.append((2, 4, 4, 4, 4, 4))
-_CONFIGS.append((1, 4, 4, 4, 8, 4))
-_CONFIGS.append((1, 8, 4, 4, 8, 2))
-_CONFIGS.append((2, 8, 4, 4, 4, 2))
-_CONFIGS.append((2, 4, 4, 4, 2, 2))  # 64x128
-
-# 256x128 tile: large-M coverage
-_CONFIGS.append((2, 2, 4, 4, 8, 4))
-_CONFIGS.append((4, 2, 4, 4, 4, 4))
-
-# 128x256 tile variants
-_CONFIGS.append((2, 2, 4, 4, 4, 8))
-
-# 128x128 tile with small K unroll
-_CONFIGS.append((4, 4, 4, 4, 2, 2))
-
-# Preserve order while removing duplicates
-_CONFIGS = list(dict.fromkeys(_CONFIGS))
-
-_AUTOTUNE_CACHE = {}
+_DEFAULT_CONFIG = (2, 2, 2, 2, 4, 4)
+_CONFIGS = (_DEFAULT_CONFIG,)
+_MODE_NAME_TO_ID = {
+    "full": 0,
+    "no_overlap": 1,
+    "comm_only": 2,
+    "comp_only": 3,
+}
 
 
-def _select_config(a, b, scale, bias, has_scale, has_bias, ext):
-    key = (a.shape, b.shape, a.stride(), b.stride(), has_scale, has_bias)
-    cached = _AUTOTUNE_CACHE.get(key)
-    if cached is not None:
-        return cached
+def _get_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as e:
+        raise RuntimeError(f"{name} must be an integer, got '{raw}'") from e
 
-    best = _CONFIGS[0]
-    best_ms = None
 
-    def run(cfg):
-        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
-        return ext.scaled_mm_k0mk1(
-            a,
-            b,
-            scale,
-            bias,
-            has_scale,
-            has_bias,
-            warps_m,
-            warps_n,
-            unroll_k,
-            stages,
-            repeat_m,
-            repeat_n,
+@lru_cache(maxsize=1)
+def _get_fixed_config():
+    """Return fixed config matching the torch.compile-tuned 128x128x32 kernel shape."""
+    cfg = os.environ.get("HIP_K0MK1_FORCE_CONFIG")
+    if not cfg:
+        return _DEFAULT_CONFIG
+
+    values = tuple(int(v.strip()) for v in cfg.split(",") if v.strip())
+    if len(values) != 6:
+        raise RuntimeError(
+            "HIP_K0MK1_FORCE_CONFIG must contain 6 comma-separated integers: "
+            "warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n"
         )
-
-    for cfg in _CONFIGS:
-        run(cfg)
-    torch.cuda.synchronize()
-
-    for cfg in _CONFIGS:
-        start = time.perf_counter()
-        for _ in range(5):
-            run(cfg)
-        torch.cuda.synchronize()
-        ms = (time.perf_counter() - start) * 1000.0 / 5.0
-        if best_ms is None or ms < best_ms:
-            best_ms = ms
-            best = cfg
-
-    _AUTOTUNE_CACHE[key] = best
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = best
-    print(
-        f"HIP K0MK1 autotune M={a.shape[0]} N={b.shape[1]} K={a.shape[1]} "
-        f"warps=({warps_m},{warps_n}) unroll_k={unroll_k} "
-        f"stages={stages} repeat=({repeat_m},{repeat_n}) "
-        f"config={best}"
-    )
-    return warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n
+    return values
 
 
 def scaled_mm_hip(
@@ -184,6 +126,7 @@ def scaled_mm_hip(
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
+    mode: str = "full",
 ) -> torch.Tensor:
     """Scaled matmul using K0MK1 LDS layout kernel (optimized for gfx11 wave32)."""
     assert a.is_cuda
@@ -215,7 +158,19 @@ def scaled_mm_hip(
 
     ext = _load_hip_extension()
 
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config(a, b, scale_tensor, bias_tensor, has_scale, has_bias, ext)
+    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _get_fixed_config()
+    mode_name = os.environ.get("HIP_K0MK1_MODE", mode).strip().lower()
+    if mode_name not in _MODE_NAME_TO_ID:
+        raise RuntimeError(
+            f"Unsupported mode '{mode_name}'. Valid modes: {', '.join(sorted(_MODE_NAME_TO_ID))}"
+        )
+    mode_id = _MODE_NAME_TO_ID[mode_name]
+    stagger_u_iters = _get_env_int("HIP_K0MK1_STAGGER_U", 0)
+    stagger_stride_k = _get_env_int("HIP_K0MK1_STAGGER_STRIDE_K", 128)
+    if stagger_u_iters < 0:
+        raise RuntimeError("HIP_K0MK1_STAGGER_U must be >= 0")
+    if stagger_stride_k <= 0:
+        raise RuntimeError("HIP_K0MK1_STAGGER_STRIDE_K must be > 0")
     return ext.scaled_mm_k0mk1(
         a,
         b,
@@ -229,4 +184,7 @@ def scaled_mm_hip(
         stages,
         repeat_m,
         repeat_n,
+        mode_id,
+        stagger_u_iters,
+        stagger_stride_k,
     )

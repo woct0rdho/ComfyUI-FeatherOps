@@ -16,6 +16,7 @@
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
 
+#include <limits>
 #include <type_traits>
 
 namespace {
@@ -31,7 +32,14 @@ constexpr int kK1 = 8;
 // K0 = kWmmaK / K1 = 16 / 8 = 2
 constexpr int kK0 = kWmmaK / kK1;
 
-__device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
+enum KernelMode : int {
+    kModeFull = 0,
+    kModeNoOverlap = 1,
+    kModeCommOnly = 2,
+    kModeCompOnly = 3,
+};
+
+__device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(uint8_t x)
 {
     const uint16_t x_u16 = static_cast<uint16_t>(x);
     const uint16_t sign = static_cast<uint16_t>((x_u16 & 0x80u) << 8);
@@ -41,8 +49,13 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
     if ((x_u16 & 0x78u) == 0u) {
         bits = sign;
     }
+    return bits;
+}
+
+__device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
+{
     __half_raw r;
-    r.x = bits;
+    r.x = fp8e4m3fn_to_half_bits(x);
     return r;
 }
 
@@ -57,7 +70,9 @@ template <int kBlockWarpsM,
           int kStages,
           int kRepeatM,
           int kRepeatN,
-          bool kCheckBounds>
+          bool kCheckBounds,
+          bool kUseStagger,
+          int kMode>
 __global__ void scaled_mm_kernel_wmma_k0mk1(
     const half* a,
     const uint8_t* b,
@@ -73,6 +88,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     int64_t stride_bn,
     int64_t stride_cm,
     int64_t stride_cn,
+    int stagger_u_iters,
+    int stagger_stride_k,
     int has_scale,
     int has_bias)
 {
@@ -99,20 +116,23 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     static_assert(kShASize >= kCShuffleSize,
         "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
 
-    __shared__ half sh_a[kStages][kK0][kBlockM][kK1];
-    __shared__ half sh_b[kStages][kWmmaK][kBlockN + kBPad];
+    __shared__ __align__(16) half sh_a[kStages][kK0][kBlockM][kK1];
+    __shared__ __align__(16) half sh_b[kStages][kWmmaK][kBlockN + kBPad];
 
     const int block_m = static_cast<int>(blockIdx.y) * kBlockM;
     const int block_n = static_cast<int>(blockIdx.x) * kBlockN;
 
-    const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+    const int tid = static_cast<int>(threadIdx.x) + static_cast<int>(threadIdx.y) * static_cast<int>(blockDim.x);
     constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
 
-    // Wave ID and position
-    const int wave_id = (threadIdx.x / kWaveSize) + threadIdx.y * (blockDim.x / kWaveSize);
+    // Flattened wave mapping: use 1D thread blocks to mirror rocBLAS/Tensile WG32_4_1 style.
+    const int wave_id = tid / kWaveSize;
     const int warp_m = wave_id % kBlockWarpsM;
     const int warp_n = wave_id / kBlockWarpsM;
-    const int lane = threadIdx.x % kWaveSize;
+    const int lane = tid % kWaveSize;
+    constexpr bool mode_no_overlap = (kMode == kModeNoOverlap);
+    constexpr bool mode_comm_only = (kMode == kModeCommOnly);
+    constexpr bool mode_comp_only = (kMode == kModeCompOnly);
 
     // Accumulator registers: 8 floats per WMMA tile in wave32 mode
     constexpr int kRepeatTiles = kRepeatM * kRepeatN;
@@ -140,6 +160,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             // Decode vec_idx to [k0][m] position
             const int k0 = vec_idx / kBlockM;
             const int m = vec_idx % kBlockM;
+
+            if constexpr (mode_comp_only) {
+                #pragma unroll
+                for (int i = 0; i < kK1; ++i) {
+                    sh_a[stage][k0][m][i] = __float2half_rn(1.0f);
+                }
+                continue;
+            }
 
             const int64_t a_row = block_m + m;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
@@ -196,6 +224,17 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
             const int row = elem_base / kBlockN;
             const int col = elem_base % kBlockN;
+
+            if constexpr (mode_comp_only) {
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    if (col + i < kBlockN) {
+                        sh_b[stage][row][col + i] = __float2half_rn(1.0f);
+                    }
+                }
+                continue;
+            }
+
             const int64_t b_row = kk + row;
             const int64_t b_col = block_n + col;
 
@@ -247,31 +286,61 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     };
 
     // Pipeline setup
-    constexpr bool kOverlap = (kStages >= 2 * kUnrollK);
-    int stage_base = 0;
-    int64_t k0_iter = 0;
+    constexpr bool kSupportsOverlap = (kStages >= 2 * kUnrollK);
+    constexpr bool do_overlap = kSupportsOverlap && !mode_no_overlap && !mode_comm_only && !mode_comp_only;
+    constexpr int kChunkK = kWmmaK * kUnrollK;
+    const int total_chunks = static_cast<int>((K + kChunkK - 1) / kChunkK);
 
-    __builtin_amdgcn_sched_barrier(0);
+    int stagger_chunks = 0;
+    if constexpr (kUseStagger) {
+        if (stagger_u_iters > 0 && stagger_stride_k > 0 && total_chunks > 0) {
+            const int64_t wg_linear = static_cast<int64_t>(blockIdx.y) * static_cast<int64_t>(gridDim.x) +
+                                      static_cast<int64_t>(blockIdx.x);
+            const int stagger_group = static_cast<int>(wg_linear % static_cast<int64_t>(stagger_u_iters));
+            const int64_t stagger_k = static_cast<int64_t>(stagger_group) * static_cast<int64_t>(stagger_stride_k);
+            stagger_chunks = static_cast<int>((stagger_k / kChunkK) % total_chunks);
+        }
+    }
+
+    auto chunk_k0 = [&](int iter_idx) -> int64_t {
+        if (total_chunks <= 0) {
+            return 0;
+        }
+        int chunk = iter_idx;
+        if constexpr (kUseStagger) {
+            chunk += stagger_chunks;
+            if (chunk >= total_chunks) {
+                chunk %= total_chunks;
+            }
+        }
+        return static_cast<int64_t>(chunk) * kChunkK;
+    };
+
+    int stage_base = 0;
+    float comm_sink = 0.0f;
+
+    const int64_t k0_first = chunk_k0(0);
     int valid_u0 = kUnrollK;
     if constexpr (kCheckBounds) {
-        int64_t rem = K - k0_iter;
+        int64_t rem = K - k0_first;
         valid_u0 = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
         if (valid_u0 > kUnrollK) valid_u0 = kUnrollK;
     }
     for (int u = 0; u < valid_u0; ++u) {
-        const int64_t kk = k0_iter + static_cast<int64_t>(u) * kWmmaK;
+        const int64_t kk = k0_first + static_cast<int64_t>(u) * kWmmaK;
         load_a_lds_k0mk1(u, kk);
         load_b_lds(u, kk);
     }
     __syncthreads();
 
     // Main loop
-    for (k0_iter = 0; k0_iter < K; k0_iter += kWmmaK * kUnrollK) {
-        __builtin_amdgcn_sched_barrier(0);
-        const int64_t k_next = k0_iter + static_cast<int64_t>(kUnrollK) * kWmmaK;
+    for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+        const int64_t k0_iter = chunk_k0(iter_idx);
+        const bool has_next = (iter_idx + 1 < total_chunks);
+        const int64_t k_next = has_next ? chunk_k0(iter_idx + 1) : 0;
 
-        if constexpr (kOverlap) {
-            if (k_next < K) {
+        if constexpr (do_overlap) {
+            if (has_next) {
                 int valid_u_next = kUnrollK;
                 if constexpr (kCheckBounds) {
                     int64_t rem = K - k_next;
@@ -313,6 +382,16 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         // Even lanes get M rows 0-7, odd lanes get M rows 8-15
                         // Both subgroups (lanes 0-15 and 16-31) read the same M rows (duplication)
                         const int swizzled_lane = ((lane_in_subgroup & 1) << 3) | (lane_in_subgroup >> 1);
+
+                        if constexpr (mode_comm_only) {
+                            const int tile_m = warp_m + rm * kBlockWarpsM;
+                            const int tile_n = warp_n + rn * kBlockWarpsN;
+                            const int m_row = tile_m * kWmmaM + swizzled_lane;
+                            const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+                            comm_sink += __half2float(sh_a[stage][0][m_row][0]);
+                            comm_sink += __half2float(sh_b[stage][0][n_col]);
+                            continue;
+                        }
 
                         // Load 16 K elements for this lane's A data
                         // From K0×M×K1: [k0][m][k1] where k0=0..1, k1=0..7
@@ -358,8 +437,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             }
         }
 
-        if constexpr (!kOverlap) {
-            if (k_next < K) {
+        if constexpr (!do_overlap) {
+            if (has_next) {
                 __syncthreads();
                 int valid_u_next = kUnrollK;
                 if constexpr (kCheckBounds) {
@@ -377,8 +456,11 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         }
 
         stage_base = (stage_base + kUnrollK) % kStages;
-        __builtin_amdgcn_sched_barrier(0);
         __syncthreads();
+    }
+
+    if constexpr (mode_comm_only) {
+        acc[0][0] = comm_sink;
     }
 
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
@@ -436,7 +518,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     uint4 data = *reinterpret_cast<uint4*>(&my_sh_c[read_row * kCStride + read_col_base]);
                     half* h = reinterpret_cast<half*>(&data);
 
-                    // Apply bias if needed
+                    // Apply bias if enabled
                     if (has_bias) {
                         for (int i = 0; i < 8; ++i) {
                             h[i] = __hadd(h[i], bias[out_col + i]);
@@ -499,7 +581,10 @@ torch::Tensor scaled_mm_k0mk1(
     int64_t unroll_k,
     int64_t stages,
     int64_t repeat_m,
-    int64_t repeat_n)
+    int64_t repeat_n,
+    int64_t mode,
+    int64_t stagger_u_iters,
+    int64_t stagger_stride_k)
 {
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
@@ -508,6 +593,11 @@ torch::Tensor scaled_mm_k0mk1(
     TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a and b must be 2D");
     TORCH_CHECK(a.size(1) == b.size(0), "a and b shapes are incompatible");
     TORCH_CHECK(bias.scalar_type() == at::kHalf || !has_bias, "bias must be float16");
+    TORCH_CHECK(mode >= 0 && mode <= 3, "mode must be in [0, 3]");
+    TORCH_CHECK(stagger_u_iters >= 0, "stagger_u_iters must be >= 0");
+    TORCH_CHECK(stagger_stride_k > 0, "stagger_stride_k must be > 0");
+    TORCH_CHECK(stagger_u_iters <= std::numeric_limits<int>::max(), "stagger_u_iters too large");
+    TORCH_CHECK(stagger_stride_k <= std::numeric_limits<int>::max(), "stagger_stride_k too large");
 
     if (has_scale) {
         TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor");
@@ -544,27 +634,62 @@ torch::Tensor scaled_mm_k0mk1(
             (b.size(1) % kBlockN != 0) ||
             (a.size(1) % (kWmmaK * kUnrollK) != 0);
 
-        dim3 block(kWaveSize * kBlockWarpsM, kBlockWarpsN);
+        constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+        static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
+        dim3 block(kThreadsPerBlock, 1, 1);
         dim3 grid(
             (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
             (static_cast<uint32_t>(a.size(0)) + kBlockM - 1) / kBlockM);
 
-        auto dispatch_kernel = [&](auto kCheckBoundsVal) {
+        const bool enable_stagger = (stagger_u_iters > 0);
+
+        auto dispatch_kernel = [&](auto kCheckBoundsVal, auto kUseStaggerVal, auto kModeVal) {
             constexpr bool kCheckBounds = decltype(kCheckBoundsVal)::value;
+            constexpr bool kEnableStagger = decltype(kUseStaggerVal)::value;
+            constexpr int kKernelMode = decltype(kModeVal)::value;
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds>),
+                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds, kEnableStagger, kKernelMode>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 a.size(0), b.size(1), a.size(1),
                 a.stride(0), a.stride(1), b.stride(0), b.stride(1),
                 c.stride(0), c.stride(1),
+                kEnableStagger ? static_cast<int>(stagger_u_iters) : 0,
+                static_cast<int>(stagger_stride_k),
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         };
 
+        auto launch_mode = [&](auto kCheckBoundsVal, auto kUseStaggerVal) {
+            switch (mode) {
+                case kModeFull:
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeFull>{});
+                    break;
+                case kModeNoOverlap:
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeNoOverlap>{});
+                    break;
+                case kModeCommOnly:
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeCommOnly>{});
+                    break;
+                case kModeCompOnly:
+                    dispatch_kernel(kCheckBoundsVal, kUseStaggerVal, std::integral_constant<int, kModeCompOnly>{});
+                    break;
+                default:
+                    TORCH_CHECK(false, "Unsupported mode ", mode);
+            }
+        };
+
         if (check_bounds) {
-            dispatch_kernel(std::true_type{});
+            if (enable_stagger) {
+                launch_mode(std::true_type{}, std::true_type{});
+            } else {
+                launch_mode(std::true_type{}, std::false_type{});
+            }
         } else {
-            dispatch_kernel(std::false_type{});
+            if (enable_stagger) {
+                launch_mode(std::false_type{}, std::true_type{});
+            } else {
+                launch_mode(std::false_type{}, std::false_type{});
+            }
         }
     };
 
@@ -582,6 +707,7 @@ torch::Tensor scaled_mm_k0mk1(
     };
 
     bool launched =
+        try_launch(ConfigTagK0MK1<2, 2, 2, 4, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
@@ -612,5 +738,24 @@ torch::Tensor scaled_mm_k0mk1(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("scaled_mm_k0mk1", &scaled_mm_k0mk1, "Scaled mixed-precision matmul (HIP, K0MK1 layout)");
+    namespace py = pybind11;
+    m.def(
+        "scaled_mm_k0mk1",
+        &scaled_mm_k0mk1,
+        py::arg("a"),
+        py::arg("b"),
+        py::arg("scale"),
+        py::arg("bias"),
+        py::arg("has_scale"),
+        py::arg("has_bias"),
+        py::arg("block_warps_m"),
+        py::arg("block_warps_n"),
+        py::arg("unroll_k"),
+        py::arg("stages"),
+        py::arg("repeat_m"),
+        py::arg("repeat_n"),
+        py::arg("mode") = 0,
+        py::arg("stagger_u_iters") = 0,
+        py::arg("stagger_stride_k") = 128,
+        "Scaled mixed-precision matmul (HIP, K0MK1 layout)");
 }
