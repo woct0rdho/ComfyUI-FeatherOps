@@ -101,6 +101,19 @@ def _get_fixed_config():
     return values
 
 
+@lru_cache(maxsize=1)
+def _get_profile_mode() -> int:
+    """Return profiling mode selector (0 = normal kernel)."""
+    mode = os.environ.get("HIP_K0MK1_PROFILE_MODE", "0").strip()
+    try:
+        parsed = int(mode)
+    except ValueError as exc:
+        raise RuntimeError("HIP_K0MK1_PROFILE_MODE must be an integer") from exc
+    if parsed < 0:
+        raise RuntimeError("HIP_K0MK1_PROFILE_MODE must be >= 0")
+    return parsed
+
+
 def scaled_mm_hip(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -139,6 +152,7 @@ def scaled_mm_hip(
     ext = _load_hip_extension()
 
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _get_fixed_config()
+    profile_mode = _get_profile_mode()
     return ext.scaled_mm_k0mk1(
         a,
         b,
@@ -152,4 +166,5 @@ def scaled_mm_hip(
         stages,
         repeat_m,
         repeat_n,
+        profile_mode,
     )
