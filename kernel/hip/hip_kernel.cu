@@ -105,6 +105,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+    static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16 (required by row swizzle)");
+    static_assert(kBlockN % 16 == 0, "kBlockN must be a multiple of 16 (required by vec16 load)");
     // K0×M×K1 layout for A matrix (no extra LDS padding).
     // Apply row permutation on A store to improve LDS local-read banking while
     // keeping compact LDS footprint and 128-bit accesses.
@@ -206,7 +208,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                 bool in_bounds = row_in;
                 if constexpr (kCheckBounds) {
-                    in_bounds = row_in && (a_k + kK1 - 1 < K);
+                    in_bounds = in_bounds && (a_k + kK1 - 1 < K);
                 }
 
                 // vec8 load (16 bytes)
@@ -219,15 +221,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 } else {
                     // Scalar fallback
                     for (int i = 0; i < kK1; ++i) {
+                        bool item_in = row_in;
+                        if constexpr (kCheckBounds) {
+                            if (item_in) item_in = (a_k + i < K);
+                        }
+
                         half val = __float2half_rn(0.0f);
-                        if (row_in) {
-                            if constexpr (kCheckBounds) {
-                                if (a_k + i < K) {
-                                    val = a_ptr[i * stride_ak];
-                                }
-                            } else {
-                                val = a_ptr[i * stride_ak];
-                            }
+                        if (item_in) {
+                            val = a_ptr[i * stride_ak];
                         }
                         sh_a_dst[i] = val;
                     }
@@ -273,12 +274,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 if constexpr (kCheckBounds) {
                     row_in = (b_row < K);
                 }
+
                 const uint8_t* b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
 
-                bool in_bounds = row_in && (col + 15 < kBlockN);
+                bool in_bounds = row_in;
                 if constexpr (kCheckBounds) {
                     in_bounds = in_bounds && (b_col + 15 < N);
                 }
+
                 const bool can_vec = in_bounds && (stride_bn == 1) &&
                     ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
 
@@ -297,19 +300,16 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
                 } else {
                     for (int i = 0; i < 16; ++i) {
-                        if (col + i < kBlockN) {
-                            half h = __float2half_rn(0.0f);
-                            if (row_in) {
-                                if constexpr (kCheckBounds) {
-                                    if (b_col + i < N) {
-                                        h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
-                                    }
-                                } else {
-                                    h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
-                                }
-                            }
-                            sh_b[stage][row][col + i] = h;
+                        bool item_in = row_in;
+                        if constexpr (kCheckBounds) {
+                            if (item_in) item_in = (b_col + i < N);
                         }
+
+                        half h = __float2half_rn(0.0f);
+                        if (item_in) {
+                            h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
+                        }
+                        sh_b[stage][row][col + i] = h;
                     }
                 }
             }
@@ -545,6 +545,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 const int64_t out_col = tile_n_base + read_col_base;
 
                 if constexpr (kContigFastPath) {
+                    half* out_ptr = c + out_row * stride_cm + out_col;
                     half* h = sh_c + read_row_phys * kCStride + read_col_base;
 
                     if (has_bias) {
@@ -553,18 +554,18 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         }
                     }
 
-                    half* out_ptr = c + out_row * stride_cm + out_col;
                     *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
                 } else {
                     bool row_in = true;
                     if constexpr (kCheckBounds) {
                         row_in = (out_row < M);
                     }
+
                     half* out_ptr = row_in ? (c + out_row * stride_cm + out_col * stride_cn) : nullptr;
 
                     bool in_bounds = row_in;
                     if constexpr (kCheckBounds) {
-                        in_bounds = row_in && (out_col + 7 < N);
+                        in_bounds = in_bounds && (out_col + 7 < N);
                     }
 
                     const bool can_vec = in_bounds && (stride_cn == 1) &&
