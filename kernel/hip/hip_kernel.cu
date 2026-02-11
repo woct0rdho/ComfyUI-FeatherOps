@@ -725,7 +725,6 @@ torch::Tensor scaled_mm_k0mk1(
     // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
     // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     bool launched =
-        try_launch(ConfigTagK0MK1<1, 4, 2, 2, 8, 2>{}) ||
         try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
