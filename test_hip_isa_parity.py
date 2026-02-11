@@ -56,13 +56,12 @@ class KernelTemplate:
     repeat_m: int
     repeat_n: int
     check_bounds: bool
-    use_stagger: bool
-    mode: int
+    contig_fastpath: bool
 
 
 def parse_template_key(key: str) -> KernelTemplate:
     m = re.fullmatch(
-        r"ILi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELb([01])ELb([01])ELi(-?\d+)",
+        r"ILi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELi(-?\d+)ELb([01])ELb([01])",
         key,
     )
     if not m:
@@ -75,8 +74,7 @@ def parse_template_key(key: str) -> KernelTemplate:
         repeat_m=int(m.group(5)),
         repeat_n=int(m.group(6)),
         check_bounds=(m.group(7) == "1"),
-        use_stagger=(m.group(8) == "1"),
-        mode=int(m.group(9)),
+        contig_fastpath=(m.group(8) == "1"),
     )
 
 
@@ -90,7 +88,7 @@ def find_kernel_symbol(codeobj: pathlib.Path, template_key: str) -> str:
         if len(parts) < 3:
             continue
         sym = parts[-1]
-        if template_key in sym and sym.endswith("llllllllliiii"):
+        if template_key in sym:
             hits.append(sym)
     if not hits:
         raise RuntimeError(f"No kernel symbol found for template key {template_key}")
@@ -164,7 +162,7 @@ def hip_token_projection(t: KernelTemplate) -> dict[str, object]:
         "WG": f"WG32_{t.warps_m * t.warps_n}_1",
         "WS": "WS32",
         "1LDSB1_like": int(t.stages == t.unroll_k),
-        "PGR1_like": int(t.stages >= 2 * t.unroll_k and t.mode == 0),
+        "PGR1_like": int(t.stages >= 2 * t.unroll_k),
         "WSGRA_like": 0,
         "WSGRB_like": 0,
     }
@@ -216,7 +214,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--template-key",
-        default="ILi2ELi2ELi2ELi2ELi4ELi4ELb0ELb0ELi0",
+        default="ILi2ELi2ELi2ELi2ELi4ELi4ELb0ELb1",
         help="Template key fragment for active kernel",
     )
     ap.add_argument(
