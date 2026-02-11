@@ -198,14 +198,22 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     constexpr bool profile_c_only = (kProfileMode == 6);
     constexpr bool profile_a_write_only = (kProfileMode == 7);
     constexpr bool profile_a_read_only = (kProfileMode == 8);
+    constexpr bool profile_b_write_only = (kProfileMode == 9);
+    constexpr bool profile_b_read_only = (kProfileMode == 10);
     constexpr bool profile_disable_a_store =
         (kProfileMode == 1) || profile_b_only || profile_c_only || profile_a_read_only;
     constexpr bool profile_disable_a_localread =
-        (kProfileMode == 1) || profile_b_only || profile_c_only || profile_a_write_only;
-    constexpr bool profile_disable_b_path =
-        (kProfileMode == 2) || profile_a_only || profile_c_only || profile_a_write_only || profile_a_read_only;
+        (kProfileMode == 1) || profile_b_only || profile_c_only || profile_a_write_only ||
+        profile_b_write_only || profile_b_read_only;
+    constexpr bool profile_disable_b_store =
+        (kProfileMode == 2) || profile_a_only || profile_c_only || profile_a_write_only ||
+        profile_a_read_only || profile_b_read_only;
+    constexpr bool profile_disable_b_localread =
+        (kProfileMode == 2) || profile_a_only || profile_c_only || profile_a_write_only ||
+        profile_a_read_only || profile_b_write_only;
     constexpr bool profile_disable_c_shuffle =
-        (kProfileMode == 3) || profile_a_only || profile_b_only || profile_a_write_only || profile_a_read_only;
+        (kProfileMode == 3) || profile_a_only || profile_b_only || profile_a_write_only ||
+        profile_a_read_only || profile_b_write_only || profile_b_read_only;
 
     // Loading A: K0×M×K1 layout.
     // Structural parity path:
@@ -340,16 +348,24 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
                 const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
                 half h[16];
-                for(int j=0; j<4; ++j) {
+                for (int j = 0; j < 4; ++j) {
                     uint32_t p = p32[j];
-                    h[4*j+0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
-                    h[4*j+1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
-                    h[4*j+2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
-                    h[4*j+3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
+                    h[4 * j + 0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
+                    h[4 * j + 1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
+                    h[4 * j + 2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
+                    h[4 * j + 3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
                 }
-                uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
-                dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
-                dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                if constexpr (profile_b_write_only) {
+                    volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(&sh_b[stage][row][col]);
+                    #pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        dst[i] = reinterpret_cast<const __half_raw*>(&h[i])->x;
+                    }
+                } else {
+                    uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+                    dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
+                    dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                }
             } else {
                 bool row_in = true;
                 if constexpr (kCheckBounds) {
@@ -368,16 +384,24 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
                     const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
                     half h[16];
-                    for(int j=0; j<4; ++j) {
+                    for (int j = 0; j < 4; ++j) {
                         uint32_t p = p32[j];
-                        h[4*j+0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
-                        h[4*j+1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
-                        h[4*j+2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
-                        h[4*j+3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
+                        h[4 * j + 0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
+                        h[4 * j + 1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
+                        h[4 * j + 2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
+                        h[4 * j + 3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
                     }
-                    uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
-                    dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
-                    dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                    if constexpr (profile_b_write_only) {
+                        volatile uint16_t* dst = reinterpret_cast<volatile uint16_t*>(&sh_b[stage][row][col]);
+                        #pragma unroll
+                        for (int i = 0; i < 16; ++i) {
+                            dst[i] = reinterpret_cast<const __half_raw*>(&h[i])->x;
+                        }
+                    } else {
+                        uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+                        dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
+                        dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                    }
                 } else {
                     for (int i = 0; i < 16; ++i) {
                         if (col + i < kBlockN) {
@@ -391,7 +415,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                                     h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
                                 }
                             }
-                            sh_b[stage][row][col + i] = h;
+                            if constexpr (profile_b_write_only) {
+                                const uint16_t bits = reinterpret_cast<const __half_raw*>(&h)->x;
+                                reinterpret_cast<volatile uint16_t*>(&sh_b[stage][row][col + i])[0] = bits;
+                            } else {
+                                sh_b[stage][row][col + i] = h;
+                            }
                         }
                     }
                 }
@@ -419,6 +448,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         }
     }
 
+    constexpr int kShBSize = kStages * kWmmaK * (kBlockN + kBPad);
+    if constexpr (profile_b_read_only) {
+        // One-time B LDS initialization for read-dominant profiling mode.
+        for (int i = tid; i < kShBSize; i += kThreads) {
+            reinterpret_cast<half*>(sh_b)[i] = __float2half_rn(0.0f);
+        }
+    }
+
     const int64_t k0_first = chunk_k0(0);
     int valid_u0 = kUnrollK;
     if constexpr (kCheckBounds) {
@@ -434,7 +471,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     }
     for (int u = 0; u < valid_u0; ++u) {
         const int64_t k = k0_first + static_cast<int64_t>(u) * kWmmaK;
-        if (!profile_disable_b_path) {
+        if (!profile_disable_b_store) {
             load_b_lds(u, k);
         }
     }
@@ -474,7 +511,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         stage = (stage_base + kUnrollK + u) % kStages;
                     }
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    if (!profile_disable_b_path) {
+                    if (!profile_disable_b_store) {
                         load_b_lds(stage, k);
                     }
                 }
@@ -529,7 +566,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         // Load B from K×N layout
                         _Float16 reg_b[16];
                         const int n_col = tile_n * kWmmaN + lane_in_subgroup;
-                        if (!profile_disable_b_path) {
+                        if (!profile_disable_b_localread) {
                             for (int k = 0; k < kWmmaK; ++k) {
                                 reg_b[k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
                             }
@@ -592,7 +629,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         stage = (stage_base + u) % kStages;
                     }
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    if (!profile_disable_b_path) {
+                    if (!profile_disable_b_store) {
                         load_b_lds(stage, k);
                     }
                 }
@@ -849,32 +886,38 @@ torch::Tensor scaled_mm_k0mk1(
                 case 0:
                     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 0>{});
                     break;
-                case 1:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 1>{});
+                // case 1:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 1>{});
+                //     break;
+                // case 2:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 2>{});
+                //     break;
+                // case 3:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 3>{});
+                //     break;
+                // case 4:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 4>{});
+                //     break;
+                // case 5:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 5>{});
+                //     break;
+                // case 6:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 6>{});
+                //     break;
+                // case 7:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 7>{});
+                //     break;
+                // case 8:
+                //     dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 8>{});
+                //     break;
+                case 9:
+                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 9>{});
                     break;
-                case 2:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 2>{});
-                    break;
-                case 3:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 3>{});
-                    break;
-                case 4:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 4>{});
-                    break;
-                case 5:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 5>{});
-                    break;
-                case 6:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 6>{});
-                    break;
-                case 7:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 7>{});
-                    break;
-                case 8:
-                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 8>{});
+                case 10:
+                    dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 10>{});
                     break;
                 default:
-                    TORCH_CHECK(false, "Unsupported HIP_K0MK1_PROFILE_MODE. Expected 0..8");
+                    TORCH_CHECK(false, "Unsupported HIP_K0MK1_PROFILE_MODE. Expected 0..10");
             }
         };
 
