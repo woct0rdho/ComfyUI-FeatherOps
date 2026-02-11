@@ -24,7 +24,39 @@ else:
 SMEM_SIZE = triton.runtime.driver.active.utils.get_device_properties(torch.cuda.current_device())["max_shared_mem"]
 
 
+def _get_forced_triton_config() -> triton.Config | None:
+    """
+    Optional one-config override to make Triton and HIP fixed-config comparisons easy.
+    Format:
+      TRITON_SCALED_MM_FORCE_CONFIG=BLOCK_M,BLOCK_N,BLOCK_K,GROUP_M,NUM_WARPS,NUM_STAGES
+    """
+    raw = os.getenv("TRITON_SCALED_MM_FORCE_CONFIG", "").strip()
+    if not raw:
+        return None
+    vals = [int(v.strip()) for v in raw.split(",") if v.strip()]
+    if len(vals) != 6:
+        raise RuntimeError(
+            "TRITON_SCALED_MM_FORCE_CONFIG must be 6 comma-separated ints: "
+            "BLOCK_M,BLOCK_N,BLOCK_K,GROUP_M,NUM_WARPS,NUM_STAGES"
+        )
+    bm, bn, bk, gm, nw, ns = vals
+    return triton.Config(
+        {
+            "BLOCK_SIZE_M": bm,
+            "BLOCK_SIZE_N": bn,
+            "BLOCK_SIZE_K": bk,
+            "GROUP_SIZE_M": gm,
+        },
+        num_warps=nw,
+        num_stages=ns,
+    )
+
+
 def get_autotune_configs() -> list[triton.Config]:
+    forced = _get_forced_triton_config()
+    if forced is not None:
+        return [forced]
+
     configs = []
     for m, n, k, g, w, s in product(
         DEFAULT_BLOCK_SIZES_M,
@@ -105,6 +137,10 @@ def _common_prune_criteria(smem_criteria: Callable, config: triton.Config, kwarg
 
 
 def prune_configs(smem_criteria: Callable, configs: list[triton.Config], args, **kwargs) -> list[triton.Config]:
+    forced = _get_forced_triton_config()
+    if forced is not None:
+        return [forced]
+
     pruned_configs = []
     for config in configs:
         if _common_prune_criteria(smem_criteria, config, args):
