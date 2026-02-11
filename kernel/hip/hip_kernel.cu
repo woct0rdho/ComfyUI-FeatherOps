@@ -16,7 +16,6 @@
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
 
-#include <cstdlib>
 #include <type_traits>
 
 namespace {
@@ -31,20 +30,6 @@ constexpr int kWaveSize = 32;
 constexpr int kK1 = 8;
 // K0 = kWmmaK / K1 = 16 / 8 = 2
 constexpr int kK0 = kWmmaK / kK1;
-
-inline int get_profile_mode_from_env()
-{
-    const char* env = std::getenv("HIP_K0MK1_PROFILE_MODE");
-    if (!env || env[0] == '\0') {
-        return 0;
-    }
-    char* end = nullptr;
-    const long value = std::strtol(env, &end, 10);
-    if (end == env) {
-        return 0;
-    }
-    return static_cast<int>(value);
-}
 
 __device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(uint8_t x)
 {
@@ -91,8 +76,7 @@ template <int kBlockWarpsM,
           int kRepeatM,
           int kRepeatN,
           bool kCheckBounds,
-          bool kContigFastPath,
-          int kProfileMode>
+          bool kContigFastPath>
 __global__ void scaled_mm_kernel_wmma_k0mk1(
     const half* a,
     const uint8_t* b,
@@ -161,19 +145,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             acc[r][i] = 0.0f;
         }
     }
-
-    constexpr bool profile_c_lds_write_only = (kProfileMode == 11);
-    constexpr bool profile_c_lds_read_only = (kProfileMode == 12);
-    constexpr bool profile_c_global_store_only = (kProfileMode == 13);
-    constexpr bool profile_c_bias_only = (kProfileMode == 14);
-    constexpr bool profile_disable_c_lds_write =
-        profile_c_lds_read_only || profile_c_global_store_only || profile_c_bias_only;
-    constexpr bool profile_disable_c_lds_read =
-        profile_c_lds_write_only || profile_c_global_store_only;
-    constexpr bool profile_disable_c_global_store =
-        profile_c_lds_write_only || profile_c_lds_read_only || profile_c_bias_only;
-    constexpr bool profile_disable_c_bias =
-        profile_c_lds_write_only || profile_c_lds_read_only || profile_c_global_store_only;
 
     // Loading A: K0×M×K1 layout with physical/inverse row mapping and
     // wave-separated global-read ownership.
@@ -538,7 +509,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
-        constexpr int kWaveScratchElems = kWmmaM * kCStride;
         constexpr bool kUseCRowPhysicalMap = true;
 
         auto c_row_logical_to_phys = [&](int logical_row) -> int {
@@ -547,13 +517,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             }
             return logical_row;
         };
-
-        if constexpr (profile_c_lds_read_only || profile_c_bias_only) {
-            // Prepare deterministic per-wave LDS payload for C-read and C-bias profiling modes.
-            for (int i = lane; i < kWaveScratchElems; i += kWaveSize) {
-                my_sh_c[i] = __float2half_rn(1.0f);
-            }
-        }
 
         for (int rm = 0; rm < kRepeatM; ++rm) {
             for (int rn = 0; rn < kRepeatN; ++rn) {
@@ -566,19 +529,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 // Step 1: Write acc to LDS in column-major order (WMMA layout)
                 // Each thread writes 8 values to one column
                 const int col = lane_in_subgroup;
-                if constexpr (!profile_disable_c_lds_write) {
-                    for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                        const int row_logical = subgroup * 8 + acc_idx;
-                        const int row_phys = c_row_logical_to_phys(row_logical);
-                        half val = __float2half_rn(acc[repeat_idx][acc_idx]);
-                        val = __hmul(val, scale_h);
-                        my_sh_c[row_phys * kCStride + col] = val;
-                    }
-                }
-
-                if constexpr (profile_c_lds_write_only) {
-                    // Keep this mode focused on LDS write path only.
-                    continue;
+                for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
+                    const int row_logical = subgroup * 8 + acc_idx;
+                    const int row_phys = c_row_logical_to_phys(row_logical);
+                    half val = __float2half_rn(acc[repeat_idx][acc_idx]);
+                    val = __hmul(val, scale_h);
+                    my_sh_c[row_phys * kCStride + col] = val;
                 }
 
                 // Wave executes in lockstep (SIMT), so all writes complete before reads
@@ -596,107 +552,73 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                 if constexpr (!kCheckBounds) {
                     // Interior-only fast path: no edge checks.
-                    uint4 data = {};
-                    if constexpr (!profile_disable_c_lds_read) {
-                        data = *reinterpret_cast<uint4*>(&my_sh_c[read_row_phys * kCStride + read_col_base]);
-                    }
+                    uint4 data = *reinterpret_cast<uint4*>(&my_sh_c[read_row_phys * kCStride + read_col_base]);
                     half* h = reinterpret_cast<half*>(&data);
 
-                    if constexpr (!profile_disable_c_bias) {
-                        if (has_bias) {
-                            #pragma unroll
-                            for (int i = 0; i < 8; ++i) {
-                                h[i] = __hadd(h[i], bias[out_col + i]);
-                            }
+                    if (has_bias) {
+                        for (int i = 0; i < 8; ++i) {
+                            h[i] = __hadd(h[i], bias[out_col + i]);
                         }
                     }
 
-                    if constexpr (!profile_disable_c_global_store) {
-                        if constexpr (kContigFastPath) {
-                            half* out_ptr = &c[out_row * stride_cm + out_col];
+                    if constexpr (kContigFastPath) {
+                        half* out_ptr = &c[out_row * stride_cm + out_col];
+                        *reinterpret_cast<uint4*>(out_ptr) = data;
+                    } else {
+                        half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
+                        const bool can_vec = (stride_cn == 1) &&
+                            ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
+                        if (can_vec) {
                             *reinterpret_cast<uint4*>(out_ptr) = data;
                         } else {
-                            half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
-                            const bool can_vec = (stride_cn == 1) &&
-                                ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
-                            if (can_vec) {
-                                *reinterpret_cast<uint4*>(out_ptr) = data;
-                            } else {
-                                #pragma unroll
-                                for (int i = 0; i < 8; ++i) {
-                                    c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
-                                }
+                            for (int i = 0; i < 8; ++i) {
+                                c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
                             }
                         }
-                    } else {
-                        volatile uint16_t sink_bits = reinterpret_cast<const __half_raw*>(&h[0])->x;
-                        (void)sink_bits;
                     }
                 } else {
                     const bool row_ok = (out_row < M);
                     const bool col_ok = (out_col + 7 < N);
 
                     if (row_ok && col_ok) {
-                        uint4 data = {};
-                        if constexpr (!profile_disable_c_lds_read) {
-                            // vec8 read from LDS (16 bytes)
-                            data = *reinterpret_cast<uint4*>(&my_sh_c[read_row_phys * kCStride + read_col_base]);
-                        }
+                        // vec8 read from LDS (16 bytes)
+                        uint4 data = *reinterpret_cast<uint4*>(&my_sh_c[read_row_phys * kCStride + read_col_base]);
                         half* h = reinterpret_cast<half*>(&data);
 
-                        // Apply bias if enabled and not disabled by split profiling mode.
-                        if constexpr (!profile_disable_c_bias) {
-                            if (has_bias) {
-                                for (int i = 0; i < 8; ++i) {
-                                    h[i] = __hadd(h[i], bias[out_col + i]);
-                                }
+                        if (has_bias) {
+                            for (int i = 0; i < 8; ++i) {
+                                h[i] = __hadd(h[i], bias[out_col + i]);
                             }
                         }
 
-                        if constexpr (!profile_disable_c_global_store) {
-                            // vec8 write to global memory (coalesced!)
-                            if constexpr (kContigFastPath) {
-                                half* out_ptr = &c[out_row * stride_cm + out_col];
+                        // vec8 write to global memory (coalesced!)
+                        if constexpr (kContigFastPath) {
+                            half* out_ptr = &c[out_row * stride_cm + out_col];
+                            *reinterpret_cast<uint4*>(out_ptr) = data;
+                        } else {
+                            // Check alignment and stride for vectorized write.
+                            half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
+                            const bool can_vec = (stride_cn == 1) &&
+                                ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
+
+                            if (can_vec) {
                                 *reinterpret_cast<uint4*>(out_ptr) = data;
                             } else {
-                                // Check alignment and stride for vectorized write.
-                                half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
-                                const bool can_vec = (stride_cn == 1) &&
-                                    ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
-
-                                if (can_vec) {
-                                    *reinterpret_cast<uint4*>(out_ptr) = data;
-                                } else {
-                                    // Scalar fallback for non-contiguous or unaligned output
-                                    for (int i = 0; i < 8; ++i) {
-                                        c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
-                                    }
+                                // Scalar fallback for non-contiguous or unaligned output
+                                for (int i = 0; i < 8; ++i) {
+                                    c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
                                 }
                             }
-                        } else {
-                            // Keep read/bias work observable when global store is disabled.
-                            volatile uint16_t sink_bits = reinterpret_cast<const __half_raw*>(&h[0])->x;
-                            (void)sink_bits;
                         }
                     } else if (row_ok) {
                         // Scalar fallback for edge columns
                         for (int i = 0; i < 8; ++i) {
                             if (out_col + i >= N) break;
-                            half val = __float2half_rn(0.0f);
-                            if constexpr (!profile_disable_c_lds_read) {
-                                val = my_sh_c[read_row_phys * kCStride + read_col_base + i];
+                            half val = my_sh_c[read_row_phys * kCStride + read_col_base + i];
+                            if (has_bias) {
+                                val = __hadd(val, bias[out_col + i]);
                             }
-                            if constexpr (!profile_disable_c_bias) {
-                                if (has_bias) {
-                                    val = __hadd(val, bias[out_col + i]);
-                                }
-                            }
-                            if constexpr (!profile_disable_c_global_store) {
-                                c[out_row * stride_cm + (out_col + i) * stride_cn] = val;
-                            } else {
-                                volatile uint16_t sink_bits = reinterpret_cast<const __half_raw*>(&val)->x;
-                                (void)sink_bits;
-                            }
+                            c[out_row * stride_cm + (out_col + i) * stride_cn] = val;
                         }
                     }
                     // Note: if !row_ok, we skip writing (out of bounds)
@@ -760,7 +682,6 @@ torch::Tensor scaled_mm_k0mk1(
     const float* scale_ptr = has_scale ? scale.data_ptr<float>() : nullptr;
     const half* bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
     half* c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
-    const int profile_mode = get_profile_mode_from_env();
 
     auto launch = [&](auto tag) {
         constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
@@ -784,40 +705,16 @@ torch::Tensor scaled_mm_k0mk1(
             (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
             (static_cast<uint32_t>(a.size(0)) + kBlockM - 1) / kBlockM);
 
-        auto dispatch_kernel = [&](auto kCheckBoundsVal, auto kContigFastPathVal, auto kProfileModeVal) {
+        auto dispatch_kernel = [&](auto kCheckBoundsVal, auto kContigFastPathVal) {
             constexpr bool kCheckBounds = decltype(kCheckBoundsVal)::value;
             constexpr bool kEnableContigFastPath = decltype(kContigFastPathVal)::value;
-            constexpr int kProfileModeConst = decltype(kProfileModeVal)::value;
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds, kEnableContigFastPath, kProfileModeConst>),
+                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds, kEnableContigFastPath>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 a.size(0), b.size(1), a.size(1),
                 a.stride(0), a.stride(1), b.stride(0), b.stride(1),
                 c.stride(0), c.stride(1), has_scale ? 1 : 0, has_bias ? 1 : 0);
-        };
-
-        auto dispatch_kernel_with_profile = [&](auto kCheckBoundsVal, auto kContigFastPathVal) {
-            switch (profile_mode) {
-            case 0:
-                dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 0>{});
-                return;
-            case 11:
-                dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 11>{});
-                return;
-            case 12:
-                dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 12>{});
-                return;
-            case 13:
-                dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 13>{});
-                return;
-            case 14:
-                dispatch_kernel(kCheckBoundsVal, kContigFastPathVal, std::integral_constant<int, 14>{});
-                return;
-            default:
-                TORCH_CHECK(false, "Unsupported HIP_K0MK1_PROFILE_MODE=", profile_mode,
-                    ". Supported values: 0,11,12,13,14");
-            }
         };
 
         const auto is_aligned_16 = [](const void* p) {
@@ -833,12 +730,12 @@ torch::Tensor scaled_mm_k0mk1(
             is_aligned_16(c_ptr);
 
         if (check_bounds) {
-            dispatch_kernel_with_profile(std::true_type{}, std::false_type{});
+            dispatch_kernel(std::true_type{}, std::false_type{});
         } else {
             if (enable_contig_fastpath) {
-                dispatch_kernel_with_profile(std::false_type{}, std::true_type{});
+                dispatch_kernel(std::false_type{}, std::true_type{});
             } else {
-                dispatch_kernel_with_profile(std::false_type{}, std::false_type{});
+                dispatch_kernel(std::false_type{}, std::false_type{});
             }
         }
     };
@@ -859,10 +756,10 @@ torch::Tensor scaled_mm_k0mk1(
     // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
     // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     bool launched =
-        // try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
-        // try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
-        // try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
         false;
 
     TORCH_CHECK(launched, "Unsupported K0MK1 config");
