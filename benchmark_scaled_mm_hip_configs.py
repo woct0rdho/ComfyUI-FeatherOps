@@ -14,6 +14,20 @@ def _parse_sizes(text: str) -> List[int]:
     return [int(p) for p in parts]
 
 
+def _parse_shapes(text: str) -> List[Tuple[int, int, int]]:
+    shapes: List[Tuple[int, int, int]] = []
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Invalid shape '{chunk}', expected 3 comma-separated ints: M,N,K")
+        m, n, k = (int(p) for p in parts)
+        shapes.append((m, n, k))
+    return shapes
+
+
 def _parse_configs(text: str) -> List[Tuple[int, int, int, int, int, int]]:
     configs = []
     for chunk in text.split(";"):
@@ -100,7 +114,18 @@ def _iter_gflops(m: int, n: int, k: int, seconds: float) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sizes", type=str, default="4096,8192", help="Comma-separated sizes")
+    parser.add_argument(
+        "--sizes",
+        type=str,
+        default="4096,8192",
+        help="Comma-separated N values for square GEMM (M=N=K). Ignored when --shapes is set.",
+    )
+    parser.add_argument(
+        "--shapes",
+        type=str,
+        default="",
+        help="Semicolon-separated M,N,K tuples, e.g. '4096,8192,4096;8192,4096,8192'",
+    )
     parser.add_argument("--configs", type=str, default="", help="Semicolon-separated configs")
     parser.add_argument("--use-default-configs", action="store_true", help="Include hip_kernel._CONFIGS")
     parser.add_argument("--iters", type=int, default=10, help="Timing iterations per config")
@@ -109,16 +134,19 @@ def main() -> None:
     parser.add_argument("--no-bias", action="store_true")
     args = parser.parse_args()
 
-    sizes = _parse_sizes(args.sizes)
+    if args.shapes:
+        shapes = _parse_shapes(args.shapes)
+    else:
+        sizes = _parse_sizes(args.sizes)
+        shapes = [(n, n, n) for n in sizes]
     configs = _get_configs(args)
 
     torch.manual_seed(0)
     device = "cuda"
     ext = hip_kernel._load_hip_extension()
 
-    for n in sizes:
-        m = k = n
-        print(f"\nN={n} (M=K={m})")
+    for m, n, k in shapes:
+        print(f"\nShape M={m} N={n} K={k}")
         a = torch.randn(m, k, device=device, dtype=torch.float16)
         b = torch.randn(k, n, device=device, dtype=torch.float16).to(torch.float8_e4m3fn)
         scale = torch.tensor(1.0, device=device, dtype=torch.float32)
