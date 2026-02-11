@@ -86,22 +86,6 @@ def _load_hip_extension():
 
 _DEFAULT_CONFIG = (2, 2, 2, 2, 4, 4)
 _CONFIGS = (_DEFAULT_CONFIG,)
-_MODE_NAME_TO_ID = {
-    "full": 0,
-    "no_overlap": 1,
-    "comm_only": 2,
-    "comp_only": 3,
-}
-
-
-def _get_env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError as e:
-        raise RuntimeError(f"{name} must be an integer, got '{raw}'") from e
 
 
 @lru_cache(maxsize=1)
@@ -123,7 +107,6 @@ def scaled_mm_hip(
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
-    mode: str = "full",
 ) -> torch.Tensor:
     """Scaled matmul using K0MK1 LDS layout kernel (optimized for gfx11 wave32)."""
     assert a.is_cuda
@@ -156,16 +139,6 @@ def scaled_mm_hip(
     ext = _load_hip_extension()
 
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _get_fixed_config()
-    mode_name = os.environ.get("HIP_K0MK1_MODE", mode).strip().lower()
-    if mode_name not in _MODE_NAME_TO_ID:
-        raise RuntimeError(f"Unsupported mode '{mode_name}'. Valid modes: {', '.join(sorted(_MODE_NAME_TO_ID))}")
-    mode_id = _MODE_NAME_TO_ID[mode_name]
-    stagger_u_iters = _get_env_int("HIP_K0MK1_STAGGER_U", 0)
-    stagger_stride_k = _get_env_int("HIP_K0MK1_STAGGER_STRIDE_K", 128)
-    if stagger_u_iters < 0:
-        raise RuntimeError("HIP_K0MK1_STAGGER_U must be >= 0")
-    if stagger_stride_k <= 0:
-        raise RuntimeError("HIP_K0MK1_STAGGER_STRIDE_K must be > 0")
     return ext.scaled_mm_k0mk1(
         a,
         b,
@@ -179,7 +152,4 @@ def scaled_mm_hip(
         stages,
         repeat_m,
         repeat_n,
-        mode_id,
-        stagger_u_iters,
-        stagger_stride_k,
     )
