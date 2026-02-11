@@ -52,8 +52,6 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
 }
 
 // 16-row swizzle used by A LDS physical mapping.
-// logical->physical : ((x & 7) << 1) | (x >> 3)
-// physical->logical : ((x & 1) << 3) | (x >> 1)
 __host__ __device__ __forceinline__ constexpr int a_row_logical_to_phys_16(int x)
 {
     return ((x & 7) << 1) | ((x >> 3) & 1);
@@ -191,7 +189,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
             half* sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
             auto store_a_vec8 = [&](const uint4& packed) {
-                *reinterpret_cast<uint4*>(&sh_a_dst[0]) = packed;
+                *reinterpret_cast<uint4*>(sh_a_dst) = packed;
             };
 
             if constexpr (kContigFastPath) {
@@ -258,8 +256,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
             if constexpr (kContigFastPath) {
                 const uint8_t* b_ptr = b + b_row * stride_bk + b_col;
-                const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
-                const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
+                const uint32_t* p32 = reinterpret_cast<const uint32_t*>(b_ptr);
                 half h[16];
                 for (int j = 0; j < 4; ++j) {
                     uint32_t p = p32[j];
@@ -286,8 +283,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
 
                 if (can_vec) {
-                    const uint4 packed = *reinterpret_cast<const uint4*>(b_ptr);
-                    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(&packed);
+                    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(b_ptr);
                     half h[16];
                     for (int j = 0; j < 4; ++j) {
                         uint32_t p = p32[j];
@@ -419,11 +415,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         half reg_a[16];
                         for (int k0 = 0; k0 < kK0; ++k0) {
                             const half* sh_a_src = sh_a_row_ptr(stage, k0, m_row);
-                            const uint4 a_vec = *reinterpret_cast<const uint4*>(&sh_a_src[0]);
-                            const half* a_halfs = reinterpret_cast<const half*>(&a_vec);
                             #pragma unroll
                             for (int k1 = 0; k1 < kK1; ++k1) {
-                                reg_a[k0 * kK1 + k1] = a_halfs[k1];
+                                reg_a[k0 * kK1 + k1] = sh_a_src[k1];
                             }
                         }
 
@@ -504,7 +498,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         // Each warp gets its own 16×24 buffer (24 = 16 + 8 padding for bank conflicts)
         constexpr int kCPad = 8;
         constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
-        half* my_sh_c = sh_a + wave_id * kWmmaM * kCStride;
+        half* sh_c = sh_a + wave_id * kWmmaM * kCStride;
 
         const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
         const int subgroup = lane / 16;
@@ -534,7 +528,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     const int row_phys = c_row_logical_to_phys(row_logical);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     val = __hmul(val, scale_h);
-                    my_sh_c[row_phys * kCStride + col] = val;
+                    sh_c[row_phys * kCStride + col] = val;
                 }
 
                 // Wave executes in lockstep (SIMT), so all writes complete before reads
@@ -550,10 +544,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                if constexpr (!kCheckBounds) {
-                    // Interior-only fast path: no edge checks.
-                    uint4 data = *reinterpret_cast<uint4*>(&my_sh_c[read_row_phys * kCStride + read_col_base]);
-                    half* h = reinterpret_cast<half*>(&data);
+                if constexpr (kContigFastPath) {
+                    half* h = sh_c + read_row_phys * kCStride + read_col_base;
 
                     if (has_bias) {
                         for (int i = 0; i < 8; ++i) {
@@ -561,29 +553,25 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         }
                     }
 
-                    if constexpr (kContigFastPath) {
-                        half* out_ptr = &c[out_row * stride_cm + out_col];
-                        *reinterpret_cast<uint4*>(out_ptr) = data;
-                    } else {
-                        half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
-                        const bool can_vec = (stride_cn == 1) &&
-                            ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
-                        if (can_vec) {
-                            *reinterpret_cast<uint4*>(out_ptr) = data;
-                        } else {
-                            for (int i = 0; i < 8; ++i) {
-                                c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
-                            }
-                        }
-                    }
+                    half* out_ptr = c + out_row * stride_cm + out_col;
+                    *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
                 } else {
-                    const bool row_ok = (out_row < M);
-                    const bool col_ok = (out_col + 7 < N);
+                    bool row_in = true;
+                    if constexpr (kCheckBounds) {
+                        row_in = (out_row < M);
+                    }
+                    half* out_ptr = row_in ? (c + out_row * stride_cm + out_col * stride_cn) : nullptr;
 
-                    if (row_ok && col_ok) {
-                        // vec8 read from LDS (16 bytes)
-                        uint4 data = *reinterpret_cast<uint4*>(&my_sh_c[read_row_phys * kCStride + read_col_base]);
-                        half* h = reinterpret_cast<half*>(&data);
+                    bool in_bounds = row_in;
+                    if constexpr (kCheckBounds) {
+                        in_bounds = row_in && (out_col + 7 < N);
+                    }
+
+                    const bool can_vec = in_bounds && (stride_cn == 1) &&
+                        ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
+
+                    if (can_vec) {
+                        half* h = sh_c + read_row_phys * kCStride + read_col_base;
 
                         if (has_bias) {
                             for (int i = 0; i < 8; ++i) {
@@ -591,37 +579,23 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                             }
                         }
 
-                        // vec8 write to global memory (coalesced!)
-                        if constexpr (kContigFastPath) {
-                            half* out_ptr = &c[out_row * stride_cm + out_col];
-                            *reinterpret_cast<uint4*>(out_ptr) = data;
-                        } else {
-                            // Check alignment and stride for vectorized write.
-                            half* out_ptr = &c[out_row * stride_cm + out_col * stride_cn];
-                            const bool can_vec = (stride_cn == 1) &&
-                                ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
-
-                            if (can_vec) {
-                                *reinterpret_cast<uint4*>(out_ptr) = data;
-                            } else {
-                                // Scalar fallback for non-contiguous or unaligned output
-                                for (int i = 0; i < 8; ++i) {
-                                    c[out_row * stride_cm + (out_col + i) * stride_cn] = h[i];
-                                }
-                            }
-                        }
-                    } else if (row_ok) {
-                        // Scalar fallback for edge columns
+                        *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
+                    } else {
                         for (int i = 0; i < 8; ++i) {
-                            if (out_col + i >= N) break;
-                            half val = my_sh_c[read_row_phys * kCStride + read_col_base + i];
-                            if (has_bias) {
-                                val = __hadd(val, bias[out_col + i]);
+                            bool item_in = row_in;
+                            if constexpr (kCheckBounds) {
+                                if (item_in) item_in = (out_col + i < N);
                             }
-                            c[out_row * stride_cm + (out_col + i) * stride_cn] = val;
+
+                            if (item_in) {
+                                half val = sh_c[read_row_phys * kCStride + read_col_base + i];
+                                if (has_bias) {
+                                    val = __hadd(val, bias[out_col + i]);
+                                }
+                                out_ptr[i * stride_cn] = val;
+                            }
                         }
                     }
-                    // Note: if !row_ok, we skip writing (out of bounds)
                 }
             }
         }
