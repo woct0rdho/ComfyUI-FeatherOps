@@ -88,10 +88,10 @@ def _load_hip_extension():
 # K0MK1 autotune configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
 # Keep this list in sync with kernel/hip/hip_kernel.cu::try_launch table.
 _CONFIGS = (
-    # (2, 2, 2, 2, 4, 4),
-    # (2, 4, 2, 2, 4, 2),
+    (2, 2, 2, 2, 4, 4),
+    (2, 4, 2, 2, 4, 2),
     (2, 4, 2, 2, 4, 4),
-    # (4, 2, 2, 2, 2, 4),
+    (4, 2, 2, 2, 2, 4),
 )
 _DEFAULT_CONFIG = (2, 4, 2, 2, 4, 4)
 _AUTOTUNE_CACHE = {}
