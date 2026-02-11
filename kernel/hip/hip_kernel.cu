@@ -81,6 +81,19 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
     return r;
 }
 
+// 16-row swizzle used by A LDS physical mapping.
+// logical->physical : ((x & 7) << 1) | (x >> 3)
+// physical->logical : ((x & 1) << 3) | (x >> 1)
+__host__ __device__ __forceinline__ constexpr int a_row_logical_to_phys_16(int x)
+{
+    return ((x & 7) << 1) | ((x >> 3) & 1);
+}
+
+__host__ __device__ __forceinline__ constexpr int a_row_phys_to_logical_16(int x)
+{
+    return ((x & 1) << 3) | ((x >> 1) & 7);
+}
+
 // =============================================================================
 // Optimized kernel with K0×M×K1 LDS layout and direct WMMA intrinsics
 // K1 = 8 enables vec8 LDS reads (like CK)
@@ -194,19 +207,27 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     constexpr bool profile_disable_c_shuffle =
         (kProfileMode == 3) || profile_a_only || profile_b_only || profile_a_write_only || profile_a_read_only;
 
-    // Loading A: K0×M×K1 layout
-    // Thread cluster: organize threads to load K0×M elements, each loading K1=8 halfs
-    // Total elements per K tile: kK0 * kBlockM * kK1 = 2 * 128 * 8 = 2048 halfs
-    // With vec8 loading: 2048 / 8 = 256 vecs, 256 threads → 1 vec per thread
+    // Loading A: K0×M×K1 layout.
+    // Structural parity path:
+    // 1) physical LDS row mapping (swizzled)
+    // 2) inverse mapping for global logical-row source
+    // 3) WSGR (wave-separated global read) A-store ownership on torch-shape contract
     constexpr int kAVecs = kK0 * kBlockM; // 2 * 128 = 256 vec8 loads
-    constexpr int kAVecsPerThread = (kAVecs + kThreads - 1) / kThreads;
-    auto permute_row_store = [&](int m) -> int {
-        // For each 16-row tile: physical = inverse((lane&1)<<3 | (lane>>1))
-        // g(x) = ((x & 7) << 1) | (x >> 3)
-        const int tile_base = m & ~15;
-        const int local = m & 15;
-        const int perm = ((local & 7) << 1) | (local >> 3);
-        return tile_base + perm;
+    constexpr bool kUseWsgrAStoreOwnership =
+        kMatchesTorchContractShape && (Gfx1151TorchContract::kWaveSeparateGRA == 1);
+    constexpr int kAOwnerWaves =
+        kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
+    constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
+    constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
+    auto a_row_logical_to_phys = [&](int logical_row) -> int {
+        const int tile_base = logical_row & ~15;
+        const int local = logical_row & 15;
+        return tile_base + a_row_logical_to_phys_16(local);
+    };
+    auto a_row_phys_to_logical = [&](int physical_row) -> int {
+        const int tile_base = physical_row & ~15;
+        const int local = physical_row & 15;
+        return tile_base + a_row_phys_to_logical_16(local);
     };
     auto sh_a_row_ptr = [&](int stage, int k0, int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
@@ -214,20 +235,26 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     };
 
     auto load_a_lds_k0mk1 = [&](int stage, int64_t kk) {
-        // Load A into K0×M×K1 layout
-        // Each thread loads one vec8 (8 halfs = 16 bytes)
-        for (int v = 0; v < kAVecsPerThread; ++v) {
-            const int vec_idx = tid + v * kThreads;
+        // WSGR ownership: only A-owner waves issue A global->LDS stores.
+        if constexpr (kUseWsgrAStoreOwnership) {
+            if (wave_id >= kAOwnerWaves) return;
+        }
+
+        const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
+
+        // Physical LDS space is traversed directly; global logical row is obtained by inverse map.
+        for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
+            const int vec_idx = a_owner_tid + v * kAOwnerThreads;
             if (vec_idx >= kAVecs) continue;
 
-            // Decode vec_idx to [k0][m] position
+            // Decode vec_idx to [k0][m_phys].
             const int k0 = vec_idx / kBlockM;
-            const int m = vec_idx % kBlockM;
-            const int m_store = permute_row_store(m);
+            const int m_phys = vec_idx % kBlockM;
+            const int m_logical = a_row_phys_to_logical(m_phys);
 
-            const int64_t a_row = block_m + m;
+            const int64_t a_row = block_m + m_logical;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
-            half* sh_a_dst = sh_a_row_ptr(stage, k0, m_store);
+            half* sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
             auto store_a_vec8 = [&](const uint4& packed) {
                 if constexpr (profile_a_write_only) {
                     // Keep write-only profiling mode observable to prevent
