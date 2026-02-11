@@ -1,4 +1,5 @@
 import os
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -84,21 +85,117 @@ def _load_hip_extension():
     return module
 
 
-_DEFAULT_CONFIG = (2, 2, 2, 2, 4, 4)
-_CONFIGS = (_DEFAULT_CONFIG,)
+# K0MK1 autotune configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
+# Keep this list in sync with kernel/hip/hip_kernel.cu::try_launch table.
+_CONFIGS = (
+    (1, 1, 4, 4, 8, 8),
+    (1, 2, 4, 4, 8, 4),
+    (1, 4, 2, 2, 8, 2),
+    (1, 4, 4, 4, 8, 2),
+    (1, 4, 4, 4, 8, 4),
+    (1, 8, 4, 4, 8, 2),
+    (2, 1, 4, 4, 4, 8),
+    (2, 2, 2, 2, 4, 4),
+    (2, 2, 2, 4, 4, 4),
+    (2, 2, 4, 4, 4, 4),
+    (2, 2, 4, 4, 4, 8),
+    (2, 2, 4, 4, 8, 4),
+    (2, 4, 2, 2, 4, 2),
+    (2, 4, 2, 2, 4, 4),
+    (2, 4, 2, 4, 4, 4),
+    (2, 4, 4, 4, 2, 2),
+    (2, 4, 4, 4, 4, 2),
+    (2, 4, 4, 4, 4, 4),
+    (2, 8, 4, 4, 4, 2),
+    (4, 1, 4, 4, 2, 8),
+    (4, 2, 2, 2, 2, 4),
+    (4, 2, 4, 4, 2, 4),
+    (4, 2, 4, 4, 4, 4),
+    (4, 4, 4, 4, 2, 2),
+)
+_DEFAULT_CONFIG = _CONFIGS[0]
+_AUTOTUNE_CACHE = {}
 
 
 @lru_cache(maxsize=1)
-def _get_fixed_config():
-    """Return fixed config matching the torch.compile-tuned 128x128x32 kernel shape."""
+def _get_forced_config():
     cfg = os.environ.get("HIP_K0MK1_FORCE_CONFIG")
     if not cfg:
-        return _DEFAULT_CONFIG
-
+        return None
     values = tuple(int(v.strip()) for v in cfg.split(",") if v.strip())
     if len(values) != 6:
         raise RuntimeError("HIP_K0MK1_FORCE_CONFIG must contain 6 comma-separated integers: warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n")
     return values
+
+
+def _select_config(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    has_scale: bool,
+    has_bias: bool,
+    ext,
+):
+    forced = _get_forced_config()
+    if forced is not None:
+        return forced
+
+    key = (
+        tuple(a.shape),
+        tuple(b.shape),
+        tuple(a.stride()),
+        tuple(b.stride()),
+        has_scale,
+        has_bias,
+    )
+    cached = _AUTOTUNE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    warmup_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_WARMUP", "1")))
+    bench_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_ITERS", "3")))
+    best_cfg = _DEFAULT_CONFIG
+    best_ms = None
+
+    def run(cfg):
+        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        return ext.scaled_mm_k0mk1(
+            a,
+            b,
+            scale,
+            bias,
+            has_scale,
+            has_bias,
+            warps_m,
+            warps_n,
+            unroll_k,
+            stages,
+            repeat_m,
+            repeat_n,
+        )
+
+    # Warm up all candidates once to compile/load kernels.
+    for cfg in _CONFIGS:
+        for _ in range(warmup_iters):
+            run(cfg)
+    torch.cuda.synchronize()
+
+    # Time each candidate.
+    for cfg in _CONFIGS:
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            run(cfg)
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - start) * 1000.0 / bench_iters
+        if best_ms is None or ms < best_ms:
+            best_ms = ms
+            best_cfg = cfg
+
+    _AUTOTUNE_CACHE[key] = best_cfg
+    wm, wn, uk, st, rm, rn = best_cfg
+    print(f"HIP K0MK1 autotune M={a.shape[0]} N={b.shape[1]} K={a.shape[1]} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    return best_cfg
 
 
 def scaled_mm_hip(
@@ -138,7 +235,15 @@ def scaled_mm_hip(
 
     ext = _load_hip_extension()
 
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _get_fixed_config()
+    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config(
+        a,
+        b,
+        scale_tensor,
+        bias_tensor,
+        has_scale,
+        has_bias,
+        ext,
+    )
     return ext.scaled_mm_k0mk1(
         a,
         b,

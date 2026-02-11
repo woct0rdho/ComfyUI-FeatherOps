@@ -31,36 +31,6 @@ constexpr int kK1 = 8;
 // K0 = kWmmaK / K1 = 16 / 8 = 2
 constexpr int kK0 = kWmmaK / kK1;
 
-// -----------------------------------------------------------------------------
-// Target contract (torch.compile Tensile kernel on gfx1151).
-// This freezes the intended kernel shape/schedule knobs in one place.
-//
-// Target name tokens:
-//   MT128x128x32, WG32_4_1, WS32, PGR1, PLR0, SIA3, 1LDSB1,
-//   WSGRA1, WSGRB1, LRVW16
-//
-// Notes:
-// - Only a subset is currently asserted structurally here (tile/workgroup/depthU).
-// - Scheduling semantics (PGR1/SIA3/etc.) are implemented incrementally.
-// - SU32/SUS256 were explored and not kept in this HIP path.
-// -----------------------------------------------------------------------------
-struct Gfx1151TorchContract {
-    static constexpr int kMacroTileM = 128;      // MT128x...
-    static constexpr int kMacroTileN = 128;      // MT...x128x...
-    static constexpr int kDepthU = 32;           // MT...x...x32
-    static constexpr int kWaveSize = 32;         // WS32
-    static constexpr int kWorkgroupWaves = 4;    // WG32_4_1
-    static constexpr int kWorkgroupSize = kWaveSize * kWorkgroupWaves; // 128 threads
-    static constexpr int kUnrollK = kDepthU / kWmmaK; // 2
-    static constexpr int kPrefetchGlobalRead = 1; // PGR1
-    static constexpr int kPrefetchLocalRead = 0;  // PLR0
-    static constexpr int kScheduleIterAlg = 3;    // SIA3
-    static constexpr int kUseOneLdsBuffer = 1;    // 1LDSB1
-    static constexpr int kWaveSeparateGRA = 1;    // WSGRA1
-    static constexpr int kWaveSeparateGRB = 1;    // WSGRB1
-    static constexpr int kLocalReadVectorWidth = 16; // LRVW16
-};
-
 __device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(uint8_t x)
 {
     const uint16_t x_u16 = static_cast<uint16_t>(x);
@@ -137,14 +107,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
-    constexpr bool kMatchesTorchContractShape =
-        (kBlockM == Gfx1151TorchContract::kMacroTileM) &&
-        (kBlockN == Gfx1151TorchContract::kMacroTileN) &&
-        (kUnrollK * kWmmaK == Gfx1151TorchContract::kDepthU) &&
-        (kBlockWarpsM == 2) &&
-        (kBlockWarpsN == 2) &&
-        (kRepeatM == 4) &&
-        (kRepeatN == 4);
     // K0×M×K1 layout for A matrix (no extra LDS padding).
     // Apply row permutation on A store to improve LDS local-read banking while
     // keeping compact LDS footprint and 128-bit accesses.
@@ -168,16 +130,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     const int tid = static_cast<int>(threadIdx.x) + static_cast<int>(threadIdx.y) * static_cast<int>(blockDim.x);
     constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
-    if constexpr (kMatchesTorchContractShape) {
-        static_assert(kWaveSize == Gfx1151TorchContract::kWaveSize,
-            "Target contract mismatch: expected WS32");
-        static_assert(kThreads == Gfx1151TorchContract::kWorkgroupSize,
-            "Target contract mismatch: expected WG32_4_1 (128 threads)");
-        static_assert(kUnrollK == Gfx1151TorchContract::kUnrollK,
-            "Target contract mismatch: expected DepthU=32 with kWmmaK=16");
-    }
 
-    // Flattened wave mapping: use 1D thread blocks to mirror rocBLAS/Tensile WG32_4_1 style.
+    // Flattened wave mapping with 1D thread blocks.
     const int wave_id = tid / kWaveSize;
     const int warp_m = wave_id % kBlockWarpsM;
     const int warp_n = wave_id / kBlockWarpsM;
@@ -192,14 +146,10 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         }
     }
 
-    // Loading A: K0×M×K1 layout.
-    // Structural parity path:
-    // 1) physical LDS row mapping (swizzled)
-    // 2) inverse mapping for global logical-row source
-    // 3) WSGR (wave-separated global read) A-store ownership on torch-shape contract
+    // Loading A: K0×M×K1 layout with physical/inverse row mapping and
+    // wave-separated global-read ownership.
     constexpr int kAVecs = kK0 * kBlockM; // 2 * 128 = 256 vec8 loads
-    constexpr bool kUseWsgrAStoreOwnership =
-        kMatchesTorchContractShape && (Gfx1151TorchContract::kWaveSeparateGRA == 1);
+    constexpr bool kUseWsgrAStoreOwnership = true;
     constexpr int kAOwnerWaves =
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
@@ -452,9 +402,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     stage = (stage_base + u) % kStages;
                 }
 
-                if constexpr (kMatchesTorchContractShape && !do_overlap) {
-                    // Per-U LDS wait before local-read + WMMA sequence.
-                    asm volatile("s_waitcnt lgkmcnt(0)\n\t" ::: "memory");
+                if constexpr (!do_overlap) {
+                    // No-overlap schedule needs an explicit LDS wait before local-read + WMMA.
+                    // asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
                 }
                 for (int rm = 0; rm < kRepeatM; ++rm) {
                     for (int rn = 0; rn < kRepeatN; ++rn) {
@@ -509,10 +459,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
         if constexpr (!do_overlap) {
             if (has_next) {
-                if constexpr (kMatchesTorchContractShape) {
-                    // Selective asm issue hint around no-overlap A/B load slice.
-                    asm volatile("s_setprio 1\n\t" ::: "memory");
-                }
+                // Raise priority around the no-overlap refill slice.
+                asm volatile("s_setprio 1" ::: "memory");
                 int valid_u_next = kUnrollK;
                 if constexpr (kCheckBounds) {
                     int64_t rem = K - k_next;
@@ -539,9 +487,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     load_b_lds(stage, k);
                 }
-                if constexpr (kMatchesTorchContractShape) {
-                    asm volatile("s_setprio 0\n\t" ::: "memory");
-                }
+                asm volatile("s_setprio 0" ::: "memory");
             }
         }
 
@@ -715,14 +661,6 @@ torch::Tensor scaled_mm_k0mk1(
         constexpr int kRepeatN = decltype(tag)::kRepeatN;
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
         constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
-        constexpr bool kMatchesTorchContractShape =
-            (kBlockM == Gfx1151TorchContract::kMacroTileM) &&
-            (kBlockN == Gfx1151TorchContract::kMacroTileN) &&
-            (kUnrollK * kWmmaK == Gfx1151TorchContract::kDepthU) &&
-            (kBlockWarpsM == 2) &&
-            (kBlockWarpsN == 2) &&
-            (kRepeatM == 4) &&
-            (kRepeatN == 4);
 
         const bool check_bounds =
             (a.size(0) % kBlockM != 0) ||
@@ -731,10 +669,6 @@ torch::Tensor scaled_mm_k0mk1(
 
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
         static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
-        if constexpr (kMatchesTorchContractShape) {
-            static_assert(kThreadsPerBlock == Gfx1151TorchContract::kWorkgroupSize,
-                "Target contract mismatch: expected 128-thread workgroup for MT128x128x32");
-        }
         dim3 block(kThreadsPerBlock, 1, 1);
         dim3 grid(
             (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
@@ -752,20 +686,17 @@ torch::Tensor scaled_mm_k0mk1(
                 c.stride(0), c.stride(1), has_scale ? 1 : 0, has_bias ? 1 : 0);
         };
 
-        bool enable_contig_fastpath = false;
-        if constexpr (kMatchesTorchContractShape) {
-            const auto is_aligned_16 = [](const void* p) {
-                return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
-            };
-            enable_contig_fastpath =
-                !check_bounds &&
-                (a.stride(1) == 1) &&
-                (b.stride(1) == 1) &&
-                (c.stride(1) == 1) &&
-                is_aligned_16(a_ptr) &&
-                is_aligned_16(b_ptr) &&
-                is_aligned_16(c_ptr);
-        }
+        const auto is_aligned_16 = [](const void* p) {
+            return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
+        };
+        const bool enable_contig_fastpath =
+            !check_bounds &&
+            (a.stride(1) == 1) &&
+            (b.stride(1) == 1) &&
+            (c.stride(1) == 1) &&
+            is_aligned_16(a_ptr) &&
+            is_aligned_16(b_ptr) &&
+            is_aligned_16(c_ptr);
 
         if (check_bounds) {
             dispatch_kernel(std::true_type{}, std::false_type{});
@@ -791,36 +722,34 @@ torch::Tensor scaled_mm_k0mk1(
         return false;
     };
 
-    // Keep only the active fixed config; autotune configs are disabled to reduce compile time.
+    // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
+    // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     bool launched =
-        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{});
-
-    /*
-    Disabled autotune configs:
-        try_launch(ConfigTagK0MK1<2, 2, 2, 4, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<1, 1, 4, 4, 8, 8>{}) ||
+        try_launch(ConfigTagK0MK1<1, 2, 4, 4, 8, 4>{}) ||
         try_launch(ConfigTagK0MK1<1, 4, 2, 2, 8, 2>{}) ||
         try_launch(ConfigTagK0MK1<1, 4, 4, 4, 8, 2>{}) ||
-        try_launch(ConfigTagK0MK1<4, 1, 4, 4, 2, 8>{}) ||
-        try_launch(ConfigTagK0MK1<1, 2, 4, 4, 8, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 1, 4, 4, 4, 8>{}) ||
-        try_launch(ConfigTagK0MK1<1, 1, 4, 4, 8, 8>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 2>{}) ||
-        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 2, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<1, 4, 4, 4, 8, 4>{}) ||
         try_launch(ConfigTagK0MK1<1, 8, 4, 4, 8, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 8, 4, 4, 4, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 2, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 8, 4>{}) ||
-        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 1, 4, 4, 4, 8>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 2, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 2, 4, 4, 4, 8>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 4, 4, 8, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 2, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 8, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<4, 1, 4, 4, 2, 8>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 2, 4>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 4, 4, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<4, 4, 4, 4, 2, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 4, 4, 4>{});
-    */
+        false;
 
     TORCH_CHECK(launched, "Unsupported K0MK1 config");
     return c;
