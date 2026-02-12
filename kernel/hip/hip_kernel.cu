@@ -47,6 +47,34 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(const uint8_t x)
     return r;
 }
 
+// Packed fp8e4m3fn → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
+// Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
+// Ignores denormals (values with zero exponent map to small fp16 instead of zero).
+__device__ __forceinline__ void fp8x4_to_half2x2(
+    const uint32_t p, uint32_t& out_lo, uint32_t& out_hi)
+{
+    // p = [b3:b2:b1:b0], each byte is fp8e4m3fn
+    // Pair bytes for sequential output: [b1:b0] and [b3:b2]
+    // lo_pair has b0 in [7:0] and b1 in [23:16]
+    // hi_pair has b2 in [7:0] and b3 in [23:16]
+    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);       // [0:b1:0:b0]
+    const uint32_t hi_pair = ((p >> 16) & 0xFFu) | ((p >> 8) & 0xFF0000u); // [0:b3:0:b2]
+
+    // Convert each pair simultaneously using 32-bit ops:
+    // For each byte x at [7:0] or [23:16]:
+    //   fp16 = ((x & 0x80) << 8) | (((x & 0x7F) << 7) + 0x2000)
+    {
+        const uint32_t signs = (lo_pair & 0x00800080u) << 8;
+        const uint32_t em = ((lo_pair & 0x007F007Fu) << 7) + 0x20002000u;
+        out_lo = signs | em;  // [fp16(b1) : fp16(b0)]
+    }
+    {
+        const uint32_t signs = (hi_pair & 0x00800080u) << 8;
+        const uint32_t em = ((hi_pair & 0x007F007Fu) << 7) + 0x20002000u;
+        out_hi = signs | em;  // [fp16(b3) : fp16(b2)]
+    }
+}
+
 // 16-row swizzle used by A LDS physical mapping.
 __device__ __forceinline__ constexpr int a_row_logical_to_phys_16(const int x)
 {
@@ -259,18 +287,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             if constexpr (kContigFastPath) {
                 const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
                 const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
-                half h[16];
+                uint32_t h32[8];
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    uint32_t p = p32[j];
-                    h[4 * j + 0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
-                    h[4 * j + 1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
-                    h[4 * j + 2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
-                    h[4 * j + 3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
+                    fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
                 }
                 uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
-                dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
-                dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                dst_ptr[0] = *reinterpret_cast<uint4*>(&h32[0]);
+                dst_ptr[1] = *reinterpret_cast<uint4*>(&h32[4]);
             } else {
                 bool row_in = true;
                 if constexpr (kCheckBounds) {
@@ -289,18 +313,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                 if (can_vec) {
                     const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
-                    half h[16];
+                    uint32_t h32[8];
                     #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        uint32_t p = p32[j];
-                        h[4 * j + 0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
-                        h[4 * j + 1] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 8) & 0xFFu));
-                        h[4 * j + 2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
-                        h[4 * j + 3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
+                        fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
                     }
                     uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
-                    dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
-                    dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
+                    dst_ptr[0] = *reinterpret_cast<uint4*>(&h32[0]);
+                    dst_ptr[1] = *reinterpret_cast<uint4*>(&h32[4]);
                 } else {
                     #pragma unroll
                     for (int i = 0; i < 16; ++i) {
@@ -320,9 +340,174 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         }
     };
 
+    // =========================================================================
+    // Split-phase load lambdas for VMEM/WMMA overlap (prefetch path)
+    // Phase 1: issue global_load → VGPR buffers (VMEM unit, can overlap with WMMA)
+    // Phase 2: VALU convert + ds_write from VGPR buffers → LDS (SIMD unit, serial)
+    // =========================================================================
+
+    // A prefetch buffers: one uint4 per vec load, per sub-iteration
+    uint4 a_prefetch_buf[kUnrollK][kAVecsPerOwnerThread];
+
+    // B prefetch buffers: 4 uint32_t per vec16 load, per sub-iteration
+    uint32_t b_prefetch_buf[kUnrollK][kBVecsPerThread][4];
+
+    // Phase 1 for A: issue global_load → VGPR buffer (no LDS write)
+    const auto prefetch_a_global = [&](const int u, const int64_t kk) -> void {
+        if constexpr (kUseWsgrAStoreOwnership) {
+            if (wave_id >= kAOwnerWaves) return;
+        }
+        const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
+
+        #pragma unroll
+        for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
+            const int vec_idx = a_owner_tid + v * kAOwnerThreads;
+            if (vec_idx >= kAVecs) continue;
+
+            const int k0 = vec_idx / kBlockM;
+            const int m_phys = vec_idx % kBlockM;
+            const int m_logical = a_row_phys_to_logical(m_phys);
+            const int64_t a_row = block_m + m_logical;
+            const int64_t a_k = kk + k0 * kK1;
+
+            if constexpr (kContigFastPath) {
+                const half* const a_ptr = a + a_row * stride_am + a_k;
+                a_prefetch_buf[u][v] = *reinterpret_cast<const uint4*>(a_ptr);
+            } else {
+                bool row_in = true;
+                if constexpr (kCheckBounds) {
+                    row_in = (a_row < M);
+                }
+                const half* const a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
+                bool in_bounds = row_in;
+                if constexpr (kCheckBounds) {
+                    in_bounds = in_bounds && (a_k + kK1 - 1 < K);
+                }
+                const bool can_vec = in_bounds && (stride_ak == 1) &&
+                    ((reinterpret_cast<uintptr_t>(a_ptr) & 0xFu) == 0u);
+                if (can_vec) {
+                    a_prefetch_buf[u][v] = *reinterpret_cast<const uint4*>(a_ptr);
+                } else {
+                    // Scalar fallback: load into buffer as half array
+                    half* const buf_h = reinterpret_cast<half*>(&a_prefetch_buf[u][v]);
+                    #pragma unroll
+                    for (int i = 0; i < kK1; ++i) {
+                        bool item_in = row_in;
+                        if constexpr (kCheckBounds) {
+                            if (item_in) item_in = (a_k + i < K);
+                        }
+                        buf_h[i] = item_in ? a_ptr[i * stride_ak] : __float2half_rn(0.0f);
+                    }
+                }
+            }
+        }
+    };
+
+    // Phase 2 for A: write VGPR buffer → LDS (ds_write only, no global access)
+    const auto commit_a_lds = [&](const int u, const int stage) -> void {
+        if constexpr (kUseWsgrAStoreOwnership) {
+            if (wave_id >= kAOwnerWaves) return;
+        }
+        const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
+
+        #pragma unroll
+        for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
+            const int vec_idx = a_owner_tid + v * kAOwnerThreads;
+            if (vec_idx >= kAVecs) continue;
+
+            const int k0 = vec_idx / kBlockM;
+            const int m_phys = vec_idx % kBlockM;
+            half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
+            *reinterpret_cast<uint4*>(sh_a_dst) = a_prefetch_buf[u][v];
+        }
+    };
+
+    // Phase 1 for B: issue global_load → VGPR buffer (raw fp8 bytes, no conversion)
+    const auto prefetch_b_global = [&](const int u, const int64_t kk) -> void {
+        #pragma unroll
+        for (int v = 0; v < kBVecsPerThread; ++v) {
+            const int vec_idx = tid + v * kThreads;
+            const int elem_base = vec_idx * 16;
+            if (elem_base >= kBElements) continue;
+
+            const int row = elem_base / kBlockN;
+            const int col = elem_base % kBlockN;
+            const int64_t b_row = kk + row;
+            const int64_t b_col = block_n + col;
+
+            if constexpr (kContigFastPath) {
+                const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
+                const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    b_prefetch_buf[u][v][j] = p32[j];
+                }
+            } else {
+                bool row_in = true;
+                if constexpr (kCheckBounds) {
+                    row_in = (b_row < K);
+                }
+                const uint8_t* const b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
+                bool in_bounds = row_in;
+                if constexpr (kCheckBounds) {
+                    in_bounds = in_bounds && (b_col + 15 < N);
+                }
+                const bool can_vec = in_bounds && (stride_bn == 1) &&
+                    ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
+                if (can_vec) {
+                    const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        b_prefetch_buf[u][v][j] = p32[j];
+                    }
+                } else {
+                    // Scalar fallback: pack bytes into uint32
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        uint32_t packed = 0;
+                        #pragma unroll
+                        for (int bi = 0; bi < 4; ++bi) {
+                            const int i = j * 4 + bi;
+                            bool item_in = row_in;
+                            if constexpr (kCheckBounds) {
+                                if (item_in) item_in = (b_col + i < N);
+                            }
+                            uint8_t byte_val = 0;
+                            if (item_in) {
+                                byte_val = b_ptr[i * stride_bn];
+                            }
+                            packed |= static_cast<uint32_t>(byte_val) << (bi * 8);
+                        }
+                        b_prefetch_buf[u][v][j] = packed;
+                    }
+                }
+            }
+        }
+    };
+
+    // Phase 2 for B: VALU fp8→fp16 convert + ds_write from VGPR buffer → LDS
+    const auto commit_b_lds = [&](const int u, const int stage) -> void {
+        #pragma unroll
+        for (int v = 0; v < kBVecsPerThread; ++v) {
+            const int vec_idx = tid + v * kThreads;
+            const int elem_base = vec_idx * 16;
+            if (elem_base >= kBElements) continue;
+
+            const int row = elem_base / kBlockN;
+            const int col = elem_base % kBlockN;
+
+            uint32_t h32[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                fp8x4_to_half2x2(b_prefetch_buf[u][v][j], h32[2 * j], h32[2 * j + 1]);
+            }
+            uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+            dst_ptr[0] = *reinterpret_cast<uint4*>(&h32[0]);
+            dst_ptr[1] = *reinterpret_cast<uint4*>(&h32[4]);
+        }
+    };
+
     // Pipeline setup
-    constexpr bool kSupportsOverlap = (kStages >= 2 * kUnrollK);
-    constexpr bool do_overlap = kSupportsOverlap;
     constexpr int kChunkK = kWmmaK * kUnrollK;
     const int total_chunks = static_cast<int>((K + kChunkK - 1) / kChunkK);
 
@@ -330,9 +515,67 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         return static_cast<int64_t>(iter_idx) * kChunkK;
     };
 
+    // True double-buffering requires kStages >= 2*kUnrollK (e.g. kStages=4, kUnrollK=2).
+    // Read from stages [stage_base .. stage_base+kUnrollK-1],
+    // write to stages [(stage_base+kUnrollK) .. (stage_base+2*kUnrollK-1)] % kStages.
+    // Only 1 __syncthreads() per iteration since read/write stage sets are disjoint.
+    constexpr bool kDoubleBuffer = (kStages >= 2 * kUnrollK);
+
+    // WMMA compute lambda for one sub-iteration (one stage).
+    const auto wmma_compute_stage = [&](const int stage, const int64_t k0_iter) -> void {
+        if (wave_id >= kBlockWarpsM * kBlockWarpsN) return;
+
+        #pragma unroll
+        for (int rm = 0; rm < kRepeatM; ++rm) {
+            #pragma unroll
+            for (int rn = 0; rn < kRepeatN; ++rn) {
+                const int repeat_idx = rm * kRepeatN + rn;
+                const int tile_m = warp_m + rm * kBlockWarpsM;
+                const int tile_n = warp_n + rn * kBlockWarpsN;
+
+                const int lane_in_subgroup = lane % 16;
+                const int m_row = tile_m * kWmmaM + lane_in_subgroup;
+                half reg_a[16];
+                #pragma unroll
+                for (int k0 = 0; k0 < kK0; ++k0) {
+                    const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
+                    #pragma unroll
+                    for (int k1 = 0; k1 < kK1; ++k1) {
+                        reg_a[k0 * kK1 + k1] = sh_a_src[k1];
+                    }
+                }
+
+                _Float16 reg_b[16];
+                const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+                #pragma unroll
+                for (int k = 0; k < kWmmaK; ++k) {
+                    reg_b[k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
+                }
+
+                using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
+                using float8_t = float __attribute__((ext_vector_type(8)));
+
+                _Float16 reg_a_fp16[16];
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    reg_a_fp16[i] = static_cast<_Float16>(reg_a[i]);
+                }
+
+                const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
+                const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(reg_b);
+                float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
+
+                c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
+
+                *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
+            }
+        }
+    };
+
     int stage_base = 0;
 
-    constexpr int64_t k0_first = chunk_k0(0);
+    // Prologue: load first chunk into LDS using monolithic loads
+    constexpr int64_t k0_first = 0;
     int valid_u0 = kUnrollK;
     if constexpr (kCheckBounds) {
         int64_t rem = K - k0_first;
@@ -349,155 +592,106 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     }
     __syncthreads();
 
-    // Main loop
+    // =========================================================================
+    // Main loop with VMEM/WMMA overlap via split-phase loads + ASM fences.
+    //
+    // When kDoubleBuffer (kStages >= 2*kUnrollK):
+    //   Read stages [stage_base..+kUnrollK-1], write stages [stage_base+kUnrollK..+2*kUnrollK-1].
+    //   Disjoint stage sets → no read/write race → only 1 __syncthreads().
+    //
+    // Schedule per iteration:
+    //   1. prefetch_global(all u) for next chunk → VMEM (fire-and-forget)
+    //   2. ASM fence
+    //   3. WMMA compute(all u) on current stages → Matrix unit (CONCURRENT with VMEM)
+    //   4. s_waitcnt vmcnt(0)
+    //   5. commit_lds(all u) to next stages → VALU convert + ds_write
+    //   6. __syncthreads() + advance stage_base
+    //
+    // When !kDoubleBuffer (kStages == kUnrollK):
+    //   Fallback: serial compute-then-load with single __syncthreads().
+    // =========================================================================
     for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
         const int64_t k0_iter = chunk_k0(iter_idx);
         const bool has_next = (iter_idx + 1 < total_chunks);
         const int64_t k_next = has_next ? chunk_k0(iter_idx + 1) : 0;
 
-        if constexpr (do_overlap) {
-            if (has_next) {
-                int valid_u_next = kUnrollK;
-                if constexpr (kCheckBounds) {
-                    int64_t rem = K - k_next;
-                    valid_u_next = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
-                    if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
-                }
-                for (int u = 0; u < valid_u_next; ++u) {
-                    int stage = 0;
-                    if constexpr (kStages == kUnrollK) {
-                        stage = u;
-                    } else {
-                        stage = (stage_base + kUnrollK + u) % kStages;
-                    }
-                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    load_a_lds_k0mk1(stage, k);
-                }
-                for (int u = 0; u < valid_u_next; ++u) {
-                    int stage = 0;
-                    if constexpr (kStages == kUnrollK) {
-                        stage = u;
-                    } else {
-                        stage = (stage_base + kUnrollK + u) % kStages;
-                    }
-                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                    load_b_lds(stage, k);
-                }
-            }
+        int valid_u = kUnrollK;
+        if constexpr (kCheckBounds) {
+            int64_t rem = K - k0_iter;
+            valid_u = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
+            if (valid_u > kUnrollK) valid_u = kUnrollK;
         }
 
-        // Compute: use direct WMMA intrinsic
-        if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-            int valid_u = kUnrollK;
+        int valid_u_next = 0;
+        if (has_next) {
+            valid_u_next = kUnrollK;
             if constexpr (kCheckBounds) {
-                int64_t rem = K - k0_iter;
-                valid_u = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
-                if (valid_u > kUnrollK) valid_u = kUnrollK;
-            }
-            for (int u = 0; u < valid_u; ++u) {
-                int stage = 0;
-                if constexpr (kStages == kUnrollK) {
-                    stage = u;
-                } else {
-                    stage = (stage_base + u) % kStages;
-                }
-
-                if constexpr (!do_overlap) {
-                    // No-overlap schedule needs an explicit LDS wait before local-read + WMMA.
-                    // asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-                }
-                #pragma unroll
-                for (int rm = 0; rm < kRepeatM; ++rm) {
-                    #pragma unroll
-                    for (int rn = 0; rn < kRepeatN; ++rn) {
-                        const int repeat_idx = rm * kRepeatN + rn;
-                        const int tile_m = warp_m + rm * kBlockWarpsM;
-                        const int tile_n = warp_n + rn * kBlockWarpsN;
-
-                        // Load A from K0×M×K1 layout into registers.
-                        const int lane_in_subgroup = lane % 16;
-
-                        const int m_row = tile_m * kWmmaM + lane_in_subgroup;
-                        half reg_a[16];
-                        #pragma unroll
-                        for (int k0 = 0; k0 < kK0; ++k0) {
-                            const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
-                            #pragma unroll
-                            for (int k1 = 0; k1 < kK1; ++k1) {
-                                reg_a[k0 * kK1 + k1] = sh_a_src[k1];
-                            }
-                        }
-
-                        // Load B from K×N layout
-                        _Float16 reg_b[16];
-                        const int n_col = tile_n * kWmmaN + lane_in_subgroup;
-                        #pragma unroll
-                        for (int k = 0; k < kWmmaK; ++k) {
-                            reg_b[k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
-                        }
-
-                        // Execute WMMA intrinsic
-                        // Use _Float16 for vector types (required by HIP/clang)
-                        using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
-                        using float8_t = float __attribute__((ext_vector_type(8)));
-
-                        // Convert half registers to _Float16 for WMMA
-                        _Float16 reg_a_fp16[16];
-                        #pragma unroll
-                        for (int i = 0; i < 16; ++i) {
-                            reg_a_fp16[i] = static_cast<_Float16>(reg_a[i]);
-                        }
-
-                        const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
-                        const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(reg_b);
-                        float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
-
-                        c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
-
-                        *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
-                    }
-                }
+                int64_t rem = K - k_next;
+                valid_u_next = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
+                if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
             }
         }
 
-        if constexpr (!do_overlap) {
-            if (has_next) {
-                // Raise priority around the no-overlap refill slice.
-                asm volatile("s_setprio 1" ::: "memory");
-                int valid_u_next = kUnrollK;
-                if constexpr (kCheckBounds) {
-                    int64_t rem = K - k_next;
-                    valid_u_next = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
-                    if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
+        if constexpr (kDoubleBuffer) {
+            // --- Phase 1: Issue global_load for next chunk (VMEM, fire-and-forget) ---
+            for (int u = 0; u < valid_u; ++u) {
+                if (has_next && u < valid_u_next) {
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    prefetch_a_global(u, k);
+                    prefetch_b_global(u, k);
                 }
+            }
+
+            // ASM fence: prevent compiler from moving WMMA before global_load
+            asm volatile("" ::: "memory");
+
+            // --- Phase 2: WMMA compute on current LDS data (Matrix unit) ---
+            // Concurrent with in-flight global_loads on VMEM unit.
+            for (int u = 0; u < valid_u; ++u) {
+                const int read_stage = (stage_base + u) % kStages;
+                wmma_compute_stage(read_stage, k0_iter);
+            }
+
+            // --- Phase 3: Wait for global loads, then convert+store to NEXT stages ---
+            // No barrier needed before commit — write stages are disjoint from read stages.
+            if (has_next) {
+                asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
                 for (int u = 0; u < valid_u_next; ++u) {
-                    int stage = 0;
-                    if constexpr (kStages == kUnrollK) {
-                        stage = u;
-                    } else {
-                        stage = (stage_base + u) % kStages;
-                    }
+                    const int write_stage = (stage_base + kUnrollK + u) % kStages;
+                    commit_a_lds(u, write_stage);
+                    commit_b_lds(u, write_stage);
+                }
+            }
+
+            stage_base = (stage_base + kUnrollK) % kStages;
+            __syncthreads();
+        } else {
+            // Fallback: serial compute-then-load (original schedule, 1 sync)
+            for (int u = 0; u < valid_u; ++u) {
+                const int stage = (stage_base + u) % kStages;
+                wmma_compute_stage(stage, k0_iter);
+            }
+
+            if (has_next) {
+                asm volatile("s_setprio 1" ::: "memory");
+                for (int u = 0; u < valid_u_next; ++u) {
+                    const int stage = (stage_base + u) % kStages;
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     load_a_lds_k0mk1(stage, k);
                 }
                 for (int u = 0; u < valid_u_next; ++u) {
-                    int stage = 0;
-                    if constexpr (kStages == kUnrollK) {
-                        stage = u;
-                    } else {
-                        stage = (stage_base + u) % kStages;
-                    }
+                    const int stage = (stage_base + u) % kStages;
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     load_b_lds(stage, k);
                 }
                 asm volatile("s_setprio 0" ::: "memory");
             }
-        }
 
-        if constexpr (kStages != kUnrollK) {
-            stage_base = (stage_base + kUnrollK) % kStages;
+            if constexpr (kStages != kUnrollK) {
+                stage_base = (stage_base + kUnrollK) % kStages;
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
