@@ -522,47 +522,50 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     constexpr bool kDoubleBuffer = (kStages >= 2 * kUnrollK);
 
     // WMMA compute lambda for one sub-iteration (one stage).
+    // Register-tiling: load all B fragments once, then iterate rm with A loads.
+    // Reduces LDS reads from (kRepeatM*kRepeatN)*(16+16) to kRepeatN*16 + kRepeatM*16.
     const auto wmma_compute_stage = [&](const int stage, const int64_t k0_iter) -> void {
         if (wave_id >= kBlockWarpsM * kBlockWarpsN) return;
 
+        using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
+        using float8_t = float __attribute__((ext_vector_type(8)));
+
+        const int lane_in_subgroup = lane % 16;
+
+        // Pre-load all B fragments (one per rn tile)
+        _Float16 all_reg_b[kRepeatN][16];
+        #pragma unroll
+        for (int rn = 0; rn < kRepeatN; ++rn) {
+            const int tile_n = warp_n + rn * kBlockWarpsN;
+            const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+            #pragma unroll
+            for (int k = 0; k < kWmmaK; ++k) {
+                all_reg_b[rn][k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
+            }
+        }
+
+        // For each rm: load A once, compute all rn tiles with cached B
         #pragma unroll
         for (int rm = 0; rm < kRepeatM; ++rm) {
+            const int tile_m = warp_m + rm * kBlockWarpsM;
+            const int m_row = tile_m * kWmmaM + lane_in_subgroup;
+
+            _Float16 reg_a_fp16[16];
+            #pragma unroll
+            for (int k0 = 0; k0 < kK0; ++k0) {
+                const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
+                #pragma unroll
+                for (int k1 = 0; k1 < kK1; ++k1) {
+                    reg_a_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_a_src[k1]);
+                }
+            }
+
+            const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
+
             #pragma unroll
             for (int rn = 0; rn < kRepeatN; ++rn) {
                 const int repeat_idx = rm * kRepeatN + rn;
-                const int tile_m = warp_m + rm * kBlockWarpsM;
-                const int tile_n = warp_n + rn * kBlockWarpsN;
-
-                const int lane_in_subgroup = lane % 16;
-                const int m_row = tile_m * kWmmaM + lane_in_subgroup;
-                half reg_a[16];
-                #pragma unroll
-                for (int k0 = 0; k0 < kK0; ++k0) {
-                    const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
-                    #pragma unroll
-                    for (int k1 = 0; k1 < kK1; ++k1) {
-                        reg_a[k0 * kK1 + k1] = sh_a_src[k1];
-                    }
-                }
-
-                _Float16 reg_b[16];
-                const int n_col = tile_n * kWmmaN + lane_in_subgroup;
-                #pragma unroll
-                for (int k = 0; k < kWmmaK; ++k) {
-                    reg_b[k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
-                }
-
-                using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
-                using float8_t = float __attribute__((ext_vector_type(8)));
-
-                _Float16 reg_a_fp16[16];
-                #pragma unroll
-                for (int i = 0; i < 16; ++i) {
-                    reg_a_fp16[i] = static_cast<_Float16>(reg_a[i]);
-                }
-
-                const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
-                const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(reg_b);
+                const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(all_reg_b[rn]);
                 float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
 
                 c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
