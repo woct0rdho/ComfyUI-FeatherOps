@@ -136,7 +136,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     // Accumulator registers: 8 floats per WMMA tile in wave32 mode
     constexpr int kRepeatTiles = kRepeatM * kRepeatN;
     float acc[kRepeatTiles][8];
+    #pragma unroll
     for (int r = 0; r < kRepeatTiles; ++r) {
+        #pragma unroll
         for (int i = 0; i < 8; ++i) {
             acc[r][i] = 0.0f;
         }
@@ -174,6 +176,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
 
         // Physical LDS space is traversed directly; global logical row is obtained by inverse map.
+        #pragma unroll
         for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
             const int vec_idx = a_owner_tid + v * kAOwnerThreads;
             if (vec_idx >= kAVecs) continue;
@@ -216,6 +219,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     store_a_vec8(packed);
                 } else {
                     // Scalar fallback
+                    #pragma unroll
                     for (int i = 0; i < kK1; ++i) {
                         bool item_in = row_in;
                         if constexpr (kCheckBounds) {
@@ -240,6 +244,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     const auto load_b_lds = [&](const int stage, const int64_t kk) -> void {
         // Load B with vec16 fp8→fp16 conversion, store to K×N layout
+        #pragma unroll
         for (int v = 0; v < kBVecsPerThread; ++v) {
             const int vec_idx = tid + v * kThreads;
             const int elem_base = vec_idx * 16;
@@ -255,6 +260,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
                 const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
                 half h[16];
+                #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     uint32_t p = p32[j];
                     h[4 * j + 0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
@@ -284,6 +290,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 if (can_vec) {
                     const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
                     half h[16];
+                    #pragma unroll
                     for (int j = 0; j < 4; ++j) {
                         uint32_t p = p32[j];
                         h[4 * j + 0] = fp8e4m3fn_to_half(static_cast<uint8_t>(p & 0xFFu));
@@ -295,6 +302,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
                     dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
                 } else {
+                    #pragma unroll
                     for (int i = 0; i < 16; ++i) {
                         bool item_in = row_in;
                         if constexpr (kCheckBounds) {
@@ -398,7 +406,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     // No-overlap schedule needs an explicit LDS wait before local-read + WMMA.
                     // asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
                 }
+                #pragma unroll
                 for (int rm = 0; rm < kRepeatM; ++rm) {
+                    #pragma unroll
                     for (int rn = 0; rn < kRepeatN; ++rn) {
                         const int repeat_idx = rm * kRepeatN + rn;
                         const int tile_m = warp_m + rm * kBlockWarpsM;
@@ -409,6 +419,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                         const int m_row = tile_m * kWmmaM + lane_in_subgroup;
                         half reg_a[16];
+                        #pragma unroll
                         for (int k0 = 0; k0 < kK0; ++k0) {
                             const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
                             #pragma unroll
@@ -420,6 +431,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         // Load B from K×N layout
                         _Float16 reg_b[16];
                         const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+                        #pragma unroll
                         for (int k = 0; k < kWmmaK; ++k) {
                             reg_b[k] = static_cast<_Float16>(sh_b[stage][k][n_col]);
                         }
@@ -431,6 +443,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                         // Convert half registers to _Float16 for WMMA
                         _Float16 reg_a_fp16[16];
+                        #pragma unroll
                         for (int i = 0; i < 16; ++i) {
                             reg_a_fp16[i] = static_cast<_Float16>(reg_a[i]);
                         }
@@ -508,7 +521,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             return logical_row;
         };
 
+        #pragma unroll
         for (int rm = 0; rm < kRepeatM; ++rm) {
+            #pragma unroll
             for (int rn = 0; rn < kRepeatN; ++rn) {
                 const int repeat_idx = rm * kRepeatN + rn;
                 const int tile_m = warp_m + rm * kBlockWarpsM;
@@ -519,6 +534,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 // Step 1: Write acc to LDS in column-major order (WMMA layout)
                 // Each thread writes 8 values to one column
                 const int col = lane_in_subgroup;
+                #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logical = subgroup * 8 + acc_idx;
                     const int row_phys = c_row_logical_to_phys(row_logical);
@@ -545,6 +561,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                     if (has_bias) {
+                        #pragma unroll
                         for (int i = 0; i < 8; ++i) {
                             h[i] = __hadd(h[i], bias[out_col + i]);
                         }
@@ -571,6 +588,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                         if (has_bias) {
+                            #pragma unroll
                             for (int i = 0; i < 8; ++i) {
                                 h[i] = __hadd(h[i], bias[out_col + i]);
                             }
@@ -578,6 +596,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
                         *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
                     } else {
+                        #pragma unroll
                         for (int i = 0; i < 8; ++i) {
                             bool item_in = row_in;
                             if constexpr (kCheckBounds) {
