@@ -35,10 +35,7 @@ def _get_forced_triton_config() -> triton.Config | None:
         return None
     vals = [int(v.strip()) for v in raw.split(",") if v.strip()]
     if len(vals) != 6:
-        raise RuntimeError(
-            "TRITON_SCALED_MM_FORCE_CONFIG must be 6 comma-separated ints: "
-            "BLOCK_M,BLOCK_N,BLOCK_K,GROUP_M,NUM_WARPS,NUM_STAGES"
-        )
+        raise RuntimeError("TRITON_SCALED_MM_FORCE_CONFIG must be 6 comma-separated ints: BLOCK_M,BLOCK_N,BLOCK_K,GROUP_M,NUM_WARPS,NUM_STAGES")
     bm, bn, bk, gm, nw, ns = vals
     return triton.Config(
         {

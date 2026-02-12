@@ -26,12 +26,8 @@ constexpr int kWmmaK = 16;
 // gfx11 uses wave32 - hardcode for consistent host/device behavior
 // rocwmma::Constants::AMDGCN_WAVE_SIZE returns 64 during host compilation
 constexpr int kWaveSize = 32;
-// K1 = 8 for fp16: enables vec8 LDS reads (like CK)
-constexpr int kK1 = 8;
-// K0 = kWmmaK / K1 = 16 / 8 = 2
-constexpr int kK0 = kWmmaK / kK1;
 
-__device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(uint8_t x)
+__device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(const uint8_t x)
 {
     const uint16_t x_u16 = static_cast<uint16_t>(x);
     const uint16_t sign = static_cast<uint16_t>((x_u16 & 0x80u) << 8);
@@ -44,7 +40,7 @@ __device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(uint8_t x)
     return bits;
 }
 
-__device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
+__device__ __forceinline__ half fp8e4m3fn_to_half(const uint8_t x)
 {
     __half_raw r;
     r.x = fp8e4m3fn_to_half_bits(x);
@@ -52,12 +48,12 @@ __device__ __forceinline__ half fp8e4m3fn_to_half(uint8_t x)
 }
 
 // 16-row swizzle used by A LDS physical mapping.
-__host__ __device__ __forceinline__ constexpr int a_row_logical_to_phys_16(int x)
+__device__ __forceinline__ constexpr int a_row_logical_to_phys_16(const int x)
 {
     return ((x & 7) << 1) | ((x >> 3) & 1);
 }
 
-__host__ __device__ __forceinline__ constexpr int a_row_phys_to_logical_16(int x)
+__device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
 {
     return ((x & 1) << 3) | ((x >> 1) & 7);
 }
@@ -76,28 +72,23 @@ template <int kBlockWarpsM,
           bool kCheckBounds,
           bool kContigFastPath>
 __global__ void scaled_mm_kernel_wmma_k0mk1(
-    const half* a,
-    const uint8_t* b,
-    const float* scale,
-    const half* bias,
-    half* c,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t stride_am,
-    int64_t stride_ak,
-    int64_t stride_bk,
-    int64_t stride_bn,
-    int64_t stride_cm,
-    int64_t stride_cn,
-    int has_scale,
-    int has_bias)
+    const half* const a,
+    const uint8_t* const b,
+    const float* const scale,
+    const half* const bias,
+    half* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int64_t stride_am,
+    const int64_t stride_ak,
+    const int64_t stride_bk,
+    const int64_t stride_bn,
+    const int64_t stride_cm,
+    const int64_t stride_cn,
+    const int has_scale,
+    const int has_bias)
 {
-    // Only wave32 mode supported for gfx11
-    // Note: kWaveSize is 64 during host compilation, 32 during gfx11 device compilation
-#if __HIP_DEVICE_COMPILE__
-    static_assert(kWaveSize == 32, "This kernel requires wave32 mode (gfx11)");
-#endif
     static_assert(kStages == 1 || kStages == 2 || kStages == 4, "kStages must be 1, 2, or 4");
     static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
     static_assert(!kContigFastPath || !kCheckBounds,
@@ -107,17 +98,22 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
     static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16 (required by row swizzle)");
     static_assert(kBlockN % 16 == 0, "kBlockN must be a multiple of 16 (required by vec16 load)");
+
     // K0×M×K1 layout for A matrix (no extra LDS padding).
     // Apply row permutation on A store to improve LDS local-read banking while
     // keeping compact LDS footprint and 128-bit accesses.
+    // K1 = 8 for fp16: enables vec8 LDS reads (like CK)
+    constexpr int kK1 = 8;
+    // K0 = kWmmaK / K1 = 16 / 8 = 2
+    constexpr int kK0 = kWmmaK / kK1;
+    constexpr int kAStrideK1 = kK1;
+    constexpr int kShASize = kStages * kK0 * kBlockM * kAStrideK1;
+
     // B uses K×N layout for efficient vec16 stores during loading
     constexpr int kBPad = 8;
-    constexpr int kAStrideK1 = kK1;
-    // K0 = kWmmaK / kK1 = 16 / 8 = 2
 
     // C-shuffle epilogue reuses sh_a memory. Each warp needs 16*24 halfs.
     // Ensure sh_a is large enough for A layout and C-shuffle reuse.
-    constexpr int kShASize = kStages * kK0 * kBlockM * kAStrideK1;
     constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * (kWmmaN + kBPad);
     static_assert(kShASize >= kCShuffleSize,
         "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
@@ -154,22 +150,22 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
-    auto a_row_logical_to_phys = [&](int logical_row) -> int {
+    const auto a_row_logical_to_phys = [&](const int logical_row) -> int {
         const int tile_base = logical_row & ~15;
         const int local = logical_row & 15;
         return tile_base + a_row_logical_to_phys_16(local);
     };
-    auto a_row_phys_to_logical = [&](int physical_row) -> int {
+    const auto a_row_phys_to_logical = [&](const int physical_row) -> int {
         const int tile_base = physical_row & ~15;
         const int local = physical_row & 15;
         return tile_base + a_row_phys_to_logical_16(local);
     };
-    auto sh_a_row_ptr = [&](int stage, int k0, int m) -> half* {
+    const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
         return &sh_a[idx];
     };
 
-    auto load_a_lds_k0mk1 = [&](int stage, int64_t kk) {
+    const auto load_a_lds_k0mk1 = [&](const int stage, const int64_t kk) -> void {
         // WSGR ownership: only A-owner waves issue A global->LDS stores.
         if constexpr (kUseWsgrAStoreOwnership) {
             if (wave_id >= kAOwnerWaves) return;
@@ -189,13 +185,13 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
             const int64_t a_row = block_m + m_logical;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
-            half* sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
-            auto store_a_vec8 = [&](const uint4& packed) {
+            half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
+            const auto store_a_vec8 = [&](const uint4& packed) -> void {
                 *reinterpret_cast<uint4*>(sh_a_dst) = packed;
             };
 
             if constexpr (kContigFastPath) {
-                const half* a_ptr = a + a_row * stride_am + a_k;
+                const half* const a_ptr = a + a_row * stride_am + a_k;
                 const uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
                 store_a_vec8(packed);
             } else {
@@ -204,7 +200,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     row_in = (a_row < M);
                 }
 
-                const half* a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
+                const half* const a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
 
                 bool in_bounds = row_in;
                 if constexpr (kCheckBounds) {
@@ -242,7 +238,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     constexpr int kBVecs = kBElements / 16; // vec16 fp8 loads (16 bytes)
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
 
-    auto load_b_lds = [&](int stage, int64_t kk) {
+    const auto load_b_lds = [&](const int stage, const int64_t kk) -> void {
         // Load B with vec16 fp8→fp16 conversion, store to K×N layout
         for (int v = 0; v < kBVecsPerThread; ++v) {
             const int vec_idx = tid + v * kThreads;
@@ -256,8 +252,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t b_col = block_n + col;
 
             if constexpr (kContigFastPath) {
-                const uint8_t* b_ptr = b + b_row * stride_bk + b_col;
-                const uint32_t* p32 = reinterpret_cast<const uint32_t*>(b_ptr);
+                const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
+                const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
                 half h[16];
                 for (int j = 0; j < 4; ++j) {
                     uint32_t p = p32[j];
@@ -266,7 +262,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     h[4 * j + 2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
                     h[4 * j + 3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
                 }
-                uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+                uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
                 dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
                 dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
             } else {
@@ -275,7 +271,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     row_in = (b_row < K);
                 }
 
-                const uint8_t* b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
+                const uint8_t* const b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
 
                 bool in_bounds = row_in;
                 if constexpr (kCheckBounds) {
@@ -286,7 +282,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                     ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
 
                 if (can_vec) {
-                    const uint32_t* p32 = reinterpret_cast<const uint32_t*>(b_ptr);
+                    const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
                     half h[16];
                     for (int j = 0; j < 4; ++j) {
                         uint32_t p = p32[j];
@@ -295,7 +291,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         h[4 * j + 2] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 16) & 0xFFu));
                         h[4 * j + 3] = fp8e4m3fn_to_half(static_cast<uint8_t>((p >> 24) & 0xFFu));
                     }
-                    uint4* dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+                    uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
                     dst_ptr[0] = *reinterpret_cast<uint4*>(&h[0]);
                     dst_ptr[1] = *reinterpret_cast<uint4*>(&h[8]);
                 } else {
@@ -322,13 +318,13 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     constexpr int kChunkK = kWmmaK * kUnrollK;
     const int total_chunks = static_cast<int>((K + kChunkK - 1) / kChunkK);
 
-    auto chunk_k0 = [&](int iter_idx) -> int64_t {
+    const auto chunk_k0 = [&](const int iter_idx) -> int64_t {
         return static_cast<int64_t>(iter_idx) * kChunkK;
     };
 
     int stage_base = 0;
 
-    const int64_t k0_first = chunk_k0(0);
+    constexpr int64_t k0_first = chunk_k0(0);
     int valid_u0 = kUnrollK;
     if constexpr (kCheckBounds) {
         int64_t rem = K - k0_first;
@@ -414,7 +410,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         const int m_row = tile_m * kWmmaM + lane_in_subgroup;
                         half reg_a[16];
                         for (int k0 = 0; k0 < kK0; ++k0) {
-                            const half* sh_a_src = sh_a_row_ptr(stage, k0, m_row);
+                            const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
                             #pragma unroll
                             for (int k1 = 0; k1 < kK1; ++k1) {
                                 reg_a[k0 * kK1 + k1] = sh_a_src[k1];
@@ -498,14 +494,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         // Each warp gets its own 16×24 buffer (24 = 16 + 8 padding for bank conflicts)
         constexpr int kCPad = 8;
         constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
-        half* sh_c = sh_a + wave_id * kWmmaM * kCStride;
+        half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
 
         const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
         constexpr bool kUseCRowPhysicalMap = true;
 
-        auto c_row_logical_to_phys = [&](int logical_row) -> int {
+        const auto c_row_logical_to_phys = [&](const int logical_row) -> int {
             if constexpr (kUseCRowPhysicalMap) {
                 return a_row_logical_to_phys_16(logical_row);
             }
@@ -545,8 +541,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 const int64_t out_col = tile_n_base + read_col_base;
 
                 if constexpr (kContigFastPath) {
-                    half* out_ptr = c + out_row * stride_cm + out_col;
-                    half* h = sh_c + read_row_phys * kCStride + read_col_base;
+                    half* const out_ptr = c + out_row * stride_cm + out_col;
+                    half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                     if (has_bias) {
                         for (int i = 0; i < 8; ++i) {
@@ -561,7 +557,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         row_in = (out_row < M);
                     }
 
-                    half* out_ptr = row_in ? (c + out_row * stride_cm + out_col * stride_cn) : nullptr;
+                    half* const out_ptr = row_in ? (c + out_row * stride_cm + out_col * stride_cn) : nullptr;
 
                     bool in_bounds = row_in;
                     if constexpr (kCheckBounds) {
@@ -572,7 +568,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                         ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
 
                     if (can_vec) {
-                        half* h = sh_c + read_row_phys * kCStride + read_col_base;
+                        half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                         if (has_bias) {
                             for (int i = 0; i < 8; ++i) {
@@ -621,14 +617,14 @@ torch::Tensor scaled_mm_k0mk1(
     const torch::Tensor& b,
     const torch::Tensor& scale,
     const torch::Tensor& bias,
-    bool has_scale,
-    bool has_bias,
-    int64_t block_warps_m,
-    int64_t block_warps_n,
-    int64_t unroll_k,
-    int64_t stages,
-    int64_t repeat_m,
-    int64_t repeat_n)
+    const bool has_scale,
+    const bool has_bias,
+    const int64_t block_warps_m,
+    const int64_t block_warps_n,
+    const int64_t unroll_k,
+    const int64_t stages,
+    const int64_t repeat_m,
+    const int64_t repeat_n)
 {
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     TORCH_CHECK(b.is_cuda(), "b must be a CUDA tensor");
@@ -651,14 +647,14 @@ torch::Tensor scaled_mm_k0mk1(
 
     auto c = torch::empty({a.size(0), b.size(1)}, a.options().dtype(at::kHalf));
 
-    const half* a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
-    const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(b.data_ptr());
+    const half* const a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
+    const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b.data_ptr());
     auto stream = at::cuda::getCurrentCUDAStream();
-    const float* scale_ptr = has_scale ? scale.data_ptr<float>() : nullptr;
-    const half* bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
-    half* c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
+    const float* const scale_ptr = has_scale ? scale.data_ptr<float>() : nullptr;
+    const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
+    half* const c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
 
-    auto launch = [&](auto tag) {
+    const auto launch = [&](const auto tag) -> void {
         constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
         constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
         constexpr int kUnrollK = decltype(tag)::kUnrollK;
@@ -675,12 +671,12 @@ torch::Tensor scaled_mm_k0mk1(
 
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
         static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
-        dim3 block(kThreadsPerBlock, 1, 1);
-        dim3 grid(
+        const dim3 block(kThreadsPerBlock, 1, 1);
+        const dim3 grid(
             (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
             (static_cast<uint32_t>(a.size(0)) + kBlockM - 1) / kBlockM);
 
-        auto dispatch_kernel = [&](auto kCheckBoundsVal, auto kContigFastPathVal) {
+        const auto dispatch_kernel = [&](const auto kCheckBoundsVal, const auto kContigFastPathVal) -> void {
             constexpr bool kCheckBounds = decltype(kCheckBoundsVal)::value;
             constexpr bool kEnableContigFastPath = decltype(kContigFastPathVal)::value;
             hipLaunchKernelGGL(
@@ -692,7 +688,7 @@ torch::Tensor scaled_mm_k0mk1(
                 c.stride(0), c.stride(1), has_scale ? 1 : 0, has_bias ? 1 : 0);
         };
 
-        const auto is_aligned_16 = [](const void* p) {
+        const auto is_aligned_16 = [](const void* const p) {
             return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
         };
         const bool enable_contig_fastpath =
@@ -715,7 +711,7 @@ torch::Tensor scaled_mm_k0mk1(
         }
     };
 
-    auto try_launch = [&](auto tag) {
+    const auto try_launch = [&](const auto tag) -> bool {
         if (block_warps_m == decltype(tag)::kBlockWarpsM &&
             block_warps_n == decltype(tag)::kBlockWarpsN &&
             unroll_k == decltype(tag)::kUnrollK &&
@@ -730,7 +726,7 @@ torch::Tensor scaled_mm_k0mk1(
 
     // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
     // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
-    bool launched =
+    const bool launched =
         try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
         try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
