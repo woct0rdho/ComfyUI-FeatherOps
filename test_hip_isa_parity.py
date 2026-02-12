@@ -238,15 +238,15 @@ def main() -> None:
     llvm_objcopy = find_tool(
         [
             "llvm-objcopy",
-            "/home/wd/venv_torch/lib/python3.13/site-packages/_rocm_sdk_devel/lib/llvm/bin/llvm-objcopy",
-            "/home/wd/venv_torch/lib/python3.13/site-packages/_rocm_sdk_core/lib/llvm/bin/llvm-objcopy",
+            "~/venv_torch/lib/python3.13/site-packages/_rocm_sdk_devel/lib/llvm/bin/llvm-objcopy",
+            "~/venv_torch/lib/python3.13/site-packages/_rocm_sdk_core/lib/llvm/bin/llvm-objcopy",
         ]
     )
     llvm_objdump = find_tool(
         [
             "llvm-objdump",
-            "/home/wd/venv_torch/lib/python3.13/site-packages/_rocm_sdk_devel/lib/llvm/bin/llvm-objdump",
-            "/home/wd/venv_torch/lib/python3.13/site-packages/_rocm_sdk_core/lib/llvm/bin/llvm-objdump",
+            "~/venv_torch/lib/python3.13/site-packages/_rocm_sdk_devel/lib/llvm/bin/llvm-objdump",
+            "~/venv_torch/lib/python3.13/site-packages/_rocm_sdk_core/lib/llvm/bin/llvm-objdump",
         ]
     )
 
