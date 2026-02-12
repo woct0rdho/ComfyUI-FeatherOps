@@ -40,12 +40,12 @@ def main():
     device = "cuda"
     ext = _load_hip_extension()
 
-    # Test matrix sizes
+    # Test matrix sizes - must be divisible by tile sizes for contiguous fast path.
+    # Max block_m=128, max block_n=256, chunk_k=32 across all configs.
     test_sizes = [
-        (64, 64, 64),
         (128, 128, 128),
-        (192, 128, 80),
         (256, 256, 256),
+        (256, 512, 256),
         (512, 512, 512),
     ]
 
@@ -60,11 +60,16 @@ def main():
         warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
         block_m = 16 * warps_m * repeat_m
         block_n = 16 * warps_n * repeat_n
+        chunk_k = 16 * unroll_k
 
         config_passed = True
         config_errors = []
 
         for M, N, K in test_sizes:
+            # Skip sizes that don't satisfy divisibility for this config
+            if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
+                continue
+
             passed, msg = test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=False)
             if not passed:
                 config_passed = False

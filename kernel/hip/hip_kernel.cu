@@ -16,8 +16,6 @@
 #include <hip/hip_runtime.h>
 #include <rocwmma/rocwmma.hpp>
 
-#include <type_traits>
-
 namespace {
 
 constexpr int kWmmaM = 16;
@@ -26,26 +24,6 @@ constexpr int kWmmaK = 16;
 // gfx11 uses wave32 - hardcode for consistent host/device behavior
 // rocwmma::Constants::AMDGCN_WAVE_SIZE returns 64 during host compilation
 constexpr int kWaveSize = 32;
-
-__device__ __forceinline__ uint16_t fp8e4m3fn_to_half_bits(const uint8_t x)
-{
-    const uint16_t x_u16 = static_cast<uint16_t>(x);
-    const uint16_t sign = static_cast<uint16_t>((x_u16 & 0x80u) << 8);
-    uint16_t exp_mant = static_cast<uint16_t>((x_u16 & 0x7Fu) << 7);
-    exp_mant = static_cast<uint16_t>(exp_mant + 0x2000u);
-    uint16_t bits = static_cast<uint16_t>(sign | exp_mant);
-    if ((x_u16 & 0x78u) == 0u) {
-        bits = sign;
-    }
-    return bits;
-}
-
-__device__ __forceinline__ half fp8e4m3fn_to_half(const uint8_t x)
-{
-    __half_raw r;
-    r.x = fp8e4m3fn_to_half_bits(x);
-    return r;
-}
 
 // Packed fp8e4m3fn → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
 // Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
@@ -88,6 +66,8 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
 
 // =============================================================================
 // Optimized kernel with K0×M×K1 LDS layout and direct WMMA intrinsics
+// Contiguous fast path only: requires aligned, contiguous inputs with
+// dimensions divisible by tile sizes.
 // K1 = 8 enables vec8 LDS reads (like CK)
 // =============================================================================
 
@@ -96,9 +76,7 @@ template <int kBlockWarpsM,
           int kUnrollK,
           int kStages,
           int kRepeatM,
-          int kRepeatN,
-          bool kCheckBounds,
-          bool kContigFastPath>
+          int kRepeatN>
 __global__ void scaled_mm_kernel_wmma_k0mk1(
     const half* const a,
     const uint8_t* const b,
@@ -109,18 +87,13 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     const int64_t N,
     const int64_t K,
     const int64_t stride_am,
-    const int64_t stride_ak,
     const int64_t stride_bk,
-    const int64_t stride_bn,
     const int64_t stride_cm,
-    const int64_t stride_cn,
     const int has_scale,
     const int has_bias)
 {
     static_assert(kStages == 1 || kStages == 2 || kStages == 4, "kStages must be 1, 2, or 4");
     static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
-    static_assert(!kContigFastPath || !kCheckBounds,
-        "Contiguous fast path requires no-bounds-check launch shape.");
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
@@ -180,11 +153,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
-    const auto a_row_logical_to_phys = [&](const int logical_row) -> int {
-        const int tile_base = logical_row & ~15;
-        const int local = logical_row & 15;
-        return tile_base + a_row_logical_to_phys_16(local);
-    };
     const auto a_row_phys_to_logical = [&](const int physical_row) -> int {
         const int tile_base = physical_row & ~15;
         const int local = physical_row & 15;
@@ -217,51 +185,9 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t a_row = block_m + m_logical;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
             half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
-            const auto store_a_vec8 = [&](const uint4& packed) -> void {
-                *reinterpret_cast<uint4*>(sh_a_dst) = packed;
-            };
 
-            if constexpr (kContigFastPath) {
-                const half* const a_ptr = a + a_row * stride_am + a_k;
-                const uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
-                store_a_vec8(packed);
-            } else {
-                bool row_in = true;
-                if constexpr (kCheckBounds) {
-                    row_in = (a_row < M);
-                }
-
-                const half* const a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
-
-                bool in_bounds = row_in;
-                if constexpr (kCheckBounds) {
-                    in_bounds = in_bounds && (a_k + kK1 - 1 < K);
-                }
-
-                // vec8 load (16 bytes)
-                const bool can_vec = in_bounds && (stride_ak == 1) &&
-                    ((reinterpret_cast<uintptr_t>(a_ptr) & 0xFu) == 0u);
-
-                if (can_vec) {
-                    const uint4 packed = *reinterpret_cast<const uint4*>(a_ptr);
-                    store_a_vec8(packed);
-                } else {
-                    // Scalar fallback
-                    #pragma unroll
-                    for (int i = 0; i < kK1; ++i) {
-                        bool item_in = row_in;
-                        if constexpr (kCheckBounds) {
-                            if (item_in) item_in = (a_k + i < K);
-                        }
-
-                        half val = __float2half_rn(0.0f);
-                        if (item_in) {
-                            val = a_ptr[i * stride_ak];
-                        }
-                        sh_a_dst[i] = val;
-                    }
-                }
-            }
+            const half* const a_ptr = a + a_row * stride_am + a_k;
+            *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_ptr);
         }
     };
 
@@ -284,59 +210,16 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t b_row = kk + row;
             const int64_t b_col = block_n + col;
 
-            if constexpr (kContigFastPath) {
-                const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
-                const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
-                uint32_t h32[8];
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
-                }
-                uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
-                dst_ptr[0] = *reinterpret_cast<uint4*>(&h32[0]);
-                dst_ptr[1] = *reinterpret_cast<uint4*>(&h32[4]);
-            } else {
-                bool row_in = true;
-                if constexpr (kCheckBounds) {
-                    row_in = (b_row < K);
-                }
-
-                const uint8_t* const b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
-
-                bool in_bounds = row_in;
-                if constexpr (kCheckBounds) {
-                    in_bounds = in_bounds && (b_col + 15 < N);
-                }
-
-                const bool can_vec = in_bounds && (stride_bn == 1) &&
-                    ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
-
-                if (can_vec) {
-                    const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
-                    uint32_t h32[8];
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
-                    }
-                    uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
-                    dst_ptr[0] = *reinterpret_cast<uint4*>(&h32[0]);
-                    dst_ptr[1] = *reinterpret_cast<uint4*>(&h32[4]);
-                } else {
-                    #pragma unroll
-                    for (int i = 0; i < 16; ++i) {
-                        bool item_in = row_in;
-                        if constexpr (kCheckBounds) {
-                            if (item_in) item_in = (b_col + i < N);
-                        }
-
-                        half h = __float2half_rn(0.0f);
-                        if (item_in) {
-                            h = fp8e4m3fn_to_half(b_ptr[i * stride_bn]);
-                        }
-                        sh_b[stage][row][col + i] = h;
-                    }
-                }
+            const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
+            const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
+            uint32_t h32[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
             }
+            uint4* const dst_ptr = reinterpret_cast<uint4*>(&sh_b[stage][row][col]);
+            dst_ptr[0] = *reinterpret_cast<uint4*>(&h32[0]);
+            dst_ptr[1] = *reinterpret_cast<uint4*>(&h32[4]);
         }
     };
 
@@ -370,36 +253,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t a_row = block_m + m_logical;
             const int64_t a_k = kk + k0 * kK1;
 
-            if constexpr (kContigFastPath) {
-                const half* const a_ptr = a + a_row * stride_am + a_k;
-                a_prefetch_buf[u][v] = *reinterpret_cast<const uint4*>(a_ptr);
-            } else {
-                bool row_in = true;
-                if constexpr (kCheckBounds) {
-                    row_in = (a_row < M);
-                }
-                const half* const a_ptr = row_in ? (a + a_row * stride_am + a_k * stride_ak) : nullptr;
-                bool in_bounds = row_in;
-                if constexpr (kCheckBounds) {
-                    in_bounds = in_bounds && (a_k + kK1 - 1 < K);
-                }
-                const bool can_vec = in_bounds && (stride_ak == 1) &&
-                    ((reinterpret_cast<uintptr_t>(a_ptr) & 0xFu) == 0u);
-                if (can_vec) {
-                    a_prefetch_buf[u][v] = *reinterpret_cast<const uint4*>(a_ptr);
-                } else {
-                    // Scalar fallback: load into buffer as half array
-                    half* const buf_h = reinterpret_cast<half*>(&a_prefetch_buf[u][v]);
-                    #pragma unroll
-                    for (int i = 0; i < kK1; ++i) {
-                        bool item_in = row_in;
-                        if constexpr (kCheckBounds) {
-                            if (item_in) item_in = (a_k + i < K);
-                        }
-                        buf_h[i] = item_in ? a_ptr[i * stride_ak] : __float2half_rn(0.0f);
-                    }
-                }
-            }
+            const half* const a_ptr = a + a_row * stride_am + a_k;
+            a_prefetch_buf[u][v] = *reinterpret_cast<const uint4*>(a_ptr);
         }
     };
 
@@ -435,52 +290,11 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             const int64_t b_row = kk + row;
             const int64_t b_col = block_n + col;
 
-            if constexpr (kContigFastPath) {
-                const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
-                const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    b_prefetch_buf[u][v][j] = p32[j];
-                }
-            } else {
-                bool row_in = true;
-                if constexpr (kCheckBounds) {
-                    row_in = (b_row < K);
-                }
-                const uint8_t* const b_ptr = row_in ? (b + b_row * stride_bk + b_col * stride_bn) : nullptr;
-                bool in_bounds = row_in;
-                if constexpr (kCheckBounds) {
-                    in_bounds = in_bounds && (b_col + 15 < N);
-                }
-                const bool can_vec = in_bounds && (stride_bn == 1) &&
-                    ((reinterpret_cast<uintptr_t>(b_ptr) & 0xFu) == 0u);
-                if (can_vec) {
-                    const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        b_prefetch_buf[u][v][j] = p32[j];
-                    }
-                } else {
-                    // Scalar fallback: pack bytes into uint32
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        uint32_t packed = 0;
-                        #pragma unroll
-                        for (int bi = 0; bi < 4; ++bi) {
-                            const int i = j * 4 + bi;
-                            bool item_in = row_in;
-                            if constexpr (kCheckBounds) {
-                                if (item_in) item_in = (b_col + i < N);
-                            }
-                            uint8_t byte_val = 0;
-                            if (item_in) {
-                                byte_val = b_ptr[i * stride_bn];
-                            }
-                            packed |= static_cast<uint32_t>(byte_val) << (bi * 8);
-                        }
-                        b_prefetch_buf[u][v][j] = packed;
-                    }
-                }
+            const uint8_t* const b_ptr = b + b_row * stride_bk + b_col;
+            const uint32_t* const p32 = reinterpret_cast<const uint32_t*>(b_ptr);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                b_prefetch_buf[u][v][j] = p32[j];
             }
         }
     };
@@ -509,7 +323,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     // Pipeline setup
     constexpr int kChunkK = kWmmaK * kUnrollK;
-    const int total_chunks = static_cast<int>((K + kChunkK - 1) / kChunkK);
+    const int total_chunks = static_cast<int>(K / kChunkK);
 
     const auto chunk_k0 = [&](const int iter_idx) -> int64_t {
         return static_cast<int64_t>(iter_idx) * kChunkK;
@@ -578,19 +392,14 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
     int stage_base = 0;
 
     // Prologue: load first chunk into LDS using monolithic loads
-    constexpr int64_t k0_first = 0;
-    int valid_u0 = kUnrollK;
-    if constexpr (kCheckBounds) {
-        int64_t rem = K - k0_first;
-        valid_u0 = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
-        if (valid_u0 > kUnrollK) valid_u0 = kUnrollK;
-    }
-    for (int u = 0; u < valid_u0; ++u) {
-        const int64_t k = k0_first + static_cast<int64_t>(u) * kWmmaK;
+    #pragma unroll
+    for (int u = 0; u < kUnrollK; ++u) {
+        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
         load_a_lds_k0mk1(u, k);
     }
-    for (int u = 0; u < valid_u0; ++u) {
-        const int64_t k = k0_first + static_cast<int64_t>(u) * kWmmaK;
+    #pragma unroll
+    for (int u = 0; u < kUnrollK; ++u) {
+        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
         load_b_lds(u, k);
     }
     __syncthreads();
@@ -618,27 +427,11 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         const bool has_next = (iter_idx + 1 < total_chunks);
         const int64_t k_next = has_next ? chunk_k0(iter_idx + 1) : 0;
 
-        int valid_u = kUnrollK;
-        if constexpr (kCheckBounds) {
-            int64_t rem = K - k0_iter;
-            valid_u = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
-            if (valid_u > kUnrollK) valid_u = kUnrollK;
-        }
-
-        int valid_u_next = 0;
-        if (has_next) {
-            valid_u_next = kUnrollK;
-            if constexpr (kCheckBounds) {
-                int64_t rem = K - k_next;
-                valid_u_next = rem > 0 ? static_cast<int>((rem + kWmmaK - 1) / kWmmaK) : 0;
-                if (valid_u_next > kUnrollK) valid_u_next = kUnrollK;
-            }
-        }
-
         if constexpr (kDoubleBuffer) {
             // --- Phase 1: Issue global_load for next chunk (VMEM, fire-and-forget) ---
-            for (int u = 0; u < valid_u; ++u) {
-                if (has_next && u < valid_u_next) {
+            if (has_next) {
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     prefetch_a_global(u, k);
                     prefetch_b_global(u, k);
@@ -650,7 +443,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
             // --- Phase 2: WMMA compute on current LDS data (Matrix unit) ---
             // Concurrent with in-flight global_loads on VMEM unit.
-            for (int u = 0; u < valid_u; ++u) {
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
                 const int read_stage = (stage_base + u) % kStages;
                 wmma_compute_stage(read_stage, k0_iter);
             }
@@ -659,7 +453,8 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             // No barrier needed before commit — write stages are disjoint from read stages.
             if (has_next) {
                 asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-                for (int u = 0; u < valid_u_next; ++u) {
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
                     const int write_stage = (stage_base + kUnrollK + u) % kStages;
                     commit_a_lds(u, write_stage);
                     commit_b_lds(u, write_stage);
@@ -670,19 +465,22 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
             __syncthreads();
         } else {
             // Fallback: serial compute-then-load (original schedule, 1 sync)
-            for (int u = 0; u < valid_u; ++u) {
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
                 const int stage = (stage_base + u) % kStages;
                 wmma_compute_stage(stage, k0_iter);
             }
 
             if (has_next) {
                 asm volatile("s_setprio 1" ::: "memory");
-                for (int u = 0; u < valid_u_next; ++u) {
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
                     const int stage = (stage_base + u) % kStages;
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     load_a_lds_k0mk1(stage, k);
                 }
-                for (int u = 0; u < valid_u_next; ++u) {
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
                     const int stage = (stage_base + u) % kStages;
                     const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                     load_b_lds(stage, k);
@@ -709,14 +507,6 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
         const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
-        constexpr bool kUseCRowPhysicalMap = true;
-
-        const auto c_row_logical_to_phys = [&](const int logical_row) -> int {
-            if constexpr (kUseCRowPhysicalMap) {
-                return a_row_logical_to_phys_16(logical_row);
-            }
-            return logical_row;
-        };
 
         #pragma unroll
         for (int rm = 0; rm < kRepeatM; ++rm) {
@@ -734,7 +524,7 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logical = subgroup * 8 + acc_idx;
-                    const int row_phys = c_row_logical_to_phys(row_logical);
+                    const int row_phys = a_row_logical_to_phys_16(row_logical);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     val = __hmul(val, scale_h);
                     sh_c[row_phys * kCStride + col] = val;
@@ -746,70 +536,24 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
                 // Step 2: Read from LDS in row-major order for coalesced global write
                 // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
                 const int read_row = lane / 2;
-                const int read_row_phys = c_row_logical_to_phys(read_row);
+                const int read_row_phys = a_row_logical_to_phys_16(read_row);
                 const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
                 const int read_col_base = col_half * 8;
 
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                if constexpr (kContigFastPath) {
-                    half* const out_ptr = c + out_row * stride_cm + out_col;
-                    half* const h = sh_c + read_row_phys * kCStride + read_col_base;
+                half* const out_ptr = c + out_row * stride_cm + out_col;
+                half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
-                    if (has_bias) {
-                        #pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            h[i] = __hadd(h[i], bias[out_col + i]);
-                        }
-                    }
-
-                    *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
-                } else {
-                    bool row_in = true;
-                    if constexpr (kCheckBounds) {
-                        row_in = (out_row < M);
-                    }
-
-                    half* const out_ptr = row_in ? (c + out_row * stride_cm + out_col * stride_cn) : nullptr;
-
-                    bool in_bounds = row_in;
-                    if constexpr (kCheckBounds) {
-                        in_bounds = in_bounds && (out_col + 7 < N);
-                    }
-
-                    const bool can_vec = in_bounds && (stride_cn == 1) &&
-                        ((reinterpret_cast<uintptr_t>(out_ptr) & 0xFu) == 0u);
-
-                    if (can_vec) {
-                        half* const h = sh_c + read_row_phys * kCStride + read_col_base;
-
-                        if (has_bias) {
-                            #pragma unroll
-                            for (int i = 0; i < 8; ++i) {
-                                h[i] = __hadd(h[i], bias[out_col + i]);
-                            }
-                        }
-
-                        *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
-                    } else {
-                        #pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            bool item_in = row_in;
-                            if constexpr (kCheckBounds) {
-                                if (item_in) item_in = (out_col + i < N);
-                            }
-
-                            if (item_in) {
-                                half val = sh_c[read_row_phys * kCStride + read_col_base + i];
-                                if (has_bias) {
-                                    val = __hadd(val, bias[out_col + i]);
-                                }
-                                out_ptr[i * stride_cn] = val;
-                            }
-                        }
+                if (has_bias) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        h[i] = __hadd(h[i], bias[out_col + i]);
                     }
                 }
+
+                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
             }
         }
     }
@@ -850,6 +594,10 @@ torch::Tensor scaled_mm_k0mk1(
     TORCH_CHECK(a.size(1) == b.size(0), "a and b shapes are incompatible");
     TORCH_CHECK(bias.scalar_type() == at::kHalf || !has_bias, "bias must be float16");
 
+    // Contiguous fast path requirements
+    TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
+    TORCH_CHECK(b.stride(1) == 1, "b must be row-contiguous (stride(1) == 1)");
+
     if (has_scale) {
         TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor");
         TORCH_CHECK(scale.numel() == 1, "scale must have one element");
@@ -870,6 +618,13 @@ torch::Tensor scaled_mm_k0mk1(
     const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
     half* const c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
 
+    const auto is_aligned_16 = [](const void* const p) {
+        return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
+    };
+    TORCH_CHECK(is_aligned_16(a_ptr), "a data pointer must be 16-byte aligned");
+    TORCH_CHECK(is_aligned_16(b_ptr), "b data pointer must be 16-byte aligned");
+    TORCH_CHECK(is_aligned_16(c_ptr), "c data pointer must be 16-byte aligned");
+
     const auto launch = [&](const auto tag) -> void {
         constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
         constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
@@ -880,51 +635,27 @@ torch::Tensor scaled_mm_k0mk1(
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
         constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-        const bool check_bounds =
-            (a.size(0) % kBlockM != 0) ||
-            (b.size(1) % kBlockN != 0) ||
-            (a.size(1) % (kWmmaK * kUnrollK) != 0);
+        TORCH_CHECK(a.size(0) % kBlockM == 0,
+            "M (", a.size(0), ") must be divisible by kBlockM (", kBlockM, ")");
+        TORCH_CHECK(b.size(1) % kBlockN == 0,
+            "N (", b.size(1), ") must be divisible by kBlockN (", kBlockN, ")");
+        TORCH_CHECK(a.size(1) % (kWmmaK * kUnrollK) == 0,
+            "K (", a.size(1), ") must be divisible by kChunkK (", kWmmaK * kUnrollK, ")");
 
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
         static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
         const dim3 block(kThreadsPerBlock, 1, 1);
         const dim3 grid(
-            (static_cast<uint32_t>(b.size(1)) + kBlockN - 1) / kBlockN,
-            (static_cast<uint32_t>(a.size(0)) + kBlockM - 1) / kBlockM);
+            static_cast<uint32_t>(b.size(1)) / kBlockN,
+            static_cast<uint32_t>(a.size(0)) / kBlockM);
 
-        const auto dispatch_kernel = [&](const auto kCheckBoundsVal, const auto kContigFastPathVal) -> void {
-            constexpr bool kCheckBounds = decltype(kCheckBoundsVal)::value;
-            constexpr bool kEnableContigFastPath = decltype(kContigFastPathVal)::value;
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, kCheckBounds, kEnableContigFastPath>),
-                grid, block, 0, stream.stream(),
-                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), b.size(1), a.size(1),
-                a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-                c.stride(0), c.stride(1), has_scale ? 1 : 0, has_bias ? 1 : 0);
-        };
-
-        const auto is_aligned_16 = [](const void* const p) {
-            return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
-        };
-        const bool enable_contig_fastpath =
-            !check_bounds &&
-            (a.stride(1) == 1) &&
-            (b.stride(1) == 1) &&
-            (c.stride(1) == 1) &&
-            is_aligned_16(a_ptr) &&
-            is_aligned_16(b_ptr) &&
-            is_aligned_16(c_ptr);
-
-        if (check_bounds) {
-            dispatch_kernel(std::true_type{}, std::false_type{});
-        } else {
-            if (enable_contig_fastpath) {
-                dispatch_kernel(std::false_type{}, std::true_type{});
-            } else {
-                dispatch_kernel(std::false_type{}, std::false_type{});
-            }
-        }
+        hipLaunchKernelGGL(
+            (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN>),
+            grid, block, 0, stream.stream(),
+            a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+            a.size(0), b.size(1), a.size(1),
+            a.stride(0), b.stride(0), c.stride(0),
+            has_scale ? 1 : 0, has_bias ? 1 : 0);
     };
 
     const auto try_launch = [&](const auto tag) -> bool {

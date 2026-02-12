@@ -97,6 +97,15 @@ _DEFAULT_CONFIG = (2, 4, 2, 2, 4, 4)
 _AUTOTUNE_CACHE = {}
 
 
+def _config_compatible(cfg, M, N, K):
+    """Check if a config's tile sizes evenly divide the matrix dimensions."""
+    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+    block_m = 16 * warps_m * repeat_m
+    block_n = 16 * warps_n * repeat_n
+    chunk_k = 16 * unroll_k
+    return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
+
+
 @lru_cache(maxsize=1)
 def _get_forced_config():
     cfg = os.environ.get("HIP_K0MK1_FORCE_CONFIG")
@@ -133,9 +142,14 @@ def _select_config(
     if cached is not None:
         return cached
 
+    M, N, K = a.shape[0], b.shape[1], a.shape[1]
+    candidates = [c for c in _CONFIGS if _config_compatible(c, M, N, K)]
+    if not candidates:
+        raise RuntimeError(f"No compatible K0MK1 config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
+
     warmup_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_WARMUP", "1")))
     bench_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_ITERS", "3")))
-    best_cfg = _DEFAULT_CONFIG
+    best_cfg = candidates[0]
     best_ms = None
 
     def run(cfg):
@@ -156,13 +170,13 @@ def _select_config(
         )
 
     # Warm up all candidates once to compile/load kernels.
-    for cfg in _CONFIGS:
+    for cfg in candidates:
         for _ in range(warmup_iters):
             run(cfg)
     torch.cuda.synchronize()
 
     # Time each candidate.
-    for cfg in _CONFIGS:
+    for cfg in candidates:
         start = time.perf_counter()
         for _ in range(bench_iters):
             run(cfg)
