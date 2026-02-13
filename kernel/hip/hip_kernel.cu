@@ -147,8 +147,12 @@ __global__ void scaled_mm_kernel_wmma_k0mk1(
 
     // Loading A: K0×M×K1 layout with physical/inverse row mapping and
     // wave-separated global-read ownership.
-    constexpr int kAVecs = kK0 * kBlockM; // 2 * 128 = 256 vec8 loads
-    constexpr bool kUseWsgrAStoreOwnership = true;
+    constexpr int kAVecs = kK0 * kBlockM;
+    // Use wave-separated ownership only when per-thread vec count stays small (≤4).
+    // For large kBlockM (e.g. kRepeatM=8, kBlockM=256) WSGR causes too many VGPRs
+    // for the A prefetch buffer, hurting occupancy.
+    constexpr bool kUseWsgrAStoreOwnership =
+        (kAVecs / (kBlockWarpsM * kWaveSize)) <= 4;
     constexpr int kAOwnerWaves =
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
