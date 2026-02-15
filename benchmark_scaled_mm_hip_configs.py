@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
-import time
 from typing import List, Tuple
 
 import torch
+import triton
 
 from kernel.hip import hip_kernel
 
@@ -61,12 +61,12 @@ def _run_config(
     has_scale: bool,
     has_bias: bool,
     cfg: Tuple[int, int, int, int, int, int],
-    iters: int,
+    rep: int,
     warmup: int,
 ) -> float:
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
 
-    for _ in range(warmup):
+    def run_kernel():
         ext.scaled_mm_k0mk1(
             a,
             b,
@@ -81,27 +81,10 @@ def _run_config(
             repeat_m,
             repeat_n,
         )
-    torch.cuda.synchronize()
 
-    start = time.perf_counter()
-    for _ in range(iters):
-        ext.scaled_mm_k0mk1(
-            a,
-            b,
-            scale,
-            bias,
-            has_scale,
-            has_bias,
-            warps_m,
-            warps_n,
-            unroll_k,
-            stages,
-            repeat_m,
-            repeat_n,
-        )
-    torch.cuda.synchronize()
-    elapsed = (time.perf_counter() - start) / iters
-    return elapsed
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(run_kernel, warmup=warmup, rep=rep, quantiles=quantiles)
+    return ms / 1000.0
 
 
 def _format_cfg(cfg: Tuple[int, int, int, int, int, int]) -> str:
@@ -128,8 +111,8 @@ def main() -> None:
     )
     parser.add_argument("--configs", type=str, default="", help="Semicolon-separated configs")
     parser.add_argument("--use-default-configs", action="store_true", help="Include hip_kernel._CONFIGS")
-    parser.add_argument("--iters", type=int, default=10, help="Timing iterations per config")
-    parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations per config")
+    parser.add_argument("--rep", type=int, default=1000, help="Repetition time (in ms) per config")
+    parser.add_argument("--warmup", type=int, default=100, help="Warmup time (in ms) per config")
     parser.add_argument("--no-scale", action="store_true")
     parser.add_argument("--no-bias", action="store_true")
     args = parser.parse_args()
@@ -169,7 +152,7 @@ def main() -> None:
                 has_scale,
                 has_bias,
                 cfg,
-                args.iters,
+                args.rep,
                 args.warmup,
             )
             gflops = _iter_gflops(m, n, k, seconds)
