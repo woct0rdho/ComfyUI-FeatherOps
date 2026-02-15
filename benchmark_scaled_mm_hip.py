@@ -48,7 +48,7 @@ def benchmark(N, provider):
     bias = torch.randn((N,), device=device, dtype=out_dtype)
 
     quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(lambda: providers[provider](a, b, scale, bias, out_dtype), quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench(lambda: providers[provider](a, b, scale, bias, out_dtype), warmup=100, rep=1000, quantiles=quantiles)
 
     perf = lambda ms: 2 * N**3 / ms * 1e-6
     print("N", N, "provider", provider, "end", perf(ms))
