@@ -565,9 +565,9 @@ __global__ void scaled_mm_kernel(
 
 } // namespace
 
-// Config tag for K0MK1 kernel (no vec_a/vec_b params - always uses vec8 A, vec16 B)
+// Config tag for kernel (no vec_a/vec_b params - always uses vec8 A, vec16 B)
 template <int M, int N, int U, int STAGES, int RM, int RN>
-struct ConfigTagK0MK1 {
+struct ConfigTag {
     static constexpr int kBlockWarpsM = M;
     static constexpr int kBlockWarpsN = N;
     static constexpr int kUnrollK = U;
@@ -678,13 +678,13 @@ torch::Tensor scaled_mm(
     // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
     // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     const bool launched =
-        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTag<2, 2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 2, 2, 2, 4>{}) ||
         false;
 
-    TORCH_CHECK(launched, "Unsupported K0MK1 config");
+    TORCH_CHECK(launched, "Unsupported config");
     return c;
 }
 
@@ -706,5 +706,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("stages"),
         py::arg("repeat_m"),
         py::arg("repeat_n"),
-        "Scaled mixed-precision matmul (HIP, K0MK1 layout)");
+        "Scaled mixed-precision matmul");
 }

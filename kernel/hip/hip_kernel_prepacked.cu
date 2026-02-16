@@ -55,7 +55,8 @@ template <int kBlockWarpsM,
           int kUnrollK,
           int kStages,
           int kRepeatM,
-          int kRepeatN>
+          int kRepeatN,
+          bool kUseSwizzle>
 __global__ void scaled_mm_kernel_prepacked_b(
     const half* const a,
     const uint8_t* const b_prepacked,
@@ -68,8 +69,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     const int64_t stride_am,
     const int64_t stride_cm,
     const int has_scale,
-    const int has_bias,
-    const int use_swizzle)
+    const int has_bias)
 {
     static_assert(kStages == 1 || kStages == 2 || kStages == 4, "kStages must be 1, 2, or 4");
     static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
@@ -167,7 +167,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
             const int logical_col = block_n + col_local;
 
             int packed_col = logical_col;
-            if (use_swizzle) {
+            if constexpr (kUseSwizzle) {
                 const int group = logical_col >> 4;
                 const int inner = logical_col & 15;
                 const int swizzled_group = group ^ (ktile & 7);
@@ -335,7 +335,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
 } // namespace
 
 template <int M, int N, int U, int STAGES, int RM, int RN>
-struct ConfigTagK0MK1 {
+struct ConfigTag {
     static constexpr int kBlockWarpsM = M;
     static constexpr int kBlockWarpsN = N;
     static constexpr int kUnrollK = U;
@@ -429,14 +429,23 @@ torch::Tensor scaled_mm_prepacked(
             static_cast<uint32_t>(N) / kBlockN,
             static_cast<uint32_t>(a.size(0)) / kBlockM);
 
-        hipLaunchKernelGGL(
-            (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN>),
-            grid, block, 0, stream.stream(),
-            a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-            a.size(0), N, K,
-            a.stride(0), c.stride(0),
-            has_scale ? 1 : 0, has_bias ? 1 : 0,
-            use_swizzle ? 1 : 0);
+        if (use_swizzle) {
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true>),
+                grid, block, 0, stream.stream(),
+                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                a.size(0), N, K,
+                a.stride(0), c.stride(0),
+                has_scale ? 1 : 0, has_bias ? 1 : 0);
+        } else {
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false>),
+                grid, block, 0, stream.stream(),
+                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                a.size(0), N, K,
+                a.stride(0), c.stride(0),
+                has_scale ? 1 : 0, has_bias ? 1 : 0);
+        }
     };
 
     const auto try_launch = [&](const auto tag) -> bool {
@@ -453,14 +462,14 @@ torch::Tensor scaled_mm_prepacked(
     };
 
     const bool launched =
-        try_launch(ConfigTagK0MK1<1, 8, 2, 2, 8, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
-        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTag<1, 8, 2, 2, 8, 2>{}) ||
+        try_launch(ConfigTag<2, 2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 2, 2, 2, 4>{}) ||
         false;
 
-    TORCH_CHECK(launched, "Unsupported K0MK1 config");
+    TORCH_CHECK(launched, "Unsupported config");
     return c;
 }
 
@@ -483,5 +492,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("stages"),
         py::arg("repeat_m"),
         py::arg("repeat_n"),
-        "Scaled mixed-precision matmul (HIP, prepacked B fp8-bytes [K/16,N,16])");
+        "Scaled mixed-precision matmul (prepacked B fp8-bytes [K/16,N,16])");
 }

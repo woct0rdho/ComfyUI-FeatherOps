@@ -1,4 +1,5 @@
 import os
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,7 @@ _PREPACKED_CONFIGS = (
     (1, 8, 2, 2, 8, 2),
     *_CONFIGS,
 )
+_PREPACKED_AUTOTUNE_CACHE = {}
 
 
 @lru_cache(maxsize=1)
@@ -75,14 +77,81 @@ def _load_hip_prepacked_extension():
     return module
 
 
-def _pick_config_for_dims(M: int, N: int, K: int):
+def _select_config_prepacked(
+    a: torch.Tensor,
+    b_prepacked: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    has_scale: bool,
+    has_bias: bool,
+    b_is_swizzled: bool,
+    ext,
+):
     forced = _get_forced_config()
     if forced is not None:
         return forced
-    for cfg in _PREPACKED_CONFIGS:
-        if _config_compatible(cfg, M, N, K):
-            return cfg
-    raise RuntimeError(f"No compatible K0MK1 config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
+
+    key = (
+        tuple(a.shape),
+        tuple(b_prepacked.shape),
+        tuple(a.stride()),
+        tuple(b_prepacked.stride()),
+        has_scale,
+        has_bias,
+        b_is_swizzled,
+    )
+    cached = _PREPACKED_AUTOTUNE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    M, K = a.shape
+    N = b_prepacked.shape[1]
+    candidates = [c for c in _PREPACKED_CONFIGS if _config_compatible(c, M, N, K)]
+    if not candidates:
+        raise RuntimeError(f"No compatible prepacked config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
+
+    warmup_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_WARMUP", "1")))
+    bench_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_ITERS", "10")))
+    best_cfg = candidates[0]
+    best_ms = None
+
+    def run(cfg):
+        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        return ext.scaled_mm_prepacked(
+            a,
+            b_prepacked,
+            scale,
+            bias,
+            has_scale,
+            has_bias,
+            b_is_swizzled,
+            warps_m,
+            warps_n,
+            unroll_k,
+            stages,
+            repeat_m,
+            repeat_n,
+        )
+
+    for cfg in candidates:
+        for _ in range(warmup_iters):
+            run(cfg)
+    torch.cuda.synchronize()
+
+    for cfg in candidates:
+        start = time.perf_counter()
+        for _ in range(bench_iters):
+            run(cfg)
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - start) * 1000.0 / bench_iters
+        if best_ms is None or ms < best_ms:
+            best_ms = ms
+            best_cfg = cfg
+
+    _PREPACKED_AUTOTUNE_CACHE[key] = best_cfg
+    wm, wn, uk, st, rm, rn = best_cfg
+    print(f"HIP prepacked autotune M={M} N={N} K={K} swizzled={int(b_is_swizzled)} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    return best_cfg
 
 
 def prepack_b_for_scaled_mm_hip(b: torch.Tensor, *, swizzle: bool = False) -> torch.Tensor:
@@ -153,7 +222,16 @@ def scaled_mm_hip_prepacked(
         has_bias = True
 
     ext = _load_hip_prepacked_extension()
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _pick_config_for_dims(M, N, K)
+    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config_prepacked(
+        a,
+        b_prepacked,
+        scale_tensor,
+        bias_tensor,
+        has_scale,
+        has_bias,
+        b_is_swizzled,
+        ext,
+    )
 
     return ext.scaled_mm_prepacked(
         a,

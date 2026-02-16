@@ -13,7 +13,7 @@ Comparison mapping used:
   - `BLOCK_M=128`, `BLOCK_N=256`, `BLOCK_K=32`, `num_warps=8`, `num_stages=2`.
 
 Knobs used:
-- HIP: `HIP_K0MK1_FORCE_CONFIG=2,4,2,2,4,4`
+- HIP: `HIP_FORCE_CONFIG=2,4,2,2,4,4`
 - Triton: `TRITON_SCALED_MM_FORCE_CONFIG=128,256,32,1,8,2`, `AUTOTUNE_DISABLE=1`
 
 ## Repro Artifacts
@@ -122,7 +122,7 @@ Conclusion:
 ## Easy-First Parity Plan (Kernel + Compiler)
 ### P0: Measurement Guardrails (do once, keep fixed)
 - [ ] Keep fixed-config comparison while closing gaps:
-  - HIP: `HIP_K0MK1_FORCE_CONFIG=2,4,2,2,4,4`
+  - HIP: `HIP_FORCE_CONFIG=2,4,2,2,4,4`
   - Triton: `TRITON_SCALED_MM_FORCE_CONFIG=128,256,32,1,8,2`, `AUTOTUNE_DISABLE=1`
 - [ ] For every step: benchmark (median GFLOPS), then profile, then inspect TTGIR/AMDGPU deltas.
 
