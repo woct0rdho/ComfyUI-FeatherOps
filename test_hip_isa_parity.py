@@ -82,7 +82,7 @@ def find_kernel_symbol(codeobj: pathlib.Path, template_key: str) -> str:
     out = run(["nm", "-D", "--defined-only", str(codeobj)]).stdout.splitlines()
     hits = []
     for line in out:
-        if "scaled_mm_kernel_wmma_k0mk1" not in line:
+        if "scaled_mm_kernel" not in line:
             continue
         parts = line.split()
         if len(parts) < 3:
