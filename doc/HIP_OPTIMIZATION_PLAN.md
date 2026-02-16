@@ -241,7 +241,7 @@ Insight #8 shows the kernel's LDS/VALU/WMMA scheduling is tightly coupled — re
    - `python test_scaled_mm_hip.py`
    - `python benchmark_scaled_mm_hip.py`
    - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip.py -N 8192 --iters 20`
-3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert (unless explicitly requested).
+3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 4. If a new baseline is kept, commit the kernel immediately.
 5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
 6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
