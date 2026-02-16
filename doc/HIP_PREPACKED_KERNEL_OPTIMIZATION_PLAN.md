@@ -13,6 +13,11 @@
   - `hip_prepacked`: 36,698 GFLOPS
 - Large-N forced sweep (kernel-only, prepack excluded): prepacked `1,8,2,2,8,2` wins vs baseline hip `2,4,2,2,4,4` at 4096/6144/8192.
 
+## Performance Target Policy
+
+- Performance target is **benchmark GFLOPS** from `benchmark_scaled_mm_hip_prepacked.py` (prepack excluded).
+- Profiled kernel duration (`rocprofv3`) is for attribution only (instruction mix, bottleneck direction), not the final target metric.
+
 ## Stable Checkpoints
 
 - `cfe1781` - fp8-byte prepack path kept as baseline.
@@ -68,10 +73,14 @@
 | P5 | Default prepacked selection includes `1,8` | KEEP | 37,007 (default run) | profile shows `1,8` dispatch | Default path now picks winning config |
 | P6 | Swizzle on/off study for `1,8` | KEEP (no-swizzle) | no-swizzle mean 37,288 vs swizzle mean 36,916 | bank conflict unchanged | Swizzle not helping this winner |
 | P7 | Large-N validation (4096/6144/8192) | KEEP | 33,483 / 36,609 / 36,763 | all > baseline hip | Win is not 8192-only |
+| P8 | Bottleneck isolation pass (3 kernels @8192) | KEEP | 37,283 (`1x8`) / 33,185 (`2x4`) | `1x8` vs `2x4`: VALU 0.55x, busy cycles 0.85x, similar L2 hit | Winner is not memory-limited; VALU/decode pressure is primary remaining limiter |
+| P9a | Candidate tile `1,16,2,2,16,1` | REJECT | 32,159 | large regression vs `1x8` | Too slow; reverted |
+| P9b | Compile-time swizzle specialization (`kUseSwizzle` template bool) | KEEP | 37,341 (`1x8`, forced) | correctness unchanged; benchmark slight gain | Small but positive; kept |
+| P9c | Re-try stage4 overlap on `1,8,2,4,8,2` | REJECT | 29,659 | strong regression | Reverted immediately; skipped profile after revert per protocol |
 
 ## Thermal Tracking (Baseline Hip Proxy)
 
-Forced baseline config: `HIP_K0MK1_FORCE_CONFIG=2,4,2,2,4,4`.
+Forced baseline config: `HIP_FORCE_CONFIG=2,4,2,2,4,4`.
 
 | Point | Baseline hip GFLOPS (N=8192) |
 |---|---:|
@@ -84,6 +93,10 @@ Forced baseline config: `HIP_K0MK1_FORCE_CONFIG=2,4,2,2,4,4`.
 | P5 | 34,276 |
 | Recheck | 35,376 |
 | P6 | 35,052 |
+| P8 | 34,411 |
+| P9a | 34,078 |
+| P9b | 34,894 |
+| P9c | 35,162 |
 
 Interpretation:
 - Baseline drift can reach a few percent.
@@ -92,65 +105,70 @@ Interpretation:
 ## Do Not Repeat Without New Preconditions
 
 - fp16 prepack transport path (bandwidth regression).
-- stages=4 overlap path for this kernel shape/config family.
+- stages=4 overlap path for this prepacked kernel family (both prior and re-try).
 - assuming low bank conflict automatically means higher GFLOPS.
+
+## P8 Isolation Summary (Completed)
+
+Controlled kernels at `N=8192`:
+- baseline hip `2,4,2,2,4,4`
+- prepacked winner `1,8,2,2,8,2`
+- prepacked reference `2,4,2,2,4,4`
+
+Benchmark GFLOPS:
+- hip `2x4`: **34,411**
+- prepacked `1x8`: **37,283**
+- prepacked `2x4`: **33,185**
+
+Key counters (target kernels, normalized to prepacked `1x8`):
+- prepacked `2x4` vs prepacked `1x8`:
+  - `SQ_INSTS_VALU`: **1.81x**
+  - `SQ_BUSY_CYCLES`: **1.18x**
+  - `SQ_WAVE_CYCLES`: **1.18x**
+  - `SQ_INSTS_LDS`: **0.71x**
+- baseline hip `2x4` vs prepacked `1x8`:
+  - `SQ_INSTS_LDS`: **3.70x**
+  - `SQ_INSTS_VALU`: **0.56x**
+  - `LDSBankConflict`: **22.8x** higher
+
+Inference:
+- Current winner (`1x8`) is primarily constrained by **VALU/decode work**, not by LDS conflicts or L2 behavior.
+- Reducing VALU conversion pressure is the highest-value direction.
 
 ## New Plan: Isolate Bottleneck and Optimize Further
 
 ### Objective
 
-Identify the dominant limiter of current winner `1,8,2,2,8,2` and improve further while keeping the current gains stable.
+Push prepacked `1,8,2,2,8,2` further by reducing VALU/decode pressure while preserving fp8-byte transport.
 
-### Target
+### Targets
 
-- Primary: sustain prepacked > baseline hip across `N={4096,6144,8192}`.
-- Stretch: improve N=8192 from ~36.7-37.2k to >38k GFLOPS without accuracy regression.
+- Primary: keep prepacked > baseline hip at `N={4096,6144,8192}`.
+- Stretch: raise forced `1x8` at `N=8192` from ~37.3k toward 38k+ GFLOPS.
 
-### P8 - Bottleneck Isolation Pass (must-run first)
+### P10 - Branch B Execution (VALU/Decode)
 
-Run three controlled kernels at `N=8192`:
-- Baseline hip forced `2,4,2,2,4,4`
-- Prepacked forced `1,8,2,2,8,2` (winner)
-- Prepacked forced `2,4,2,2,4,4` (reference prepacked shape)
+1. **Conversion placement A/B test**
+   - Variant A (current): convert fp8->fp16 in compute stage.
+   - Variant B: convert during load/commit phase and store fp16 fragments in LDS for compute.
+   - Compare benchmark GFLOPS first; profile only if benchmark improves.
 
-For each, collect:
-- Benchmark GFLOPS and top kernel us
-- PMCs set A: `SQ_BUSY_CYCLES SQ_INSTS_LDS SQ_INSTS_TEX_LOAD SQ_INSTS_VALU SQ_WAVES SQ_WAVE_CYCLES`
-- PMCs set B: `SQ_INSTS_FLAT SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_TEX_STORE SQ_INSTS_WAVE32_VALU SQ_WAVE32_INSTS`
-- Single-counter runs: `LDSBankConflict`, `L2CacheHit`, `VALUInsts`
+2. **Conversion micro-op reduction**
+   - Optimize `fp8x4_to_half2x2` instruction sequence (avoid non-VOPD-friendly choices).
+   - Keep numerical behavior within existing accuracy gate.
 
-Decision criteria:
-- **Memory-side bottleneck** if busy cycles track TEX/L2 pressure while VALU is not dominant.
-- **VALU/decode bottleneck** if VALUInsts or wave32 VALU share dominates and correlates with cycle growth.
-- **Control/wait bottleneck** if SALU/FLAT/other share rises while LDS/VALU are not dominant.
+3. **Decode scheduling tweaks**
+   - Reorder decode and WMMA issue to improve overlap on independent units without `kStages=4`.
+   - Keep LDS footprint and occupancy unchanged.
 
-Deliverable:
-- One compact table with per-kernel normalized ratios vs winner (`1x8`).
+### P11 - Config-Robustness Sweep
 
-### P9 - Targeted Optimization Branches (choose by P8 result)
+1. Add targeted script (`benchmark_scaled_mm_hip_configs.py`) for fixed-config comparisons.
+2. Benchmark prepacked candidates on square and rectangular large shapes.
+3. Keep default autotune set minimal: only configs that never regress badly.
 
-#### Branch A: Memory-side dominant
-1. Test prepack ordering variants that preserve fp8 bytes but improve L2 locality.
-2. Test B-load issue pattern: one vs two columns/thread prefetch grouping (same arithmetic, different VMEM issue pattern).
-3. Keep only variants that improve both kernel us and GFLOPS in same thermal window.
+### Exit Criteria
 
-#### Branch B: VALU/decode dominant
-1. Optimize `fp8x4_to_half2x2` instruction mix for VOPD-friendliness (guided by ISA/ASM).
-2. Reorder decode/WMMA schedule to increase decode-hide opportunities without increasing LDS footprint.
-3. Verify with VALUInsts + busy cycles + correctness.
-
-#### Branch C: Control/wait dominant
-1. Tighten waitcnt/priority window placement and measure effect.
-2. Prefer minimal schedule surgery; avoid stages=4 occupancy penalties unless new evidence appears.
-
-### P10 - Robustness and Selection Policy
-
-1. Add lightweight prepacked-only autotune across `_PREPACKED_CONFIGS` with cache by shape/stride.
-2. Validate selected config on mixed shapes (square and tall/wide) and ensure no 8192 regression.
-3. Keep forced-config override behavior for deterministic profiling.
-
-### Exit Criteria for This Plan Revision
-
-- Correctness stays green (`rel_l2 <= 0.01`, `max abs <= 1.0`).
-- Prepacked remains above baseline hip at 4096/6144/8192.
-- Clear bottleneck attribution from P8 with one selected optimization branch and measurable gain.
+- Correctness remains green (`rel_l2 <= 0.01`, `max abs <= 1.0`).
+- Benchmark (not profile time) improves for forced `1x8` at `N=8192`.
+- No regression of default prepacked path on large-N sweep.

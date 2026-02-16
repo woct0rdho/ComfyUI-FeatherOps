@@ -85,7 +85,7 @@ def _load_hip_extension():
     return module
 
 
-# K0MK1 autotune configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
+# Autotune configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
 # Keep this list in sync with kernel/hip/hip_kernel.cu::try_launch table.
 _CONFIGS = (
     (2, 2, 2, 2, 4, 4),
@@ -108,12 +108,12 @@ def _config_compatible(cfg, M, N, K):
 
 @lru_cache(maxsize=1)
 def _get_forced_config():
-    cfg = os.environ.get("HIP_K0MK1_FORCE_CONFIG")
+    cfg = os.environ.get("HIP_FORCE_CONFIG")
     if not cfg:
         return None
     values = tuple(int(v.strip()) for v in cfg.split(",") if v.strip())
     if len(values) != 6:
-        raise RuntimeError("HIP_K0MK1_FORCE_CONFIG must contain 6 comma-separated integers: warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n")
+        raise RuntimeError("HIP_FORCE_CONFIG must contain 6 comma-separated integers: warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n")
     return values
 
 
@@ -145,10 +145,10 @@ def _select_config(
     M, N, K = a.shape[0], b.shape[1], a.shape[1]
     candidates = [c for c in _CONFIGS if _config_compatible(c, M, N, K)]
     if not candidates:
-        raise RuntimeError(f"No compatible K0MK1 config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
+        raise RuntimeError(f"No compatible config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
 
-    warmup_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_WARMUP", "1")))
-    bench_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_ITERS", "10")))
+    warmup_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_WARMUP", "1")))
+    bench_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_ITERS", "10")))
     best_cfg = candidates[0]
     best_ms = None
 
@@ -188,7 +188,7 @@ def _select_config(
 
     _AUTOTUNE_CACHE[key] = best_cfg
     wm, wn, uk, st, rm, rn = best_cfg
-    print(f"HIP K0MK1 autotune M={a.shape[0]} N={b.shape[1]} K={a.shape[1]} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    print(f"HIP autotune M={a.shape[0]} N={b.shape[1]} K={a.shape[1]} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
@@ -199,7 +199,7 @@ def scaled_mm_hip(
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Scaled matmul using K0MK1 LDS layout kernel (optimized for gfx11 wave32)."""
+    """Scaled matmul using LDS layout kernel (optimized for gfx11 wave32)."""
     assert a.is_cuda
     assert b.device == a.device
     assert a.ndim == 2

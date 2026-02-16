@@ -2,11 +2,43 @@
 
 import torch
 
-from kernel.hip.hip_kernel_prepacked import _PREPACKED_CONFIGS, _load_hip_prepacked_extension, prepack_b_for_scaled_mm_hip, scaled_mm_hip_prepacked
+from kernel.hip.hip_kernel_prepacked import _PREPACKED_CONFIGS, _load_hip_prepacked_extension, prepack_b_for_scaled_mm_hip
 from kernel.naive import scaled_mm_naive
 
 
-def test_one(M, N, K, swizzle: bool, with_scale: bool = True, with_bias: bool = True):
+def _run_prepacked_with_config(ext, cfg, a, b_prepacked, scale, bias, swizzle: bool):
+    has_scale = scale is not None
+    has_bias = bias is not None
+
+    if has_scale:
+        scale_tensor = scale.to(dtype=torch.float32)
+    else:
+        scale_tensor = torch.empty(0, device=a.device, dtype=torch.float32)
+
+    if has_bias:
+        bias_tensor = bias.to(dtype=torch.float16)
+    else:
+        bias_tensor = torch.empty(0, device=a.device, dtype=torch.float16)
+
+    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+    return ext.scaled_mm_prepacked(
+        a,
+        b_prepacked,
+        scale_tensor,
+        bias_tensor,
+        has_scale,
+        has_bias,
+        swizzle,
+        warps_m,
+        warps_n,
+        unroll_k,
+        stages,
+        repeat_m,
+        repeat_n,
+    )
+
+
+def test_one(ext, cfg, M, N, K, swizzle: bool, with_scale: bool = True, with_bias: bool = True):
     device = "cuda"
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
@@ -15,14 +47,7 @@ def test_one(M, N, K, swizzle: bool, with_scale: bool = True, with_bias: bool = 
     bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else None
 
     b_prepacked = prepack_b_for_scaled_mm_hip(b, swizzle=swizzle)
-    out_new = scaled_mm_hip_prepacked(
-        a,
-        b_prepacked,
-        scale,
-        bias,
-        torch.float16,
-        b_is_swizzled=swizzle,
-    )
+    out_new = _run_prepacked_with_config(ext, cfg, a, b_prepacked, scale, bias, swizzle)
     out_ref = scaled_mm_naive(a, b, scale, bias, torch.float16)
 
     diff = (out_new.float() - out_ref.float()).abs()
@@ -34,7 +59,7 @@ def test_one(M, N, K, swizzle: bool, with_scale: bool = True, with_bias: bool = 
 
 
 def main():
-    _load_hip_prepacked_extension()
+    ext = _load_hip_prepacked_extension()
 
     test_sizes = [
         (128, 128, 128),
@@ -61,7 +86,7 @@ def main():
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
             for swizzle in (False, True):
-                ok, l2_rel, max_diff = test_one(M, N, K, swizzle=swizzle, with_scale=True, with_bias=True)
+                ok, l2_rel, max_diff = test_one(ext, cfg, M, N, K, swizzle=swizzle, with_scale=True, with_bias=True)
                 if not ok:
                     cfg_ok = False
                     failed.append((cfg, M, N, K, swizzle, l2_rel, max_diff))

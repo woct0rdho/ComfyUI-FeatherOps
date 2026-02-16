@@ -275,7 +275,7 @@ hipcc -save-temps [flags] -c kernel/hip/hip_kernel.hip -o /tmp/out.o
 # Config 2,4,2,2,4,4: Li2ELi4ELi2ELi2ELi4ELi4ELb0ELb1E (lines ~36919-38617)
 ```
 
-Can disable autotune with `HIP_K0MK1_FORCE_CONFIG=2,4,2,2,4,4` env var.
+Can disable autotune with `HIP_FORCE_CONFIG=2,4,2,2,4,4` env var.
 
 ## ISA Notes
 
@@ -298,7 +298,7 @@ Authoritative references: `doc/rdna35_instruction_set_architecture.md` (ISA manu
 ## File Reference
 
 - `kernel/hip/hip_kernel.cu` — Main kernel (**baseline, 36134 GFLOPS**)
-- `kernel/hip/hip_kernel.py` — Python wrapper, JIT, autotune, `HIP_K0MK1_FORCE_CONFIG`
+- `kernel/hip/hip_kernel.py` — Python wrapper, JIT, autotune, `HIP_FORCE_CONFIG`
 - `test_scaled_mm_hip.py` — Correctness test (all configs × 5 sizes)
 - `benchmark_scaled_mm_hip.py` — Full benchmark (N=128..8192)
 - `profile_scaled_mm_hip.py` — Profiling script for rocprofv3
