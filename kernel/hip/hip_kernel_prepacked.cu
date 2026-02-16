@@ -1,0 +1,487 @@
+// rocWMMA requires __half conversions; torch defines HIP no-half macros.
+#ifdef __HIP_NO_HALF_OPERATORS__
+#undef __HIP_NO_HALF_OPERATORS__
+#endif
+#ifdef __HIP_NO_HALF_CONVERSIONS__
+#undef __HIP_NO_HALF_CONVERSIONS__
+#endif
+#ifdef __HIP_NO_HALF2_OPERATORS__
+#undef __HIP_NO_HALF2_OPERATORS__
+#endif
+
+#include <torch/extension.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
+namespace {
+
+constexpr int kWmmaM = 16;
+constexpr int kWmmaN = 16;
+constexpr int kWmmaK = 16;
+constexpr int kWaveSize = 32;
+
+__device__ __forceinline__ void fp8x4_to_half2x2(
+    const uint32_t p, uint32_t& out_lo, uint32_t& out_hi)
+{
+    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);
+    const uint32_t hi_pair = ((p >> 16) & 0xFFu) | ((p >> 8) & 0xFF0000u);
+
+    {
+        const uint32_t signs = (lo_pair & 0x00800080u) << 8;
+        const uint32_t em = ((lo_pair & 0x007F007Fu) << 7) + 0x20002000u;
+        out_lo = signs | em;
+    }
+    {
+        const uint32_t signs = (hi_pair & 0x00800080u) << 8;
+        const uint32_t em = ((hi_pair & 0x007F007Fu) << 7) + 0x20002000u;
+        out_hi = signs | em;
+    }
+}
+
+__device__ __forceinline__ constexpr int a_row_logical_to_phys_16(const int x)
+{
+    return ((x & 7) << 1) | ((x >> 3) & 1);
+}
+
+__device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
+{
+    return ((x & 1) << 3) | ((x >> 1) & 7);
+}
+
+template <int kBlockWarpsM,
+          int kBlockWarpsN,
+          int kUnrollK,
+          int kStages,
+          int kRepeatM,
+          int kRepeatN>
+__global__ void scaled_mm_kernel_prepacked_b(
+    const half* const a,
+    const uint8_t* const b_prepacked,
+    const float* const scale,
+    const half* const bias,
+    half* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int64_t stride_am,
+    const int64_t stride_cm,
+    const int has_scale,
+    const int has_bias,
+    const int use_swizzle)
+{
+    static_assert(kStages == 1 || kStages == 2 || kStages == 4, "kStages must be 1, 2, or 4");
+    static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
+
+    constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
+    constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+    static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16");
+    static_assert(kBlockN % 16 == 0, "kBlockN must be a multiple of 16");
+
+    constexpr int kK1 = 8;
+    constexpr int kK0 = kWmmaK / kK1;
+    constexpr int kAStrideK1 = kK1;
+    constexpr int kShASize = kStages * kK0 * kBlockM * kAStrideK1;
+
+    constexpr int kBPad = 8;
+    constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * (kWmmaN + kBPad);
+    static_assert(kShASize >= kCShuffleSize,
+        "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
+
+    __shared__ __align__(16) half sh_a[kShASize];
+    __shared__ __align__(16) uint8_t sh_b[kStages][kBlockN + kBPad][kWmmaK];
+
+    const int block_m = static_cast<int>(blockIdx.y) * kBlockM;
+    const int block_n = static_cast<int>(blockIdx.x) * kBlockN;
+
+    const int tid = static_cast<int>(threadIdx.x) + static_cast<int>(threadIdx.y) * static_cast<int>(blockDim.x);
+    constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+
+    const int wave_id = tid / kWaveSize;
+    const int warp_m = wave_id % kBlockWarpsM;
+    const int warp_n = wave_id / kBlockWarpsM;
+    const int lane = tid % kWaveSize;
+
+    constexpr int kRepeatTiles = kRepeatM * kRepeatN;
+    float acc[kRepeatTiles][8];
+    #pragma unroll
+    for (int r = 0; r < kRepeatTiles; ++r) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            acc[r][i] = 0.0f;
+        }
+    }
+
+    constexpr int kAVecs = kK0 * kBlockM;
+    constexpr bool kUseWsgrAStoreOwnership =
+        (kAVecs / (kBlockWarpsM * kWaveSize)) <= 4;
+    constexpr int kAOwnerWaves =
+        kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
+    constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
+    constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
+    const auto a_row_phys_to_logical = [&](const int physical_row) -> int {
+        const int tile_base = physical_row & ~15;
+        const int local = physical_row & 15;
+        return tile_base + a_row_phys_to_logical_16(local);
+    };
+    const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
+        const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
+        return &sh_a[idx];
+    };
+
+    const auto load_a_lds_k0mk1 = [&](const int stage, const int64_t kk) -> void {
+        if constexpr (kUseWsgrAStoreOwnership) {
+            if (wave_id >= kAOwnerWaves) return;
+        }
+        const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
+
+        #pragma unroll
+        for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
+            const int vec_idx = a_owner_tid + v * kAOwnerThreads;
+            if (vec_idx >= kAVecs) continue;
+
+            const int k0 = vec_idx / kBlockM;
+            const int m_phys = vec_idx % kBlockM;
+            const int m_logical = a_row_phys_to_logical(m_phys);
+
+            const int64_t a_row = block_m + m_logical;
+            const int64_t a_k = kk + k0 * kK1;
+            half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
+            const half* const a_ptr = a + a_row * stride_am + a_k;
+            *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_ptr);
+        }
+    };
+
+    constexpr int kBVecs = (kBlockN * kWmmaK) / 16;
+    constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
+
+    const auto load_b_lds_prepacked = [&](const int stage, const int64_t kk) -> void {
+        const int ktile = static_cast<int>(kk / kWmmaK);
+        #pragma unroll
+        for (int v = 0; v < kBVecsPerThread; ++v) {
+            const int vec_idx = tid + v * kThreads;
+            if (vec_idx >= kBVecs) continue;
+
+            const int col_local = vec_idx;
+            const int logical_col = block_n + col_local;
+
+            int packed_col = logical_col;
+            if (use_swizzle) {
+                const int group = logical_col >> 4;
+                const int inner = logical_col & 15;
+                const int swizzled_group = group ^ (ktile & 7);
+                packed_col = (swizzled_group << 4) | inner;
+            }
+
+            const int64_t gidx = ((static_cast<int64_t>(ktile) * N + packed_col) * kWmmaK);
+            const uint8_t* const b_src = b_prepacked + gidx;
+            uint8_t* const b_dst = &sh_b[stage][col_local][0];
+            *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
+        }
+    };
+
+    constexpr int kChunkK = kWmmaK * kUnrollK;
+    const int total_chunks = static_cast<int>(K / kChunkK);
+    int stage_base = 0;
+
+    #pragma unroll
+    for (int u = 0; u < kUnrollK; ++u) {
+        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
+        load_a_lds_k0mk1(u, k);
+    }
+    #pragma unroll
+    for (int u = 0; u < kUnrollK; ++u) {
+        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
+        load_b_lds_prepacked(u, k);
+    }
+    __syncthreads();
+
+    const auto wmma_compute_stage = [&](const int stage) -> void {
+        if (wave_id >= kBlockWarpsM * kBlockWarpsN) return;
+
+        using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
+        using float8_t = float __attribute__((ext_vector_type(8)));
+
+        const int lane_in_subgroup = lane % 16;
+
+        _Float16 all_reg_b[kRepeatN][16];
+        #pragma unroll
+        for (int rn = 0; rn < kRepeatN; ++rn) {
+            const int tile_n = warp_n + rn * kBlockWarpsN;
+            const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+            const uint4 p = *reinterpret_cast<const uint4*>(&sh_b[stage][n_col][0]);
+            const uint32_t p32[4] = {p.x, p.y, p.z, p.w};
+            uint32_t h32[8];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
+            }
+            *reinterpret_cast<uint4*>(&all_reg_b[rn][0]) = *reinterpret_cast<const uint4*>(&h32[0]);
+            *reinterpret_cast<uint4*>(&all_reg_b[rn][8]) = *reinterpret_cast<const uint4*>(&h32[4]);
+        }
+
+        #pragma unroll
+        for (int rm = 0; rm < kRepeatM; ++rm) {
+            const int tile_m = warp_m + rm * kBlockWarpsM;
+            const int m_row = tile_m * kWmmaM + lane_in_subgroup;
+
+            _Float16 reg_a_fp16[16];
+            #pragma unroll
+            for (int k0 = 0; k0 < kK0; ++k0) {
+                const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
+                #pragma unroll
+                for (int k1 = 0; k1 < kK1; ++k1) {
+                    reg_a_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_a_src[k1]);
+                }
+            }
+
+            const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
+
+            #pragma unroll
+            for (int rn = 0; rn < kRepeatN; ++rn) {
+                const int repeat_idx = rm * kRepeatN + rn;
+                const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(all_reg_b[rn]);
+                float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
+                c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
+                *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
+            }
+        }
+    };
+
+    for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+        #pragma unroll
+        for (int u = 0; u < kUnrollK; ++u) {
+            const int stage = (stage_base + u) % kStages;
+            wmma_compute_stage(stage);
+        }
+
+        if (iter_idx + 1 < total_chunks) {
+            const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
+            asm volatile("s_setprio 1" ::: "memory");
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
+                const int stage = (stage_base + u) % kStages;
+                const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                load_a_lds_k0mk1(stage, k);
+            }
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
+                const int stage = (stage_base + u) % kStages;
+                const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                load_b_lds_prepacked(stage, k);
+            }
+            asm volatile("s_setprio 0" ::: "memory");
+        }
+
+        if constexpr (kStages != kUnrollK) {
+            stage_base = (stage_base + kUnrollK) % kStages;
+        }
+        __syncthreads();
+    }
+
+    if (wave_id < kBlockWarpsM * kBlockWarpsN) {
+        constexpr int kCPad = 8;
+        constexpr int kCStride = kWmmaN + kCPad;
+        half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
+
+        const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
+        const int subgroup = lane / 16;
+        const int lane_in_subgroup = lane % 16;
+
+        #pragma unroll
+        for (int rm = 0; rm < kRepeatM; ++rm) {
+            #pragma unroll
+            for (int rn = 0; rn < kRepeatN; ++rn) {
+                const int repeat_idx = rm * kRepeatN + rn;
+                const int tile_m = warp_m + rm * kBlockWarpsM;
+                const int tile_n = warp_n + rn * kBlockWarpsN;
+                const int64_t tile_m_base = block_m + tile_m * kWmmaM;
+                const int64_t tile_n_base = block_n + tile_n * kWmmaN;
+
+                const int col = lane_in_subgroup;
+                #pragma unroll
+                for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
+                    const int row_logical = subgroup * 8 + acc_idx;
+                    const int row_phys = a_row_logical_to_phys_16(row_logical);
+                    half val = __float2half_rn(acc[repeat_idx][acc_idx]);
+                    val = __hmul(val, scale_h);
+                    sh_c[row_phys * kCStride + col] = val;
+                }
+
+                const int read_row = lane / 2;
+                const int read_row_phys = a_row_logical_to_phys_16(read_row);
+                const int col_half = lane % 2;
+                const int read_col_base = col_half * 8;
+
+                const int64_t out_row = tile_m_base + read_row;
+                const int64_t out_col = tile_n_base + read_col_base;
+                half* const out_ptr = c + out_row * stride_cm + out_col;
+                half* const h = sh_c + read_row_phys * kCStride + read_col_base;
+
+                if (has_bias) {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        h[i] = __hadd(h[i], bias[out_col + i]);
+                    }
+                }
+
+                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
+            }
+        }
+    }
+}
+
+} // namespace
+
+template <int M, int N, int U, int STAGES, int RM, int RN>
+struct ConfigTagK0MK1 {
+    static constexpr int kBlockWarpsM = M;
+    static constexpr int kBlockWarpsN = N;
+    static constexpr int kUnrollK = U;
+    static constexpr int kStages = STAGES;
+    static constexpr int kRepeatM = RM;
+    static constexpr int kRepeatN = RN;
+};
+
+torch::Tensor scaled_mm_prepacked(
+    const torch::Tensor& a,
+    const torch::Tensor& b_prepacked,
+    const torch::Tensor& scale,
+    const torch::Tensor& bias,
+    const bool has_scale,
+    const bool has_bias,
+    const bool use_swizzle,
+    const int64_t block_warps_m,
+    const int64_t block_warps_n,
+    const int64_t unroll_k,
+    const int64_t stages,
+    const int64_t repeat_m,
+    const int64_t repeat_n)
+{
+    TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
+    TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
+    TORCH_CHECK(a.scalar_type() == at::kHalf, "a must be float16");
+    TORCH_CHECK(b_prepacked.scalar_type() == at::kByte, "b_prepacked must be uint8 (fp8 raw bytes)");
+    TORCH_CHECK(a.dim() == 2, "a must be 2D");
+    TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
+    TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
+
+    const int64_t K = a.size(1);
+    TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
+    TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK,
+        "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
+
+    const int64_t N = b_prepacked.size(1);
+    TORCH_CHECK(bias.scalar_type() == at::kHalf || !has_bias, "bias must be float16");
+
+    TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
+    TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
+
+    if (has_scale) {
+        TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor");
+        TORCH_CHECK(scale.numel() == 1, "scale must have one element");
+        TORCH_CHECK(scale.scalar_type() == at::kFloat, "scale must be float32");
+    }
+    if (has_bias) {
+        TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+        TORCH_CHECK(bias.numel() == N, "bias must have N elements");
+        TORCH_CHECK(bias.scalar_type() == at::kHalf, "bias must be float16");
+    }
+
+    auto c = torch::empty({a.size(0), N}, a.options().dtype(at::kHalf));
+
+    const half* const a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
+    const uint8_t* const b_ptr = b_prepacked.data_ptr<uint8_t>();
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const float* const scale_ptr = has_scale ? scale.data_ptr<float>() : nullptr;
+    const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
+    half* const c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
+
+    const auto is_aligned_16 = [](const void* const p) {
+        return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
+    };
+    TORCH_CHECK(is_aligned_16(a_ptr), "a data pointer must be 16-byte aligned");
+    TORCH_CHECK(is_aligned_16(b_ptr), "b_prepacked data pointer must be 16-byte aligned");
+    TORCH_CHECK(is_aligned_16(c_ptr), "c data pointer must be 16-byte aligned");
+
+    const auto launch = [&](const auto tag) -> void {
+        constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
+        constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
+        constexpr int kUnrollK = decltype(tag)::kUnrollK;
+        constexpr int kStages = decltype(tag)::kStages;
+        constexpr int kRepeatM = decltype(tag)::kRepeatM;
+        constexpr int kRepeatN = decltype(tag)::kRepeatN;
+        constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
+        constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+
+        TORCH_CHECK(a.size(0) % kBlockM == 0,
+            "M (", a.size(0), ") must be divisible by kBlockM (", kBlockM, ")");
+        TORCH_CHECK(N % kBlockN == 0,
+            "N (", N, ") must be divisible by kBlockN (", kBlockN, ")");
+        TORCH_CHECK(K % (kWmmaK * kUnrollK) == 0,
+            "K (", K, ") must be divisible by kChunkK (", kWmmaK * kUnrollK, ")");
+
+        constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+        static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
+        const dim3 block(kThreadsPerBlock, 1, 1);
+        const dim3 grid(
+            static_cast<uint32_t>(N) / kBlockN,
+            static_cast<uint32_t>(a.size(0)) / kBlockM);
+
+        hipLaunchKernelGGL(
+            (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN>),
+            grid, block, 0, stream.stream(),
+            a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+            a.size(0), N, K,
+            a.stride(0), c.stride(0),
+            has_scale ? 1 : 0, has_bias ? 1 : 0,
+            use_swizzle ? 1 : 0);
+    };
+
+    const auto try_launch = [&](const auto tag) -> bool {
+        if (block_warps_m == decltype(tag)::kBlockWarpsM &&
+            block_warps_n == decltype(tag)::kBlockWarpsN &&
+            unroll_k == decltype(tag)::kUnrollK &&
+            stages == decltype(tag)::kStages &&
+            repeat_m == decltype(tag)::kRepeatM &&
+            repeat_n == decltype(tag)::kRepeatN) {
+            launch(tag);
+            return true;
+        }
+        return false;
+    };
+
+    const bool launched =
+        try_launch(ConfigTagK0MK1<1, 8, 2, 2, 8, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 2>{}) ||
+        try_launch(ConfigTagK0MK1<2, 4, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTagK0MK1<4, 2, 2, 2, 2, 4>{}) ||
+        false;
+
+    TORCH_CHECK(launched, "Unsupported K0MK1 config");
+    return c;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
+    namespace py = pybind11;
+    m.def(
+        "scaled_mm_prepacked",
+        &scaled_mm_prepacked,
+        py::arg("a"),
+        py::arg("b_prepacked"),
+        py::arg("scale"),
+        py::arg("bias"),
+        py::arg("has_scale"),
+        py::arg("has_bias"),
+        py::arg("use_swizzle"),
+        py::arg("block_warps_m"),
+        py::arg("block_warps_n"),
+        py::arg("unroll_k"),
+        py::arg("stages"),
+        py::arg("repeat_m"),
+        py::arg("repeat_n"),
+        "Scaled mixed-precision matmul (HIP, prepacked B fp8-bytes [K/16,N,16])");
+}
