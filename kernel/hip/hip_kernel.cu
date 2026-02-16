@@ -77,7 +77,7 @@ template <int kBlockWarpsM,
           int kStages,
           int kRepeatM,
           int kRepeatN>
-__global__ void scaled_mm_kernel_wmma_k0mk1(
+__global__ void scaled_mm_kernel(
     const half* const a,
     const uint8_t* const b,
     const float* const scale,
@@ -576,7 +576,7 @@ struct ConfigTagK0MK1 {
     static constexpr int kRepeatN = RN;
 };
 
-torch::Tensor scaled_mm_k0mk1(
+torch::Tensor scaled_mm(
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scale,
@@ -654,7 +654,7 @@ torch::Tensor scaled_mm_k0mk1(
             static_cast<uint32_t>(a.size(0)) / kBlockM);
 
         hipLaunchKernelGGL(
-            (scaled_mm_kernel_wmma_k0mk1<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN>),
+            (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN>),
             grid, block, 0, stream.stream(),
             a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
             a.size(0), b.size(1), a.size(1),
@@ -692,8 +692,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     namespace py = pybind11;
     m.def(
-        "scaled_mm_k0mk1",
-        &scaled_mm_k0mk1,
+        "scaled_mm",
+        &scaled_mm,
         py::arg("a"),
         py::arg("b"),
         py::arg("scale"),

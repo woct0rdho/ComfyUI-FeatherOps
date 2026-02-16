@@ -148,13 +148,13 @@ def _select_config(
         raise RuntimeError(f"No compatible K0MK1 config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
 
     warmup_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_WARMUP", "1")))
-    bench_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_ITERS", "3")))
+    bench_iters = max(1, int(os.environ.get("HIP_K0MK1_AUTOTUNE_ITERS", "10")))
     best_cfg = candidates[0]
     best_ms = None
 
     def run(cfg):
         warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
-        return ext.scaled_mm_k0mk1(
+        return ext.scaled_mm(
             a,
             b,
             scale,
@@ -238,7 +238,7 @@ def scaled_mm_hip(
         has_bias,
         ext,
     )
-    return ext.scaled_mm_k0mk1(
+    return ext.scaled_mm(
         a,
         b,
         scale_tensor,

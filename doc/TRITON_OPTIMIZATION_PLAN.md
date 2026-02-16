@@ -31,7 +31,7 @@ Profiled kernel metrics:
 - Triton (`_scaled_mm_kernel`):
   - median `48.422 ms`, avg `48.638 ms`
   - `VGPR=224`, `SGPR=128`, `LDS=16384`, `WG=256`
-- HIP (`scaled_mm_kernel_wmma_k0mk1<2,4,2,2,4,4,...>`):
+- HIP (`scaled_mm_kernel<2,4,2,2,4,4,...>`):
   - median `32.052 ms`, avg `31.982 ms`
   - `VGPR=192`, `SGPR=128`, `LDS=25088`, `WG=256`
 

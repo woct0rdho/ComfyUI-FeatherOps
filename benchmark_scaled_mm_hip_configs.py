@@ -67,7 +67,7 @@ def _run_config(
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
 
     def run_kernel():
-        ext.scaled_mm_k0mk1(
+        ext.scaled_mm(
             a,
             b,
             scale,

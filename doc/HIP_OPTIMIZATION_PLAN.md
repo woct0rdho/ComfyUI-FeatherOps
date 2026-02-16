@@ -2,7 +2,7 @@
 
 ## Target
 
-Kernel: `scaled_mm_kernel_wmma_k0mk1` — fp8×fp16 mixed-precision GEMM on RDNA 3.5 (gfx1151).
+Kernel: `scaled_mm_kernel` — fp8×fp16 mixed-precision GEMM on RDNA 3.5 (gfx1151).
 Best config: `(2,4,2,2,4,4)` → BlockM=128, BlockN=256, 256 threads, VGPR=189, SGPR=105, LDS=25088.
 Peak: 40 CUs × 2 SIMD/CU × 32 ALUs/SIMD × 2 (VOPD/WMMA) × 2 (fp16 pack) × 2 (FMA) × 2.9 GHz = **59.4 TFLOPS**.
 No native fp8 conversion instructions on gfx1151.
@@ -25,6 +25,7 @@ Approximation policy: denorm/NaN exact behavior may be relaxed if gate stays gre
 
 Beats `torch_compiled` (31494) at N=8192 by +14.7%.
 Note: benchmarks affected by thermal throttling; gains <2% should be interpreted with caution.
+We've updated the benchmark scripts to use longer repetition time for more steady results. The above benchmark results are now invalid and we need to benchmark thee baseline again.
 
 ## Current Bottleneck Analysis
 
