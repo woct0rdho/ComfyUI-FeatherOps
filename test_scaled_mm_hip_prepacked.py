@@ -6,61 +6,58 @@ from kernel.hip.hip_kernel_prepacked import _PREPACKED_CONFIGS, _load_hip_prepac
 from kernel.naive import scaled_mm_naive
 
 
-def _run_prepacked_with_config(ext, cfg, a, b_prepacked, scale, bias, swizzle: bool):
-    has_scale = scale is not None
-    has_bias = bias is not None
-
-    if has_scale:
-        scale_tensor = scale.to(dtype=torch.float32)
-    else:
-        scale_tensor = torch.empty(0, device=a.device, dtype=torch.float32)
-
-    if has_bias:
-        bias_tensor = bias.to(dtype=torch.float16)
-    else:
-        bias_tensor = torch.empty(0, device=a.device, dtype=torch.float16)
-
+def test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=True):
+    """Test a specific config and return (pass, error_msg)."""
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
-    return ext.scaled_mm_prepacked(
-        a,
-        b_prepacked,
-        scale_tensor,
-        bias_tensor,
-        has_scale,
-        has_bias,
-        swizzle,
-        warps_m,
-        warps_n,
-        unroll_k,
-        stages,
-        repeat_m,
-        repeat_n,
-    )
 
-
-def test_one(ext, cfg, M, N, K, swizzle: bool, with_scale: bool = True, with_bias: bool = True):
-    device = "cuda"
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
 
-    scale = torch.tensor(1.7, device=device, dtype=torch.float32) if with_scale else None
-    bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else None
+    scale = torch.tensor(1.7, device=device, dtype=torch.float32) if with_scale else torch.empty(0, device=device, dtype=torch.float32)
+    bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else torch.empty(0, device=device, dtype=torch.float16)
 
     b_prepacked = prepack_b_for_scaled_mm_hip(b, swizzle=swizzle)
-    out_new = _run_prepacked_with_config(ext, cfg, a, b_prepacked, scale, bias, swizzle)
-    out_ref = scaled_mm_naive(a, b, scale, bias, torch.float16)
 
-    diff = (out_new.float() - out_ref.float()).abs()
+    try:
+        out_hip = ext.scaled_mm_prepacked(
+            a,
+            b_prepacked,
+            scale,
+            bias,
+            with_scale,
+            with_bias,
+            swizzle,
+            warps_m,
+            warps_n,
+            unroll_k,
+            stages,
+            repeat_m,
+            repeat_n,
+        )
+    except Exception as e:
+        return False, f"LAUNCH ERROR: {e}"
+
+    # Compute reference
+    out_ref = scaled_mm_naive(a, b, scale if with_scale else None, bias if with_bias else None, torch.float16)
+
+    # Compare
+    diff = (out_hip.float() - out_ref.float()).abs()
     ref_abs = out_ref.float().abs()
-    l2_rel = (diff.norm() / ref_abs.norm().clamp_min(1e-6)).item()
+    l2_rel = diff.norm() / ref_abs.norm().clamp_min(1e-6)
     max_diff = diff.max().item()
-    ok = l2_rel <= 0.01 and max_diff <= 1.0
-    return ok, l2_rel, max_diff
+
+    # Threshold for pass/fail
+    if l2_rel.item() > 0.01 or max_diff > 1.0:
+        return False, f"rel_l2={l2_rel.item():.3g} max_atol={max_diff:.3g}"
+    return True, f"rel_l2={l2_rel.item():.3g} max_atol={max_diff:.3g}"
 
 
 def main():
+    device = "cuda"
     ext = _load_hip_prepacked_extension()
 
+    # Test matrix sizes - must be divisible by tile sizes for contiguous fast path.
+    # Max block_m=128, max block_n=256, chunk_k=32 across all configs.
     test_sizes = [
         (128, 128, 128),
         (256, 256, 256),
@@ -68,12 +65,12 @@ def main():
         (512, 512, 512),
     ]
 
-    print("Testing prepacked HIP kernel correctness")
+    print(f"Testing {len(_PREPACKED_CONFIGS)} configs across {len(test_sizes)} matrix sizes\n")
     print("Config format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)")
     print("=" * 80)
 
-    failed = []
-    passed = 0
+    failed_configs = []
+    passed_configs = []
 
     for cfg in sorted(_PREPACKED_CONFIGS):
         warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
@@ -81,27 +78,41 @@ def main():
         block_n = 16 * warps_n * repeat_n
         chunk_k = 16 * unroll_k
 
-        cfg_ok = True
+        config_passed = True
+        config_errors = []
+
         for M, N, K in test_sizes:
+            # Skip sizes that don't satisfy divisibility for this config
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
-            for swizzle in (False, True):
-                ok, l2_rel, max_diff = test_one(ext, cfg, M, N, K, swizzle=swizzle, with_scale=True, with_bias=True)
-                if not ok:
-                    cfg_ok = False
-                    failed.append((cfg, M, N, K, swizzle, l2_rel, max_diff))
 
-        status = "PASS" if cfg_ok else "FAIL"
+            for swizzle in (False, True):
+                passed, msg = test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=True)
+                if not passed:
+                    config_passed = False
+                    config_errors.append(f"  M={M} N={N} K={K} swizzle={swizzle}: {msg}")
+
+        status = "PASS" if config_passed else "FAIL"
         print(f"[{status}] {cfg} BlockM={block_m} BlockN={block_n}")
-        if cfg_ok:
-            passed += 1
+        if not config_passed:
+            for err in config_errors:
+                print(err)
+            failed_configs.append(cfg)
+        else:
+            passed_configs.append(cfg)
 
     print("=" * 80)
-    print(f"Summary: {passed}/{len(_PREPACKED_CONFIGS)} configs passed")
-    if failed:
-        print("Failures:")
-        for cfg, M, N, K, swizzle, l2_rel, max_diff in failed:
-            print(f"  cfg={cfg} M={M} N={N} K={K} swizzle={swizzle} rel_l2={l2_rel:.3g} max_atol={max_diff:.3g}")
+    print(f"\nSummary: {len(passed_configs)}/{len(_PREPACKED_CONFIGS)} configs passed")
+
+    if failed_configs:
+        print(f"\nFailed configs ({len(failed_configs)}):")
+        for cfg in failed_configs:
+            print(f"  {cfg}")
+
+    if passed_configs:
+        print(f"\nPassed configs ({len(passed_configs)}):")
+        for cfg in passed_configs:
+            print(f"  {cfg}")
 
 
 if __name__ == "__main__":

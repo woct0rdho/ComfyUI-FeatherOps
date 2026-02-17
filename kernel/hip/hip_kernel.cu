@@ -19,26 +19,16 @@ constexpr int kWaveSize = 32;
 __device__ __forceinline__ void fp8x4_to_half2x2(
     const uint32_t p, uint32_t& out_lo, uint32_t& out_hi)
 {
-    // p = [b3:b2:b1:b0], each byte is fp8e4m3fn
-    // Pair bytes for sequential output: [b1:b0] and [b3:b2]
-    // lo_pair has b0 in [7:0] and b1 in [23:16]
-    // hi_pair has b2 in [7:0] and b3 in [23:16]
-    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);           // [0:b1:0:b0]
-    const uint32_t hi_pair = ((p >> 16) & 0xFFu) | ((p >> 8) & 0xFF0000u); // [0:b3:0:b2]
+    // p = [b3:b2:b1:b0], each byte is fp8e4m3fn.
+    // Build byte pairs as [0:b1:0:b0] and [0:b3:0:b2] using V_PERM_B32.
+    const uint32_t lo_pair = __builtin_amdgcn_perm(0u, p, 0x0c010c00u);
+    const uint32_t hi_pair = __builtin_amdgcn_perm(0u, p, 0x0c030c02u);
 
-    // Convert each pair simultaneously using 32-bit ops:
-    // For each byte x at [7:0] or [23:16]:
-    //   fp16 = ((x & 0x80) << 8) | (((x & 0x7F) << 7) + 0x2000)
-    {
-        const uint32_t signs = (lo_pair & 0x00800080u) << 8;
-        const uint32_t em = ((lo_pair & 0x007F007Fu) << 7) + 0x20002000u;
-        out_lo = signs | em;  // [fp16(b1) : fp16(b0)]
-    }
-    {
-        const uint32_t signs = (hi_pair & 0x00800080u) << 8;
-        const uint32_t em = ((hi_pair & 0x007F007Fu) << 7) + 0x20002000u;
-        out_hi = signs | em;  // [fp16(b3) : fp16(b2)]
-    }
+    // For each 16-bit lane with byte x in [7:0]:
+    // fp16 = (x << 7) + ((x & 0x80) << 7) + 0x2000
+    // This form avoids explicit and_or masking and lowers to shift-add patterns.
+    out_lo = (lo_pair << 7) + ((lo_pair & 0x00800080u) << 7) + 0x20002000u;
+    out_hi = (hi_pair << 7) + ((hi_pair & 0x00800080u) << 7) + 0x20002000u;
 }
 
 // 16-row swizzle used by A LDS physical mapping.

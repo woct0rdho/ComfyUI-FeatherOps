@@ -169,6 +169,7 @@ def prepack_b_for_scaled_mm_hip(b: torch.Tensor, *, swizzle: bool = False) -> to
 
     kt = K // 16
     packed = b.view(torch.uint8).view(kt, 16, N).permute(0, 2, 1).contiguous()
+
     if not swizzle:
         return packed
 

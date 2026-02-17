@@ -6,7 +6,7 @@ from kernel.hip.hip_kernel import _load_hip_extension, _CONFIGS
 from kernel.naive import scaled_mm_naive
 
 
-def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=False):
+def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
     """Test a specific config and return (pass, error_msg)."""
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
 
@@ -70,7 +70,7 @@ def main():
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
 
-            passed, msg = test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=False)
+            passed, msg = test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True)
             if not passed:
                 config_passed = False
                 config_errors.append(f"  M={M} N={N} K={K}: {msg}")
