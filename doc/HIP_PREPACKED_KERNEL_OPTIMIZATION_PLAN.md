@@ -1,50 +1,99 @@
 # HIP Prepacked-B Kernel Optimization Plan (gfx1151)
 
-## Current State (2026-02-16)
+## Scope and KPI
 
+- Target kernel family: prepacked B (`uint8` fp8 bytes), gfx1151, winner track around `1,8,2,2,8,2`.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Best kept prepacked path:
-  - B prepack format is **fp8 bytes** (`uint8`), layout `[K/16, N, 16]`.
-  - Kernel default config family includes `1,8,2,2,8,2` and currently picks it for large square shapes.
-  - Default swizzle for prepacked path is **off**.
-- Latest default benchmark at `N=8192`:
-  - `torch_compiled`: 32,279 GFLOPS
-  - `hip`: 33,956 GFLOPS
-  - `hip_prepacked`: 36,698 GFLOPS
-- Large-N forced sweep (kernel-only, prepack excluded): prepacked `1,8,2,2,8,2` wins vs baseline hip `2,4,2,2,4,4` at 4096/6144/8192.
+- Primary KPI: benchmark GFLOPS (kernel runtime); profile kernel-time is diagnostic only.
+- Keep rule:
+  - correctness passes,
+  - forced `N=8192` does not regress,
+  - large-N sweep (`4096/6144/8192`) does not regress materially.
 
-## Performance Target Policy
+## Current Stable Baseline (2026-02-17)
 
-- Performance target is **benchmark GFLOPS** from `benchmark_scaled_mm_hip_prepacked.py` (prepack excluded).
-- Profiled kernel duration (`rocprofv3`) is for attribution only (instruction mix, bottleneck direction), not the final target metric.
+- Data path kept: prepacked B as fp8 bytes in `[K/16, N, 16]`.
+- Current production winner: `1,8,2,2,8,2` (no-swizzle).
+- Representative full benchmark (`benchmark_scaled_mm_hip_prepacked.py`):
+  - `N=8192`: `hip_prepacked ~40.5k`, `hip ~36.2k`, `torch_compiled ~32.4k` GFLOPS.
+- Forced thermal-anchor comparison (same process window):
+  - baseline hip `2,4,2,2,4,4`: ~`35.5k` GFLOPS,
+  - prepacked winner `1,8,2,2,8,2`: ~`40.3k` GFLOPS.
+- Thermal note: gains under ~2% are treated as noise unless repeated.
 
-## Stable Checkpoints
+## Current Bottleneck Model (Important)
 
-- `cfe1781` - fp8-byte prepack path kept as baseline.
-- `c8ae4df` - added winning `1,8,2,2,8,2` kernel config.
-- `b798f83` - defaulted prepacked path to `1,8` + no-swizzle flow in wrapper/scripts.
+From target-kernel-only profiling (`P11-B6a`, forced `1,8,2,2,8,2`, `N=8192`):
 
-## Key Findings (Keep These Reasonings)
+- Avg kernel time: `27.755 ms` (~`39.61 TFLOPS`).
+- Theoretical peak (59.4 TFLOPS) lower-bound time: `18.510 ms`.
+- Gap to peak-time bound: `+9.245 ms` (~`+49.9%`).
+- Bandwidth sanity:
+  - bytes floor (A fp16 + B fp8 + C fp16): `335.5 MB`,
+  - bandwidth floor @ 200 GB/s: `1.678 ms`,
+  - arithmetic intensity very high; this path is not DRAM-bandwidth-limited.
+- Instruction mix (target kernel):
+  - VALU ~58.2%, LDS ~13.6%, OTHER ~28.3% (`SQ_WAVE32_INSTS` basis).
 
-1. **Never prepack B to fp16 for this path**
-   - fp16 prepack doubled B traffic and caused major regression.
-   - fp8-byte transport is the core benefit of prepacked path.
+Interpretation:
 
-2. **Low LDS bank conflict alone is not sufficient**
-   - One rejected path had near-zero bank conflict but was still slower.
-   - Bottleneck can shift to VMEM/VALU/control overhead.
+- Dominant limiter is on-chip issue/scheduling pressure (decode/VALU + control/other), not DRAM.
+- LDS is non-trivial but no longer the primary limiter for the winner path.
 
-3. **Tile shape can reduce duplicated B conversion work**
-   - `1,8,2,2,8,2` reduced VALU pressure vs `2,4,2,2,4,4` prepacked path and won clearly.
+## Durable Findings
 
-4. **`kStages=4` overlap attempt was not viable here**
-   - Regressed hard; likely occupancy/resource tradeoff dominated.
+1. fp8-byte transport is mandatory; fp16-prepack paths were large regressions.
+2. `1,8,2,2,8,2` no-swizzle is the strongest robust winner at large N.
+3. Stage4 overlap direction is non-viable on this hardware/kernel family.
+4. Epilogue is a minor contributor (no-scale/no-bias gave only ~`+0.35%`).
+5. Conversion approximation slack is small (aggressive approximations fail gate).
+6. Removing `v_perm` alone does not guarantee speedup; replacement ops can cancel gains.
+7. Forced-config cache pitfall is real (`_get_forced_config` cache must be cleared in same-process A/B scripts).
+8. Benchmark wins are the decision metric; profile-time and counters are supporting evidence.
 
-5. **Swizzle is config-dependent**
-   - For the current `1,8` winner, no-swizzle is slightly faster and simpler.
+## Experiment Ledger (Condensed, keep/reject reasons)
 
-6. **Thermal drift is real; always co-measure baseline hip**
-   - Baseline hip can move by a few percent across runs.
+| ID | Keep? | Change | Result | Reason |
+|---|---|---|---|---|
+| P0/P1 | REJECT | fp16-prepack transport variants | ~24k class | bandwidth/traffic regression |
+| P3 | KEEP | fp8-byte prepack path | major recovery | restored transport efficiency |
+| P4a | REJECT | `kStages=4` overlap | strong regression | occupancy/resource loss |
+| P4b | KEEP | add `1,8,2,2,8,2` | major gain | better decode/work balance |
+| P6 | KEEP | no-swizzle for `1,8` | faster | swizzle not helping winner |
+| P8 | KEEP | bottleneck isolation (`hip 2x4`, prepacked `1x8`, prepacked `2x4`) | `1x8` wins | winner not memory-limited |
+| P9a | REJECT | tile `1,16,2,2,16,1` | regression | poorer efficiency |
+| P9b | KEEP | compile-time swizzle specialization | small gain | safe positive change |
+| P9c | REJECT | stage4 overlap retry | strong regression | repeated non-viable direction |
+| P10b | KEEP | signfold conversion + perm pair-build | ~40k class | best robust conversion path |
+| P10c | REJECT | exp-only conversion approx | fails all configs | too inaccurate |
+| P10d | REJECT | spread-multiply pair-build | fails all configs | not bit-exact (carry coupling) |
+| P11-A | KEEP | epilogue ablation + pmc + asm counts | epilogue ~0.35% | bottleneck remains decode/issue |
+| P11-B1 | REJECT | mask/shift pair-build replacement | `N=8192` ~38.6k | clear perf regression |
+| P11-B2a/B2b/B2c | REJECT | low-risk decode/WMMA scheduling tweaks | no robust gain | benchmark flat/down, profile worse |
+| P11-B3a | REJECT | compute-only `s_setprio` | strong regression | priority scope wrong |
+| P11-B3b/B3c | REJECT | asymmetric A/B-only priority | correctness fail | unstable correctness |
+| P11-B4 | REJECT | direct `uint4` conversion pack | correctness fail | swizzle-path breakage |
+| P11-B5 | REJECT | no-swizzle-only direct pack | no robust gain | profile worse |
+| P11-B6a | KEEP (analysis) | roofline/issue model | quantified peak gap | confirmed compute-side bottleneck |
+| P11-B6b | REJECT | prepack lane transform + mask/shift decode | no robust gain | `v_perm` removed but replaced by similar-cost ops |
+| P11-B6c | REJECT | load-phase fp8->fp16 conversion | large regression | moved decode to non-overlapped path + larger LDS payload |
+| P11-B6d | REJECT | remove load-phase `s_setprio` | no robust gain | slightly worse forced KPI |
+| P11-B6e | REJECT | lazy decode at `rm==0` | no robust gain | profile worse |
+| P11-B6f | REJECT | add config `1,8,1,2,8,2` | NaN correctness | exposed `kStages > kUnrollK` stage-write issue |
+| P11-B6g | REJECT | fix stage-write issue then re-test `1,8,1,2,8,2` | ~38.7k forced | finer chunking loses to control overhead |
+
+## Do-Not-Repeat (Unless New Preconditions)
+
+- fp16-prepack transport variants.
+- stage4 overlap variants in this kernel family.
+- exp-only conversion approximation.
+- non-bit-exact pair-build shortcuts.
+- pair-build swap to plain mask/shift replacing current `v_perm` path.
+- low-risk B2 scheduling variants already tested (B2a/B2b/B2c).
+- asymmetric priority scopes (`B`-only or `A`-only).
+- direct conversion-pack rewrites that break swizzle correctness.
+- `1,8,1,2,8,2` as a performance path (validated slower after bugfix).
+- re-running rejected items without a clear new precondition.
 
 ## Non-Negotiable Run Protocol
 
@@ -60,115 +109,31 @@
 6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
 7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless locked by unrecoverable error or the user explicitly interrupted.
 
-## Condensed Experiment Log
+## Next Plan (P12)
 
-| ID | Change | Keep? | N=8192 hip_prepacked | Key Evidence | Why / Decision |
-|---|---|---|---:|---|---|
-| P0 | Initial prepacked (`[K/16,N,16]` fp16) | REJECT | 24,396 | bank conflict 29.62, kernel ~45.2 us | Strong regression; bad LDS pattern + fp16 traffic |
-| P1 | Alternate LDS mapping (`[K/16,16,N]` fp16 path) | REJECT | 24,141 | bank conflict ~0.23 but still slow | Conflicts fixed but fp16 traffic still dominant |
-| P2a | Add selective `s_setprio` | KEEP | 25,526 | kernel ~44.8 us | Small but real gain |
-| P3 | Switch prepack to fp8 bytes (`uint8`) | KEEP | 32,398 | kernel ~34.2 us | Big recovery; confirmed fp8-byte transport is critical |
-| P4a | Try stages=4 overlap (`2,4,2,4,4,4`) | REJECT | 25,639 | large regression | Occupancy/resource tradeoff unfavorable |
-| P4b | Add tile `1,8,2,2,8,2` | KEEP | 37,188 (forced), 36,992 recheck | kernel ~30 us, VGPR 176, low bank conflict | Reduced duplicate B-decode work; major win |
-| P5 | Default prepacked selection includes `1,8` | KEEP | 37,007 (default run) | profile shows `1,8` dispatch | Default path now picks winning config |
-| P6 | Swizzle on/off study for `1,8` | KEEP (no-swizzle) | no-swizzle mean 37,288 vs swizzle mean 36,916 | bank conflict unchanged | Swizzle not helping this winner |
-| P7 | Large-N validation (4096/6144/8192) | KEEP | 33,483 / 36,609 / 36,763 | all > baseline hip | Win is not 8192-only |
-| P8 | Bottleneck isolation pass (3 kernels @8192) | KEEP | 37,283 (`1x8`) / 33,185 (`2x4`) | `1x8` vs `2x4`: VALU 0.55x, busy cycles 0.85x, similar L2 hit | Winner is not memory-limited; VALU/decode pressure is primary remaining limiter |
-| P9a | Candidate tile `1,16,2,2,16,1` | REJECT | 32,159 | large regression vs `1x8` | Too slow; reverted |
-| P9b | Compile-time swizzle specialization (`kUseSwizzle` template bool) | KEEP | 37,341 (`1x8`, forced) | correctness unchanged; benchmark slight gain | Small but positive; kept |
-| P9c | Re-try stage4 overlap on `1,8,2,4,8,2` | REJECT | 29,659 | strong regression | Reverted immediately; skipped profile after revert per protocol |
+Objective: quantify remaining overlap ceiling before any new invasive code change.
 
-## Thermal Tracking (Baseline Hip Proxy)
+### P12-A Overlap Decomposition (Target Kernel)
 
-Forced baseline config: `HIP_FORCE_CONFIG=2,4,2,2,4,4`.
+- Build controlled run modes for winner config (`1,8,2,2,8,2`):
+  - `full`
+  - `no_overlap`
+  - `comm_only`
+  - `comp_only`
+- Use `N=8192`, forced config, and collect:
+  - benchmark GFLOPS,
+  - profile kernel time,
+  - target-kernel PMCs (`SQ_*`, `LDSBankConflict`, `L2CacheHit`, `VALUInsts`).
+- Derived metrics:
+  - direct overlap gain = `T_no_overlap - T_full`
+  - decomposition gain = `T_comm_only + T_comp_only - T_full`
 
-| Point | Baseline hip GFLOPS (N=8192) |
-|---|---:|
-| P0 | 34,124 |
-| P1 | 34,250 |
-| P2a | 34,375 |
-| P3 | 34,371 |
-| P4a | 34,403 |
-| P4b | 34,402 |
-| P5 | 34,276 |
-| Recheck | 35,376 |
-| P6 | 35,052 |
-| P8 | 34,411 |
-| P9a | 34,078 |
-| P9b | 34,894 |
-| P9c | 35,162 |
+### P12-B Decision Gate
 
-Interpretation:
-- Baseline drift can reach a few percent.
-- Compare candidate and baseline in the same run window whenever possible.
+- If measured overlap headroom suggests >2% realistic upside, proceed to one high-impact schedule change.
+- If overlap headroom is small, stop schedule micro-tuning and pivot to new algorithmic direction (not another local reorder).
 
-## Do Not Repeat Without New Preconditions
+### P12-C Candidate (Only if Gate Passes)
 
-- fp16 prepack transport path (bandwidth regression).
-- stages=4 overlap path for this prepacked kernel family (both prior and re-try).
-- assuming low bank conflict automatically means higher GFLOPS.
-
-## P8 Isolation Summary (Completed)
-
-Controlled kernels at `N=8192`:
-- baseline hip `2,4,2,2,4,4`
-- prepacked winner `1,8,2,2,8,2`
-- prepacked reference `2,4,2,2,4,4`
-
-Benchmark GFLOPS:
-- hip `2x4`: **34,411**
-- prepacked `1x8`: **37,283**
-- prepacked `2x4`: **33,185**
-
-Key counters (target kernels, normalized to prepacked `1x8`):
-- prepacked `2x4` vs prepacked `1x8`:
-  - `SQ_INSTS_VALU`: **1.81x**
-  - `SQ_BUSY_CYCLES`: **1.18x**
-  - `SQ_WAVE_CYCLES`: **1.18x**
-  - `SQ_INSTS_LDS`: **0.71x**
-- baseline hip `2x4` vs prepacked `1x8`:
-  - `SQ_INSTS_LDS`: **3.70x**
-  - `SQ_INSTS_VALU`: **0.56x**
-  - `LDSBankConflict`: **22.8x** higher
-
-Inference:
-- Current winner (`1x8`) is primarily constrained by **VALU/decode work**, not by LDS conflicts or L2 behavior.
-- Reducing VALU conversion pressure is the highest-value direction.
-
-## New Plan: Isolate Bottleneck and Optimize Further
-
-### Objective
-
-Push prepacked `1,8,2,2,8,2` further by reducing VALU/decode pressure while preserving fp8-byte transport.
-
-### Targets
-
-- Primary: keep prepacked > baseline hip at `N={4096,6144,8192}`.
-- Stretch: raise forced `1x8` at `N=8192` from ~37.3k toward 38k+ GFLOPS.
-
-### P10 - Branch B Execution (VALU/Decode)
-
-1. **Conversion placement A/B test**
-   - Variant A (current): convert fp8->fp16 in compute stage.
-   - Variant B: convert during load/commit phase and store fp16 fragments in LDS for compute.
-   - Compare benchmark GFLOPS first; profile only if benchmark improves.
-
-2. **Conversion micro-op reduction**
-   - Optimize `fp8x4_to_half2x2` instruction sequence (avoid non-VOPD-friendly choices).
-   - Keep numerical behavior within existing accuracy gate.
-
-3. **Decode scheduling tweaks**
-   - Reorder decode and WMMA issue to improve overlap on independent units without `kStages=4`.
-   - Keep LDS footprint and occupancy unchanged.
-
-### P11 - Config-Robustness Sweep
-
-1. Add targeted script (`benchmark_scaled_mm_hip_configs.py`) for fixed-config comparisons.
-2. Benchmark prepacked candidates on square and rectangular large shapes.
-3. Keep default autotune set minimal: only configs that never regress badly.
-
-### Exit Criteria
-
-- Correctness remains green (`rel_l2 <= 0.01`, `max abs <= 1.0`).
-- Benchmark (not profile time) improves for forced `1x8` at `N=8192`.
-- No regression of default prepacked path on large-N sweep.
+- Single candidate only: decode/compute placement change predicted by P12-A data.
+- Maintain constraints: fp8-byte prepack, no stage4, same correctness gate.
