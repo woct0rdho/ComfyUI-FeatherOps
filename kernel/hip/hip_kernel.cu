@@ -1,20 +1,8 @@
-// rocWMMA requires __half conversions; torch defines HIP no-half macros.
-#ifdef __HIP_NO_HALF_OPERATORS__
-#undef __HIP_NO_HALF_OPERATORS__
-#endif
-#ifdef __HIP_NO_HALF_CONVERSIONS__
-#undef __HIP_NO_HALF_CONVERSIONS__
-#endif
-#ifdef __HIP_NO_HALF2_OPERATORS__
-#undef __HIP_NO_HALF2_OPERATORS__
-#endif
-
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-#include <rocwmma/rocwmma.hpp>
 
 namespace {
 
@@ -35,7 +23,7 @@ __device__ __forceinline__ void fp8x4_to_half2x2(
     // Pair bytes for sequential output: [b1:b0] and [b3:b2]
     // lo_pair has b0 in [7:0] and b1 in [23:16]
     // hi_pair has b2 in [7:0] and b3 in [23:16]
-    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);       // [0:b1:0:b0]
+    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);           // [0:b1:0:b0]
     const uint32_t hi_pair = ((p >> 16) & 0xFFu) | ((p >> 8) & 0xFF0000u); // [0:b3:0:b2]
 
     // Convert each pair simultaneously using 32-bit ops:

@@ -1,5 +1,5 @@
 import os
-from functools import lru_cache
+import functools
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +24,7 @@ def get_rocm_lib_dirs() -> list[str]:
     return [d for d in rocm_lib_dirs if os.path.isdir(d)]
 
 
-@lru_cache(maxsize=1)
+@functools.cache
 def _load_ck_extension():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     name = "scaled_mm_ck_ext"
