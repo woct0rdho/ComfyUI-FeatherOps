@@ -11,7 +11,7 @@ def test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=T
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
-    b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
+    b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e5m2)
 
     scale = torch.tensor(1.7, device=device, dtype=torch.float32) if with_scale else torch.empty(0, device=device, dtype=torch.float32)
     bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else torch.empty(0, device=device, dtype=torch.float16)
@@ -33,7 +33,7 @@ def test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=T
             stages,
             repeat_m,
             repeat_n,
-            0,  # b_dtype=0 for fp8e4m3fn
+            1,  # b_dtype=1 for fp8e5m2
         )
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
@@ -66,7 +66,7 @@ def main():
         (512, 512, 512),
     ]
 
-    print(f"Testing {len(_PREPACKED_CONFIGS)} configs across {len(test_sizes)} matrix sizes\n")
+    print(f"Testing fp8e5m2 prepacked HIP kernel ({len(_PREPACKED_CONFIGS)} configs across {len(test_sizes)} matrix sizes)\n")
     print("Config format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)")
     print("=" * 80)
 

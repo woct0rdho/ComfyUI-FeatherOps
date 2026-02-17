@@ -85,6 +85,7 @@ def _select_config_prepacked(
     has_scale: bool,
     has_bias: bool,
     b_is_swizzled: bool,
+    b_dtype: int,
     ext,
 ):
     forced = _get_forced_config()
@@ -99,6 +100,7 @@ def _select_config_prepacked(
         has_scale,
         has_bias,
         b_is_swizzled,
+        b_dtype,
     )
     cached = _PREPACKED_AUTOTUNE_CACHE.get(key)
     if cached is not None:
@@ -131,6 +133,7 @@ def _select_config_prepacked(
             stages,
             repeat_m,
             repeat_n,
+            b_dtype,
         )
 
     # Warm up all candidates once to compile/load kernels.
@@ -152,14 +155,17 @@ def _select_config_prepacked(
 
     _PREPACKED_AUTOTUNE_CACHE[key] = best_cfg
     wm, wn, uk, st, rm, rn = best_cfg
-    print(f"HIP prepacked autotune M={M} N={N} K={K} swizzled={int(b_is_swizzled)} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    dtype_str = "fp8e5m2" if b_dtype == 1 else "fp8e4m3"
+    print(
+        f"HIP prepacked autotune M={M} N={N} K={K} swizzled={int(b_is_swizzled)} dtype={dtype_str} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms"
+    )
     return best_cfg
 
 
 def prepack_b_for_scaled_mm_hip(b: torch.Tensor, *, swizzle: bool = False) -> torch.Tensor:
     assert b.is_cuda
     assert b.ndim == 2
-    assert b.dtype == torch.float8_e4m3fn
+    assert b.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
 
     K, N = b.shape
     if K % 16 != 0:
@@ -190,8 +196,13 @@ def scaled_mm_hip_prepacked(
     out_dtype: torch.dtype,
     *,
     b_is_swizzled: bool = False,
+    b_dtype: int = 0,
 ) -> torch.Tensor:
-    """Scaled matmul path using prepacked B layout [K/16, N, 16] as fp8 bytes."""
+    """Scaled matmul path using prepacked B layout [K/16, N, 16] as fp8 bytes.
+
+    Args:
+        b_dtype: 0 for fp8e4m3fn, 1 for fp8e5m2
+    """
     assert a.is_cuda
     assert b_prepacked.device == a.device
     assert a.ndim == 2
@@ -200,6 +211,7 @@ def scaled_mm_hip_prepacked(
     assert b_prepacked.dtype == torch.uint8
     assert out_dtype == torch.float16
     assert b_prepacked.shape[2] == 16
+    assert b_dtype in {0, 1}, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)"
 
     M, K = a.shape
     K_tiles, N, kfrag = b_prepacked.shape
@@ -233,6 +245,7 @@ def scaled_mm_hip_prepacked(
         has_scale,
         has_bias,
         b_is_swizzled,
+        b_dtype,
         ext,
     )
 
@@ -250,4 +263,5 @@ def scaled_mm_hip_prepacked(
         stages,
         repeat_m,
         repeat_n,
+        b_dtype,
     )
