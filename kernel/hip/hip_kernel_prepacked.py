@@ -1,6 +1,6 @@
 import os
 import time
-from functools import lru_cache
+import functools
 from pathlib import Path
 from typing import Optional
 
@@ -10,14 +10,7 @@ from torch.utils.cpp_extension import load, _import_module_from_library
 from .hip_kernel import _CONFIGS, _config_compatible, _get_forced_config, get_rocm_lib_dirs
 
 
-_PREPACKED_CONFIGS = (
-    (1, 8, 2, 2, 8, 2),
-    *_CONFIGS,
-)
-_PREPACKED_AUTOTUNE_CACHE = {}
-
-
-@lru_cache(maxsize=1)
+@functools.cache
 def _load_hip_prepacked_extension():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     name = "scaled_mm_hip_prepacked_ext"
@@ -38,10 +31,10 @@ def _load_hip_prepacked_extension():
         except ImportError:
             pass
 
-    rocwmma_root = os.path.expanduser("~/rocm-libraries/projects/rocwmma")
-    includes = [
-        os.path.join(rocwmma_root, "library", "include"),
-    ]
+    includes = []
+
+    # rocwmma_root = os.path.expanduser("~/rocm-libraries/projects/rocwmma")
+    # includes.append(os.path.join(rocwmma_root, "library", "include"))
 
     try:
         import _rocm_sdk_core
@@ -75,6 +68,13 @@ def _load_hip_prepacked_extension():
     )
     Path(ninja_log).touch(exist_ok=True)
     return module
+
+
+_PREPACKED_CONFIGS = (
+    (1, 8, 2, 2, 8, 2),
+    *_CONFIGS,
+)
+_PREPACKED_AUTOTUNE_CACHE = {}
 
 
 def _select_config_prepacked(
@@ -133,17 +133,19 @@ def _select_config_prepacked(
             repeat_n,
         )
 
+    # Warm up all candidates once to compile/load kernels.
     for cfg in candidates:
         for _ in range(warmup_iters):
             run(cfg)
     torch.cuda.synchronize()
 
+    # Time each candidate.
     for cfg in candidates:
         start = time.perf_counter()
         for _ in range(bench_iters):
             run(cfg)
         torch.cuda.synchronize()
-        ms = (time.perf_counter() - start) * 1000.0 / bench_iters
+        ms = (time.perf_counter() - start) * 1000 / bench_iters
         if best_ms is None or ms < best_ms:
             best_ms = ms
             best_cfg = cfg

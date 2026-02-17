@@ -1,6 +1,6 @@
 import os
 import time
-from functools import lru_cache
+import functools
 from pathlib import Path
 from typing import Optional
 
@@ -20,12 +20,12 @@ def get_rocm_lib_dirs() -> list[str]:
             mod = __import__(mod_name)
             mod_dir = os.path.dirname(mod.__file__)
             rocm_lib_dirs.append(os.path.join(mod_dir, "lib"))
-        except Exception:
+        except ImportError:
             continue
     return [d for d in rocm_lib_dirs if os.path.isdir(d)]
 
 
-@lru_cache(maxsize=1)
+@functools.cache
 def _load_hip_extension():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
     name = "scaled_mm_hip_ext"
@@ -46,10 +46,10 @@ def _load_hip_extension():
         except ImportError:
             pass
 
-    rocwmma_root = os.path.expanduser("~/rocm-libraries/projects/rocwmma")
-    includes = [
-        os.path.join(rocwmma_root, "library", "include"),
-    ]
+    includes = []
+
+    # rocwmma_root = os.path.expanduser("~/rocm-libraries/projects/rocwmma")
+    # includes.append(os.path.join(rocwmma_root, "library", "include"))
 
     try:
         import _rocm_sdk_core
@@ -106,7 +106,7 @@ def _config_compatible(cfg, M, N, K):
     return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
 
 
-@lru_cache(maxsize=1)
+@functools.cache
 def _get_forced_config():
     cfg = os.environ.get("HIP_FORCE_CONFIG")
     if not cfg:
@@ -142,7 +142,8 @@ def _select_config(
     if cached is not None:
         return cached
 
-    M, N, K = a.shape[0], b.shape[1], a.shape[1]
+    M, K = a.shape
+    N = b.shape[1]
     candidates = [c for c in _CONFIGS if _config_compatible(c, M, N, K)]
     if not candidates:
         raise RuntimeError(f"No compatible config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
@@ -181,14 +182,14 @@ def _select_config(
         for _ in range(bench_iters):
             run(cfg)
         torch.cuda.synchronize()
-        ms = (time.perf_counter() - start) * 1000.0 / bench_iters
+        ms = (time.perf_counter() - start) * 1000 / bench_iters
         if best_ms is None or ms < best_ms:
             best_ms = ms
             best_cfg = cfg
 
     _AUTOTUNE_CACHE[key] = best_cfg
     wm, wn, uk, st, rm, rn = best_cfg
-    print(f"HIP autotune M={a.shape[0]} N={b.shape[1]} K={a.shape[1]} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    print(f"HIP autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
@@ -199,7 +200,6 @@ def scaled_mm_hip(
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Scaled matmul using LDS layout kernel (optimized for gfx11 wave32)."""
     assert a.is_cuda
     assert b.device == a.device
     assert a.ndim == 2

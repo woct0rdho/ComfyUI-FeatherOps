@@ -1,14 +1,3 @@
-// rocWMMA requires __half conversions; torch defines HIP no-half macros.
-#ifdef __HIP_NO_HALF_OPERATORS__
-#undef __HIP_NO_HALF_OPERATORS__
-#endif
-#ifdef __HIP_NO_HALF_CONVERSIONS__
-#undef __HIP_NO_HALF_CONVERSIONS__
-#endif
-#ifdef __HIP_NO_HALF2_OPERATORS__
-#undef __HIP_NO_HALF2_OPERATORS__
-#endif
-
 #include <torch/extension.h>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -20,26 +9,39 @@ namespace {
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
+// gfx11 uses wave32 - hardcode for consistent host/device behavior
+// rocwmma::Constants::AMDGCN_WAVE_SIZE returns 64 during host compilation
 constexpr int kWaveSize = 32;
 
+// Packed fp8e4m3fn → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
+// Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
+// Ignores denormals (values with zero exponent map to small fp16 instead of zero).
 __device__ __forceinline__ void fp8x4_to_half2x2(
     const uint32_t p, uint32_t& out_lo, uint32_t& out_hi)
 {
-    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);
-    const uint32_t hi_pair = ((p >> 16) & 0xFFu) | ((p >> 8) & 0xFF0000u);
+    // p = [b3:b2:b1:b0], each byte is fp8e4m3fn
+    // Pair bytes for sequential output: [b1:b0] and [b3:b2]
+    // lo_pair has b0 in [7:0] and b1 in [23:16]
+    // hi_pair has b2 in [7:0] and b3 in [23:16]
+    const uint32_t lo_pair = (p & 0xFFu) | ((p & 0xFF00u) << 8);           // [0:b1:0:b0]
+    const uint32_t hi_pair = ((p >> 16) & 0xFFu) | ((p >> 8) & 0xFF0000u); // [0:b3:0:b2]
 
+    // Convert each pair simultaneously using 32-bit ops:
+    // For each byte x at [7:0] or [23:16]:
+    //   fp16 = ((x & 0x80) << 8) | (((x & 0x7F) << 7) + 0x2000)
     {
         const uint32_t signs = (lo_pair & 0x00800080u) << 8;
         const uint32_t em = ((lo_pair & 0x007F007Fu) << 7) + 0x20002000u;
-        out_lo = signs | em;
+        out_lo = signs | em;  // [fp16(b1) : fp16(b0)]
     }
     {
         const uint32_t signs = (hi_pair & 0x00800080u) << 8;
         const uint32_t em = ((hi_pair & 0x007F007Fu) << 7) + 0x20002000u;
-        out_hi = signs | em;
+        out_hi = signs | em;  // [fp16(b3) : fp16(b2)]
     }
 }
 
+// 16-row swizzle used by A LDS physical mapping.
 __device__ __forceinline__ constexpr int a_row_logical_to_phys_16(const int x)
 {
     return ((x & 7) << 1) | ((x >> 3) & 1);
@@ -49,6 +51,13 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
 {
     return ((x & 1) << 3) | ((x >> 1) & 7);
 }
+
+// =============================================================================
+// Optimized kernel with K0×M×K1 LDS layout and direct WMMA intrinsics
+// Contiguous fast path only: requires aligned, contiguous inputs with
+// dimensions divisible by tile sizes.
+// K1 = 8 enables vec8 LDS reads (like CK)
+// =============================================================================
 
 template <int kBlockWarpsM,
           int kBlockWarpsN,
@@ -76,15 +85,24 @@ __global__ void scaled_mm_kernel_prepacked_b(
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
-    static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16");
-    static_assert(kBlockN % 16 == 0, "kBlockN must be a multiple of 16");
+    static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16 (required by row swizzle)");
+    static_assert(kBlockN % 16 == 0, "kBlockN must be a multiple of 16 (required by vec16 load)");
 
+    // K0×M×K1 layout for A matrix (no extra LDS padding).
+    // Apply row permutation on A store to improve LDS local-read banking while
+    // keeping compact LDS footprint and 128-bit accesses.
+    // K1 = 8 for fp16: enables vec8 LDS reads (like CK)
     constexpr int kK1 = 8;
+    // K0 = kWmmaK / K1 = 16 / 8 = 2
     constexpr int kK0 = kWmmaK / kK1;
     constexpr int kAStrideK1 = kK1;
     constexpr int kShASize = kStages * kK0 * kBlockM * kAStrideK1;
 
+    // B uses K×N layout for efficient vec16 stores during loading
     constexpr int kBPad = 8;
+
+    // C-shuffle epilogue reuses sh_a memory. Each warp needs 16*24 halfs.
+    // Ensure sh_a is large enough for A layout and C-shuffle reuse.
     constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * (kWmmaN + kBPad);
     static_assert(kShASize >= kCShuffleSize,
         "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
@@ -98,11 +116,13 @@ __global__ void scaled_mm_kernel_prepacked_b(
     const int tid = static_cast<int>(threadIdx.x) + static_cast<int>(threadIdx.y) * static_cast<int>(blockDim.x);
     constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
 
+    // Flattened wave mapping with 1D thread blocks.
     const int wave_id = tid / kWaveSize;
     const int warp_m = wave_id % kBlockWarpsM;
     const int warp_n = wave_id / kBlockWarpsM;
     const int lane = tid % kWaveSize;
 
+    // Accumulator registers: 8 floats per WMMA tile in wave32 mode
     constexpr int kRepeatTiles = kRepeatM * kRepeatN;
     float acc[kRepeatTiles][8];
     #pragma unroll
@@ -113,7 +133,12 @@ __global__ void scaled_mm_kernel_prepacked_b(
         }
     }
 
+    // Loading A: K0×M×K1 layout with physical/inverse row mapping and
+    // wave-separated global-read ownership.
     constexpr int kAVecs = kK0 * kBlockM;
+    // Use wave-separated ownership only when per-thread vec count stays small (≤4).
+    // For large kBlockM (e.g. kRepeatM=8, kBlockM=256) WSGR causes too many VGPRs
+    // for the A prefetch buffer, hurting occupancy.
     constexpr bool kUseWsgrAStoreOwnership =
         (kAVecs / (kBlockWarpsM * kWaveSize)) <= 4;
     constexpr int kAOwnerWaves =
@@ -131,28 +156,34 @@ __global__ void scaled_mm_kernel_prepacked_b(
     };
 
     const auto load_a_lds_k0mk1 = [&](const int stage, const int64_t kk) -> void {
+        // WSGR ownership: only A-owner waves issue A global->LDS stores.
         if constexpr (kUseWsgrAStoreOwnership) {
             if (wave_id >= kAOwnerWaves) return;
         }
+
         const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
 
+        // Physical LDS space is traversed directly; global logical row is obtained by inverse map.
         #pragma unroll
         for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
             const int vec_idx = a_owner_tid + v * kAOwnerThreads;
             if (vec_idx >= kAVecs) continue;
 
+            // Decode vec_idx to [k0][m_phys].
             const int k0 = vec_idx / kBlockM;
             const int m_phys = vec_idx % kBlockM;
             const int m_logical = a_row_phys_to_logical(m_phys);
 
             const int64_t a_row = block_m + m_logical;
-            const int64_t a_k = kk + k0 * kK1;
+            const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
             half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
+
             const half* const a_ptr = a + a_row * stride_am + a_k;
             *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_ptr);
         }
     };
 
+    // Loading B: K×N layout with vec16 fp8→fp16 conversion
     constexpr int kBVecs = (kBlockN * kWmmaK) / 16;
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
 
@@ -181,22 +212,13 @@ __global__ void scaled_mm_kernel_prepacked_b(
         }
     };
 
+    // Pipeline setup
     constexpr int kChunkK = kWmmaK * kUnrollK;
     const int total_chunks = static_cast<int>(K / kChunkK);
-    int stage_base = 0;
 
-    #pragma unroll
-    for (int u = 0; u < kUnrollK; ++u) {
-        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
-        load_a_lds_k0mk1(u, k);
-    }
-    #pragma unroll
-    for (int u = 0; u < kUnrollK; ++u) {
-        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
-        load_b_lds_prepacked(u, k);
-    }
-    __syncthreads();
-
+    // WMMA compute lambda for one sub-iteration (one stage).
+    // Register-tiling: load all B fragments once, then iterate rm with A loads.
+    // Reduces LDS reads from (kRepeatM*kRepeatN)*(16+16) to kRepeatN*16 + kRepeatM*16.
     const auto wmma_compute_stage = [&](const int stage) -> void {
         if (wave_id >= kBlockWarpsM * kBlockWarpsN) return;
 
@@ -205,6 +227,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
 
         const int lane_in_subgroup = lane % 16;
 
+        // Pre-load all B fragments (one per rn tile)
         _Float16 all_reg_b[kRepeatN][16];
         #pragma unroll
         for (int rn = 0; rn < kRepeatN; ++rn) {
@@ -221,6 +244,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
             *reinterpret_cast<uint4*>(&all_reg_b[rn][8]) = *reinterpret_cast<const uint4*>(&h32[4]);
         }
 
+        // For each rm: load A once, compute all rn tiles with cached B
         #pragma unroll
         for (int rm = 0; rm < kRepeatM; ++rm) {
             const int tile_m = warp_m + rm * kBlockWarpsM;
@@ -243,13 +267,49 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 const int repeat_idx = rm * kRepeatN + rn;
                 const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(all_reg_b[rn]);
                 float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
+
                 c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
+
                 *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
             }
         }
     };
 
+    int stage_base = 0;
+
+    // Prologue: load first chunk into LDS using monolithic loads
+    #pragma unroll
+    for (int u = 0; u < kUnrollK; ++u) {
+        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
+        load_a_lds_k0mk1(u, k);
+    }
+    #pragma unroll
+    for (int u = 0; u < kUnrollK; ++u) {
+        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
+        load_b_lds_prepacked(u, k);
+    }
+    __syncthreads();
+
+    // =========================================================================
+    // Main loop with VMEM/WMMA overlap via split-phase loads + ASM fences.
+    //
+    // When kDoubleBuffer (kStages >= 2*kUnrollK):
+    //   Read stages [stage_base..+kUnrollK-1], write stages [stage_base+kUnrollK..+2*kUnrollK-1].
+    //   Disjoint stage sets → no read/write race → only 1 __syncthreads().
+    //
+    // Schedule per iteration:
+    //   1. prefetch_global(all u) for next chunk → VMEM (fire-and-forget)
+    //   2. ASM fence
+    //   3. WMMA compute(all u) on current stages → Matrix unit (CONCURRENT with VMEM)
+    //   4. s_waitcnt vmcnt(0)
+    //   5. commit_lds(all u) to next stages → VALU convert + ds_write
+    //   6. __syncthreads() + advance stage_base
+    //
+    // When !kDoubleBuffer (kStages == kUnrollK):
+    //   Fallback: serial compute-then-load with single __syncthreads().
+    // =========================================================================
     for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+        // Fallback: serial compute-then-load (original schedule, 1 sync)
         #pragma unroll
         for (int u = 0; u < kUnrollK; ++u) {
             const int stage = (stage_base + u) % kStages;
@@ -280,9 +340,13 @@ __global__ void scaled_mm_kernel_prepacked_b(
         __syncthreads();
     }
 
+    // Epilogue: C-Shuffle - write output with coalesced vec8 stores
+    // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
+        // Reuse sh_a memory for C-shuffle
+        // Each warp gets its own 16×24 buffer (24 = 16 + 8 padding for bank conflicts)
         constexpr int kCPad = 8;
-        constexpr int kCStride = kWmmaN + kCPad;
+        constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
         half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
 
         const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
@@ -299,6 +363,8 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 const int64_t tile_m_base = block_m + tile_m * kWmmaM;
                 const int64_t tile_n_base = block_n + tile_n * kWmmaN;
 
+                // Step 1: Write acc to LDS in column-major order (WMMA layout)
+                // Each thread writes 8 values to one column
                 const int col = lane_in_subgroup;
                 #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
@@ -309,13 +375,19 @@ __global__ void scaled_mm_kernel_prepacked_b(
                     sh_c[row_phys * kCStride + col] = val;
                 }
 
+                // Wave executes in lockstep (SIMT), so all writes complete before reads
+                // No explicit barrier needed within a wave
+
+                // Step 2: Read from LDS in row-major order for coalesced global write
+                // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
                 const int read_row = lane / 2;
                 const int read_row_phys = a_row_logical_to_phys_16(read_row);
-                const int col_half = lane % 2;
+                const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
                 const int read_col_base = col_half * 8;
 
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
+
                 half* const out_ptr = c + out_row * stride_cm + out_col;
                 half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
@@ -334,6 +406,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
 
 } // namespace
 
+// Config tag for kernel (no vec_a/vec_b params - always uses vec8 A, vec16 B)
 template <int M, int N, int U, int STAGES, int RM, int RN>
 struct ConfigTag {
     static constexpr int kBlockWarpsM = M;
@@ -375,6 +448,7 @@ torch::Tensor scaled_mm_prepacked(
     const int64_t N = b_prepacked.size(1);
     TORCH_CHECK(bias.scalar_type() == at::kHalf || !has_bias, "bias must be float16");
 
+    // Contiguous fast path requirements
     TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
     TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
 
@@ -461,6 +535,8 @@ torch::Tensor scaled_mm_prepacked(
         return false;
     };
 
+    // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
+    // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     const bool launched =
         try_launch(ConfigTag<1, 8, 2, 2, 8, 2>{}) ||
         try_launch(ConfigTag<2, 2, 2, 2, 4, 4>{}) ||
