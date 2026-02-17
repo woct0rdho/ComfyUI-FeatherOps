@@ -16,7 +16,7 @@ constexpr int kWaveSize = 32;
 // Packed fp8e4m3fn → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
 // Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
 // Ignores denormals (values with zero exponent map to small fp16 instead of zero).
-__device__ __forceinline__ void fp8x4_to_half2x2(
+__device__ __forceinline__ void fp8e4m3x4_to_half2x2(
     const uint32_t p, uint32_t& out_lo, uint32_t& out_hi)
 {
     // p = [b3:b2:b1:b0], each byte is fp8e4m3fn.
@@ -29,6 +29,19 @@ __device__ __forceinline__ void fp8x4_to_half2x2(
     // This form avoids explicit and_or masking and lowers to shift-add patterns.
     out_lo = (lo_pair << 7) + ((lo_pair & 0x00800080u) << 7) + 0x20002000u;
     out_hi = (hi_pair << 7) + ((hi_pair & 0x00800080u) << 7) + 0x20002000u;
+}
+
+// Packed fp8e5m2 → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
+// Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
+// fp8e5m2: [sign:1][exp:5][mantissa:2], fp16: [sign:1][exp:5][mantissa:10]
+// Exponent bias is 15 for both formats, so only mantissa needs zero-extension.
+__device__ __forceinline__ void fp8e5m2x4_to_half2x2(
+    const uint32_t p, uint32_t& out_lo, uint32_t& out_hi)
+{
+    // p = [b3:b2:b1:b0], each byte is fp8e5m2.
+    // Build byte pairs as [b1:0:b0:0] and [b3:0:b2:0] using V_PERM_B32.
+    out_lo = __builtin_amdgcn_perm(0u, p, 0x010c000cu);
+    out_hi = __builtin_amdgcn_perm(0u, p, 0x030c020cu);
 }
 
 // 16-row swizzle used by A LDS physical mapping.
@@ -55,7 +68,8 @@ template <int kBlockWarpsM,
           int kStages,
           int kRepeatM,
           int kRepeatN,
-          bool kUseSwizzle>
+          bool kUseSwizzle,
+          bool kUseFp8E5M2>
 __global__ void scaled_mm_kernel_prepacked_b(
     const half* const a,
     const uint8_t* const b_prepacked,
@@ -228,7 +242,11 @@ __global__ void scaled_mm_kernel_prepacked_b(
             uint32_t h32[8];
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                fp8x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
+                if constexpr (kUseFp8E5M2) {
+                    fp8e5m2x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
+                } else {
+                    fp8e4m3x4_to_half2x2(p32[j], h32[2 * j], h32[2 * j + 1]);
+                }
             }
             *reinterpret_cast<uint4*>(&all_reg_b[rn][0]) = *reinterpret_cast<const uint4*>(&h32[0]);
             *reinterpret_cast<uint4*>(&all_reg_b[rn][8]) = *reinterpret_cast<const uint4*>(&h32[4]);
@@ -420,7 +438,8 @@ torch::Tensor scaled_mm_prepacked(
     const int64_t unroll_k,
     const int64_t stages,
     const int64_t repeat_m,
-    const int64_t repeat_n)
+    const int64_t repeat_n,
+    const int64_t b_dtype)
 {
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
@@ -429,6 +448,7 @@ torch::Tensor scaled_mm_prepacked(
     TORCH_CHECK(a.dim() == 2, "a must be 2D");
     TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
     TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
+    TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
 
     const int64_t K = a.size(1);
     TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
@@ -493,22 +513,44 @@ torch::Tensor scaled_mm_prepacked(
             static_cast<uint32_t>(N) / kBlockN,
             static_cast<uint32_t>(a.size(0)) / kBlockM);
 
+        const bool use_fp8_e5m2 = (b_dtype == 1);
+
         if (use_swizzle) {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true>),
-                grid, block, 0, stream.stream(),
-                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), N, K,
-                a.stride(0), c.stride(0),
-                has_scale ? 1 : 0, has_bias ? 1 : 0);
+            if (use_fp8_e5m2) {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true, true>),
+                    grid, block, 0, stream.stream(),
+                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                    a.size(0), N, K,
+                    a.stride(0), c.stride(0),
+                    has_scale ? 1 : 0, has_bias ? 1 : 0);
+            } else {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true, false>),
+                    grid, block, 0, stream.stream(),
+                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                    a.size(0), N, K,
+                    a.stride(0), c.stride(0),
+                    has_scale ? 1 : 0, has_bias ? 1 : 0);
+            }
         } else {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false>),
-                grid, block, 0, stream.stream(),
-                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), N, K,
-                a.stride(0), c.stride(0),
-                has_scale ? 1 : 0, has_bias ? 1 : 0);
+            if (use_fp8_e5m2) {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, true>),
+                    grid, block, 0, stream.stream(),
+                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                    a.size(0), N, K,
+                    a.stride(0), c.stride(0),
+                    has_scale ? 1 : 0, has_bias ? 1 : 0);
+            } else {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, false>),
+                    grid, block, 0, stream.stream(),
+                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                    a.size(0), N, K,
+                    a.stride(0), c.stride(0),
+                    has_scale ? 1 : 0, has_bias ? 1 : 0);
+            }
         }
     };
 
@@ -558,5 +600,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("stages"),
         py::arg("repeat_m"),
         py::arg("repeat_n"),
-        "Scaled mixed-precision matmul (prepacked B fp8-bytes [K/16,N,16])");
+        py::arg("b_dtype"),
+        "Scaled mixed-precision matmul (prepacked B fp8-bytes [K/16,N,16]). b_dtype: 0=fp8e4m3, 1=fp8e5m2");
 }
