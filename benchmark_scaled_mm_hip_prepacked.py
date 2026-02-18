@@ -13,14 +13,10 @@ from kernel.naive import scaled_mm_naive
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
-def _run_hip_prepacked(a, b_prepacked, scale, bias, out_dtype):
-    return scaled_mm_hip_prepacked(a, b_prepacked, scale, bias, out_dtype, b_is_swizzled=False, b_dtype=0)
-
-
 providers = {
     "torch_compiled": scaled_mm_naive_compiled,
     "hip": scaled_mm_hip,
-    "hip_prepacked": _run_hip_prepacked,
+    "hip_prepacked": scaled_mm_hip_prepacked,
 }
 provider_names = list(providers)
 
@@ -51,11 +47,11 @@ def benchmark(N, provider):
 
     a = torch.randn((N, N), device=device, dtype=torch.float32).to(a_dtype)
     b = torch.randn((N, N), device=device, dtype=torch.float32).to(b_dtype)
-    scale = torch.tensor(2.34, device=device, dtype=torch.float32)
-    bias = torch.randn((N,), device=device, dtype=out_dtype)
+    scale = torch.tensor(2.34, device=device, dtype=out_dtype)
+    bias = torch.randn(N, device=device, dtype=out_dtype)
 
     # Prepacking is done once and excluded from do_bench
-    b_prepacked = prepack_b_for_scaled_mm_hip(b, swizzle=False)
+    b_prepacked = prepack_b_for_scaled_mm_hip(b)
 
     if provider in {"hip", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)

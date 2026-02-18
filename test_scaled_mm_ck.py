@@ -12,14 +12,8 @@ def run_case(M, N, K, device, out_dtype, with_scale, with_bias):
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(a_dtype)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(b_dtype)
-
-    scale = None
-    if with_scale:
-        scale = torch.tensor(1.7, device=device, dtype=torch.float32)
-
-    bias = None
-    if with_bias:
-        bias = torch.randn((N,), device=device, dtype=out_dtype)
+    scale = torch.tensor(2.34, device=device, dtype=out_dtype) if with_scale else None
+    bias = torch.randn(N, device=device, dtype=out_dtype) if with_bias else None
 
     out_ck = scaled_mm_ck(a, b, scale, bias, out_dtype)
     out_ref = scaled_mm_naive(a, b, scale, bias, out_dtype)

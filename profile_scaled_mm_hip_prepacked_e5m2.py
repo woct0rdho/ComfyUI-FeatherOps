@@ -24,7 +24,7 @@ def main():
 
     print(f"Allocating tensors (N={args.N})...")
     a = torch.randn((m, k), device=device, dtype=torch.float16)
-    b = torch.randn((k, n), device=device, dtype=torch.float16).to(torch.float8_e4m3fn)
+    b = torch.randn((k, n), device=device, dtype=torch.float16).to(torch.float8_e5m2)
     b_prepacked = prepack_b_for_scaled_mm_hip(b)
     scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.float16)
     bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.float16)

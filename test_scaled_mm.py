@@ -18,16 +18,12 @@ def main():
     b_dtype = torch.float8_e4m3fn
     out_dtype = torch.float16
 
-    a = torch.randn((M, K), device=device, dtype=torch.float32)
-    b = torch.randn((K, N), device=device, dtype=torch.float32)
-    scale = torch.tensor(2.34, device=device, dtype=torch.float32)
-    bias = torch.randn((N,), device=device, dtype=torch.float32)
-
-    a = a.to(a_dtype)
-    b = b.to(b_dtype)
+    a = torch.randn((M, K), device=device, dtype=torch.float32).to(a_dtype)
+    b = torch.randn((K, N), device=device, dtype=torch.float32).to(b_dtype)
+    scale = torch.tensor(2.34, device=device, dtype=out_dtype)
+    bias = torch.randn(N, device=device, dtype=out_dtype)
 
     out_triton = scaled_mm_triton(a, b, scale, bias, out_dtype)
-
     out_ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
 
     out_triton = out_triton.float()

@@ -102,7 +102,7 @@ Interpretation:
 2. Per-step order:
    - `python test_scaled_mm_hip_prepacked.py`
    - `python benchmark_scaled_mm_hip_prepacked.py`
-   - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip_prepacked.py -N 8192 --iters 20`
+   - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip_prepacked.py`
 3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 4. If a new baseline is kept, commit the kernel immediately.
 5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.

@@ -6,17 +6,16 @@ from kernel.hip.hip_kernel_prepacked import _PREPACKED_CONFIGS, _load_hip_prepac
 from kernel.naive import scaled_mm_naive
 
 
-def test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=True):
+def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
     """Test a specific config and return (pass, error_msg)."""
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
+    scale = torch.tensor(2.34, device=device, dtype=torch.float16)
+    bias = torch.randn(N, device=device, dtype=torch.float16)
 
-    scale = torch.tensor(1.7, device=device, dtype=torch.float32) if with_scale else torch.empty(0, device=device, dtype=torch.float32)
-    bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else torch.empty(0, device=device, dtype=torch.float16)
-
-    b_prepacked = prepack_b_for_scaled_mm_hip(b, swizzle=swizzle)
+    b_prepacked = prepack_b_for_scaled_mm_hip(b)
 
     try:
         out_hip = ext.scaled_mm_prepacked(
@@ -26,7 +25,6 @@ def test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=T
             bias,
             with_scale,
             with_bias,
-            swizzle,
             warps_m,
             warps_n,
             unroll_k,
@@ -87,11 +85,10 @@ def main():
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
 
-            for swizzle in (False, True):
-                passed, msg = test_config(ext, cfg, M, N, K, device, swizzle, with_scale=True, with_bias=True)
-                if not passed:
-                    config_passed = False
-                    config_errors.append(f"  M={M} N={N} K={K} swizzle={swizzle}: {msg}")
+            passed, msg = test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True)
+            if not passed:
+                config_passed = False
+                config_errors.append(f"  M={M} N={N} K={K}: {msg}")
 
         status = "PASS" if config_passed else "FAIL"
         print(f"[{status}] {cfg} BlockM={block_m} BlockN={block_n}")

@@ -12,9 +12,8 @@ def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
-
-    scale = torch.tensor(1.7, device=device, dtype=torch.float32) if with_scale else torch.empty(0, device=device, dtype=torch.float32)
-    bias = torch.randn((N,), device=device, dtype=torch.float16) if with_bias else torch.empty(0, device=device, dtype=torch.float16)
+    scale = torch.tensor(2.34, device=device, dtype=torch.float16)
+    bias = torch.randn(N, device=device, dtype=torch.float16)
 
     try:
         out_hip = ext.scaled_mm(a, b, scale, bias, with_scale, with_bias, warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
