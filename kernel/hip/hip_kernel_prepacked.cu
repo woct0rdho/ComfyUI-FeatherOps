@@ -84,7 +84,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     const int has_scale,
     const int has_bias)
 {
-    static_assert(kStages == 1 || kStages == 2 || kStages == 4, "kStages must be 1, 2, or 4");
+    static_assert(kStages == 2, "Only kStages=2 is supported");
     static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
 
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
@@ -283,8 +283,6 @@ __global__ void scaled_mm_kernel_prepacked_b(
         }
     };
 
-    int stage_base = 0;
-
     // Prologue: load first chunk into LDS using monolithic loads
     #pragma unroll
     for (int u = 0; u < kUnrollK; ++u) {
@@ -299,28 +297,12 @@ __global__ void scaled_mm_kernel_prepacked_b(
     __syncthreads();
 
     // =========================================================================
-    // Main loop with VMEM/WMMA overlap via split-phase loads + ASM fences.
-    //
-    // When kDoubleBuffer (kStages >= 2*kUnrollK):
-    //   Read stages [stage_base..+kUnrollK-1], write stages [stage_base+kUnrollK..+2*kUnrollK-1].
-    //   Disjoint stage sets → no read/write race → only 1 __syncthreads().
-    //
-    // Schedule per iteration:
-    //   1. prefetch_global(all u) for next chunk → VMEM (fire-and-forget)
-    //   2. ASM fence
-    //   3. WMMA compute(all u) on current stages → Matrix unit (CONCURRENT with VMEM)
-    //   4. s_waitcnt vmcnt(0)
-    //   5. commit_lds(all u) to next stages → VALU convert + ds_write
-    //   6. __syncthreads() + advance stage_base
-    //
-    // When !kDoubleBuffer (kStages == kUnrollK):
-    //   Fallback: serial compute-then-load with single __syncthreads().
+    // Main loop: fixed stage2 schedule (compute current chunk, then refill next chunk).
     // =========================================================================
     for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
-        // Fallback: serial compute-then-load (original schedule, 1 sync)
         #pragma unroll
         for (int u = 0; u < kUnrollK; ++u) {
-            const int stage = (stage_base + u) % kStages;
+            const int stage = u;
             wmma_compute_stage(stage);
         }
 
@@ -329,21 +311,17 @@ __global__ void scaled_mm_kernel_prepacked_b(
             asm volatile("s_setprio 1" ::: "memory");
             #pragma unroll
             for (int u = 0; u < kUnrollK; ++u) {
-                const int stage = (stage_base + u) % kStages;
+                const int stage = u;
                 const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                 load_a_lds_k0mk1(stage, k);
             }
             #pragma unroll
             for (int u = 0; u < kUnrollK; ++u) {
-                const int stage = (stage_base + u) % kStages;
+                const int stage = u;
                 const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
                 load_b_lds_prepacked(stage, k);
             }
             asm volatile("s_setprio 0" ::: "memory");
-        }
-
-        if constexpr (kStages != kUnrollK) {
-            stage_base = (stage_base + kUnrollK) % kStages;
         }
         __syncthreads();
     }
@@ -432,7 +410,6 @@ torch::Tensor scaled_mm_prepacked(
     const torch::Tensor& bias,
     const bool has_scale,
     const bool has_bias,
-    const bool use_swizzle,
     const int64_t block_warps_m,
     const int64_t block_warps_n,
     const int64_t unroll_k,
@@ -444,11 +421,11 @@ torch::Tensor scaled_mm_prepacked(
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
     TORCH_CHECK(a.scalar_type() == at::kHalf, "a must be float16");
-    TORCH_CHECK(b_prepacked.scalar_type() == at::kByte, "b_prepacked must be uint8 (fp8 raw bytes)");
     TORCH_CHECK(a.dim() == 2, "a must be 2D");
     TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
     TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
     TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
+    TORCH_CHECK(stages == 2, "Only stages=2 is supported");
 
     const int64_t K = a.size(1);
     TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
@@ -476,7 +453,7 @@ torch::Tensor scaled_mm_prepacked(
     auto c = torch::empty({a.size(0), N}, a.options().dtype(at::kHalf));
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
-    const uint8_t* const b_ptr = b_prepacked.data_ptr<uint8_t>();
+    const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.data_ptr());
     auto stream = at::cuda::getCurrentCUDAStream();
     const float* const scale_ptr = has_scale ? scale.data_ptr<float>() : nullptr;
     const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
@@ -515,42 +492,22 @@ torch::Tensor scaled_mm_prepacked(
 
         const bool use_fp8_e5m2 = (b_dtype == 1);
 
-        if (use_swizzle) {
-            if (use_fp8_e5m2) {
-                hipLaunchKernelGGL(
-                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true, true>),
-                    grid, block, 0, stream.stream(),
-                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                    a.size(0), N, K,
-                    a.stride(0), c.stride(0),
-                    has_scale ? 1 : 0, has_bias ? 1 : 0);
-            } else {
-                hipLaunchKernelGGL(
-                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true, false>),
-                    grid, block, 0, stream.stream(),
-                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                    a.size(0), N, K,
-                    a.stride(0), c.stride(0),
-                    has_scale ? 1 : 0, has_bias ? 1 : 0);
-            }
+        if (use_fp8_e5m2) {
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, true>),
+                grid, block, 0, stream.stream(),
+                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                a.size(0), N, K,
+                a.stride(0), c.stride(0),
+                has_scale ? 1 : 0, has_bias ? 1 : 0);
         } else {
-            if (use_fp8_e5m2) {
-                hipLaunchKernelGGL(
-                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, true>),
-                    grid, block, 0, stream.stream(),
-                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                    a.size(0), N, K,
-                    a.stride(0), c.stride(0),
-                    has_scale ? 1 : 0, has_bias ? 1 : 0);
-            } else {
-                hipLaunchKernelGGL(
-                    (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, false>),
-                    grid, block, 0, stream.stream(),
-                    a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                    a.size(0), N, K,
-                    a.stride(0), c.stride(0),
-                    has_scale ? 1 : 0, has_bias ? 1 : 0);
-            }
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, false>),
+                grid, block, 0, stream.stream(),
+                a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+                a.size(0), N, K,
+                a.stride(0), c.stride(0),
+                has_scale ? 1 : 0, has_bias ? 1 : 0);
         }
     };
 
@@ -593,7 +550,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("bias"),
         py::arg("has_scale"),
         py::arg("has_bias"),
-        py::arg("use_swizzle"),
         py::arg("block_warps_m"),
         py::arg("block_warps_n"),
         py::arg("unroll_k"),
@@ -601,5 +557,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("repeat_m"),
         py::arg("repeat_n"),
         py::arg("b_dtype"),
-        "Scaled mixed-precision matmul (prepacked B fp8-bytes [K/16,N,16]). b_dtype: 0=fp8e4m3, 1=fp8e5m2");
+        "Scaled mixed-precision matmul (prepacked B fp8-bytes [K/16,N,16]).");
 }

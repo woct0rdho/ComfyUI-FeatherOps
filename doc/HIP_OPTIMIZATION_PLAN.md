@@ -240,7 +240,7 @@ Insight #8 shows the kernel's LDS/VALU/WMMA scheduling is tightly coupled — re
 2. Per-step order:
    - `python test_scaled_mm_hip.py`
    - `python benchmark_scaled_mm_hip.py`
-   - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip.py -N 8192 --iters 20`
+   - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip.py`
 3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 4. If a new baseline is kept, commit the kernel immediately.
 5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
@@ -254,9 +254,7 @@ rocprofv3 on gfx1151: max ~6 PMC counters per run (more causes crash). Use two r
 - Run 2: `SQ_INSTS_FLAT SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_TEX_STORE SQ_INSTS_WAVE32_VALU SQ_WAVE32_INSTS`
 
 ```bash
-rocprofv3 --pmc <COUNTER1> <COUNTER2> ... \
-  -- python -u profile_scaled_mm_hip.py -N 8192 --iters 20
-
+rocprofv3 --pmc <COUNTER1> <COUNTER2> ... -- python -u profile_scaled_mm_hip.py
 # Results in x2/<pid>_results.db
 sqlite3 x2/<pid>_results.db "
 SELECT ipm.name, AVG(p.value) as avg_val

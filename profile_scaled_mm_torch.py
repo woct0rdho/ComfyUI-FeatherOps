@@ -10,6 +10,7 @@ scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynami
 
 
 def main():
+    # Disable compile workers because they can keep profilers alive.
     torch._inductor.config.compile_threads = 1
 
     parser = argparse.ArgumentParser()
@@ -22,19 +23,19 @@ def main():
     m = n = k = args.N
 
     print(f"Allocating tensors (N={args.N})...")
-    a = torch.randn(m, k, device=device, dtype=torch.float16)
-    b = torch.randn(k, n, device=device, dtype=torch.float16).to(torch.float8_e4m3fn)
-    scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+    a = torch.randn((m, k), device=device, dtype=torch.float16)
+    b = torch.randn((k, n), device=device, dtype=torch.float16).to(torch.float8_e4m3fn)
+    scale = torch.tensor(2.34, device=device, dtype=torch.float16)
     bias = torch.randn(n, device=device, dtype=torch.float16)
 
-    print("Warming up (compilation)...")
+    print("Warming up...")
     for _ in range(3):
-        _ = scaled_mm_naive_compiled(a, b, scale, bias, torch.float16)
+        _ = scaled_mm_naive_compiled(a, b, scale, bias, out_dtype=torch.float16)
     torch.cuda.synchronize()
 
     print(f"Profiling {args.iters} iterations...")
     for i in range(args.iters):
-        _ = scaled_mm_naive_compiled(a, b, scale, bias, torch.float16)
+        _ = scaled_mm_naive_compiled(a, b, scale, bias, out_dtype=torch.float16)
     torch.cuda.synchronize()
     print("Done")
 

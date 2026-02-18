@@ -70,9 +70,13 @@ def _load_hip_prepacked_extension():
     return module
 
 
-_PREPACKED_CONFIGS = (
-    (1, 8, 2, 2, 8, 2),
-    *_CONFIGS,
+_PREPACKED_CONFIGS = tuple(
+    cfg
+    for cfg in (
+        (1, 8, 2, 2, 8, 2),
+        *_CONFIGS,
+    )
+    if cfg[3] == 2
 )
 _PREPACKED_AUTOTUNE_CACHE = {}
 
@@ -84,7 +88,6 @@ def _select_config_prepacked(
     bias: torch.Tensor,
     has_scale: bool,
     has_bias: bool,
-    b_is_swizzled: bool,
     b_dtype: int,
     ext,
 ):
@@ -99,7 +102,6 @@ def _select_config_prepacked(
         tuple(b_prepacked.stride()),
         has_scale,
         has_bias,
-        b_is_swizzled,
         b_dtype,
     )
     cached = _PREPACKED_AUTOTUNE_CACHE.get(key)
@@ -126,7 +128,6 @@ def _select_config_prepacked(
             bias,
             has_scale,
             has_bias,
-            b_is_swizzled,
             warps_m,
             warps_n,
             unroll_k,
@@ -156,13 +157,11 @@ def _select_config_prepacked(
     _PREPACKED_AUTOTUNE_CACHE[key] = best_cfg
     wm, wn, uk, st, rm, rn = best_cfg
     dtype_str = "fp8e5m2" if b_dtype == 1 else "fp8e4m3"
-    print(
-        f"HIP prepacked autotune M={M} N={N} K={K} swizzled={int(b_is_swizzled)} dtype={dtype_str} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms"
-    )
+    print(f"HIP prepacked autotune M={M} N={N} K={K} dtype={dtype_str} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
-def prepack_b_for_scaled_mm_hip(b: torch.Tensor, *, swizzle: bool = False) -> torch.Tensor:
+def prepack_b_for_scaled_mm_hip(b: torch.Tensor) -> torch.Tensor:
     assert b.is_cuda
     assert b.ndim == 2
     assert b.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
@@ -174,18 +173,8 @@ def prepack_b_for_scaled_mm_hip(b: torch.Tensor, *, swizzle: bool = False) -> to
         raise RuntimeError(f"N must be divisible by 16 for prepack layout, got N={N}")
 
     kt = K // 16
-    packed = b.view(torch.uint8).view(kt, 16, N).permute(0, 2, 1).contiguous()
-
-    if not swizzle:
-        return packed
-
-    groups = N // 16
-    packed_g = packed.view(kt, groups, 16, 16)
-    group_ids = torch.arange(groups, device=b.device, dtype=torch.int64).view(1, groups)
-    shifts = (torch.arange(kt, device=b.device, dtype=torch.int64) & 7).view(kt, 1)
-    swizzled_group_ids = group_ids ^ shifts
-    gather_idx = swizzled_group_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 16, 16)
-    return packed_g.gather(1, gather_idx).reshape(kt, N, 16).contiguous()
+    packed = b.view(kt, 16, N).permute(0, 2, 1).contiguous()
+    return packed
 
 
 def scaled_mm_hip_prepacked(
@@ -194,24 +183,23 @@ def scaled_mm_hip_prepacked(
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
-    *,
-    b_is_swizzled: bool = False,
-    b_dtype: int = 0,
 ) -> torch.Tensor:
-    """Scaled matmul path using prepacked B layout [K/16, N, 16] as fp8 bytes.
-
-    Args:
-        b_dtype: 0 for fp8e4m3fn, 1 for fp8e5m2
-    """
+    """Scaled matmul path using prepacked B layout [K/16, N, 16] with dtype fp8."""
     assert a.is_cuda
     assert b_prepacked.device == a.device
     assert a.ndim == 2
     assert b_prepacked.ndim == 3
     assert a.dtype == torch.float16
-    assert b_prepacked.dtype == torch.uint8
+    assert b_prepacked.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
     assert out_dtype == torch.float16
     assert b_prepacked.shape[2] == 16
-    assert b_dtype in {0, 1}, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)"
+
+    if b_prepacked.dtype == torch.float8_e4m3fn:
+        b_dtype = 0
+    elif b_prepacked.dtype == torch.float8_e5m2:
+        b_dtype = 1
+    else:
+        raise RuntimeError(f"Unsupported b_prepacked.dtype {b_prepacked.dtype} ")
 
     M, K = a.shape
     K_tiles, N, kfrag = b_prepacked.shape
@@ -244,7 +232,6 @@ def scaled_mm_hip_prepacked(
         bias_tensor,
         has_scale,
         has_bias,
-        b_is_swizzled,
         b_dtype,
         ext,
     )
@@ -256,7 +243,6 @@ def scaled_mm_hip_prepacked(
         bias_tensor,
         has_scale,
         has_bias,
-        b_is_swizzled,
         warps_m,
         warps_n,
         unroll_k,

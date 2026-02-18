@@ -5,6 +5,12 @@
 - Understand why Triton codegen is slower on gfx1151.
 - Define a concrete plan to improve Triton-generated code quality.
 
+## Reference Source Code and ISA
+- `~/triton`
+- `~/amd-llvm-project`
+- `doc/rdna35_instruction_set_architecture.md`
+- `doc/amdgpu_isa_rdna3_5.xml`
+
 ## Fixed-Config Baseline (Autotune Off)
 Comparison mapping used:
 - HIP config: `2,4,2,2,4,4`
@@ -118,6 +124,18 @@ Conclusion:
    Triton VGPR is higher (224 vs 192), reducing scheduling headroom.
 5. Missing schedule-level specialization on gfx1151:
    Useful backend transforms are either disabled by default or not stable for this kernel/arch.
+
+## Non-Negotiable Run Protocol
+1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+2. Per-step order:
+   - `python test_scaled_mm.py`
+   - `python benchmark_scaled_mm.py`
+   - If it regresses, explain the reason by inspecting the generated code and profiling.
+3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+4. If a new baseline is kept, commit the kernel immediately.
+5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless locked by unrecoverable error or the user explicitly interrupted.
 
 ## Easy-First Parity Plan (Kernel + Compiler)
 ### P0: Measurement Guardrails (do once, keep fixed)

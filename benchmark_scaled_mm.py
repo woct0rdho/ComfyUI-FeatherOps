@@ -43,13 +43,10 @@ def benchmark(N, provider):
     b_dtype = torch.float8_e4m3fn
     out_dtype = torch.float16
 
-    a = torch.randn((N, N), device=device, dtype=torch.float32)
-    b = torch.randn((N, N), device=device, dtype=torch.float32)
-    scale = torch.tensor(2.34, device=device, dtype=torch.float32)
-    bias = torch.randn((N,), device=device, dtype=torch.float32)
-
-    a = a.to(a_dtype)
-    b = b.to(b_dtype)
+    a = torch.randn((N, N), device=device, dtype=torch.float32).to(a_dtype)
+    b = torch.randn((N, N), device=device, dtype=torch.float32).to(b_dtype)
+    scale = torch.tensor(2.34, device=device, dtype=out_dtype)
+    bias = torch.randn(N, device=device, dtype=out_dtype)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(lambda: providers[provider](a, b, scale, bias, out_dtype), warmup=100, rep=1000, quantiles=quantiles)
