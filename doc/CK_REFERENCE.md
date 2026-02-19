@@ -1,4 +1,4 @@
-# CK Reference (This Repo)
+# CK Reference
 
 This file is the CK-specific reference for `kernel/ck/ck_kernel.cu` and related CK source.
 

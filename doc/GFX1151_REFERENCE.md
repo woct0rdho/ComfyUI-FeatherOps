@@ -1,7 +1,6 @@
-# GFX1151 Reference (Non-CK)
+# GFX1151 Reference
 
 This file keeps hardware/profiling/runtime facts for this machine.
-CK-specific notes are in `CK_REFERENCE.md`.
 
 ## Hardware Snapshot
 

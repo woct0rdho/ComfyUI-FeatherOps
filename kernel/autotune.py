@@ -113,6 +113,13 @@ def _common_prune_criteria(smem_criteria: Callable, config: triton.Config, kwarg
     M = kwargs["M"]
     N = kwargs["N"]
     K = kwargs["K"]
+    if M % BLOCK_SIZE_M != 0:
+        return True
+    if N % BLOCK_SIZE_N != 0:
+        return True
+    if K % BLOCK_SIZE_K != 0:
+        return True
+
     max_block_size_M = max(M, DEFAULT_BLOCK_SIZES_M[0])
     max_block_size_N = max(N, DEFAULT_BLOCK_SIZES_N[0])
     max_block_size_K = max(K, DEFAULT_BLOCK_SIZES_K[0])

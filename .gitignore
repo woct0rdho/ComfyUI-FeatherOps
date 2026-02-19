@@ -208,4 +208,7 @@ __marimo__/
 *.html
 *.png
 /.rocprof*/
+/profile*/
 /rocprof*/
+/tmp*/
+/triton*/
