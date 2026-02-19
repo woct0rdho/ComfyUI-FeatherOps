@@ -23,7 +23,7 @@ provider_names = list(providers)
     [
         triton.testing.Benchmark(
             x_names=["N"],
-            x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
+            x_vals=[256, 512, 1024, 2048, 4096, 8192],
             line_arg="provider",
             line_vals=provider_names,
             line_names=provider_names,

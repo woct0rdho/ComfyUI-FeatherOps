@@ -10,9 +10,9 @@ from kernel.naive import scaled_mm_naive
 
 
 def main():
-    M = 128
-    N = 128
-    K = 128
+    M = 256
+    N = 256
+    K = 256
     device = "cuda"
     a_dtype = torch.float16
     b_dtype = torch.float8_e4m3fn

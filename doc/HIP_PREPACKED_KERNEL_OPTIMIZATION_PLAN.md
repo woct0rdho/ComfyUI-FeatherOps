@@ -107,7 +107,7 @@ Interpretation:
 4. If a new baseline is kept, commit the kernel immediately.
 5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
 6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless locked by unrecoverable error or the user explicitly interrupted.
+7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
 ## Next Plan (P12)
 

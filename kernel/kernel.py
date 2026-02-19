@@ -20,15 +20,6 @@ def fp8e4m3fn_to_fp16(x):
     bits = tl.where((x_u16 & 0x78) == 0, sign, bits)
     return bits.to(tl.float16, bitcast=True)
 
-
-@triton.jit
-def cast_dtype(x, dtype: tl.constexpr):
-    if x.dtype == tl.float8e4nv and dtype == tl.float16:
-        return fp8e4m3fn_to_fp16(x)
-    else:
-        return x.to(dtype)
-
-
 @triton.autotune(
     configs=get_autotune_configs(),
     key=["M", "N", "K"],
@@ -36,7 +27,7 @@ def cast_dtype(x, dtype: tl.constexpr):
     cache_results=True,
 )
 @triton.jit
-def _scaled_mm_kernel(
+def _scaled_mm_kernel_interior(
     # Pointers
     a_ptr,
     b_ptr,
@@ -62,16 +53,18 @@ def _scaled_mm_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ) -> None:
-    mm_dtype = tl.float16
-
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = M // BLOCK_SIZE_M
+    num_pid_n = N // BLOCK_SIZE_N
+    num_pid = num_pid_m * num_pid_n
+
+    if pid >= num_pid:
+        return
 
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
@@ -84,22 +77,32 @@ def _scaled_mm_kernel(
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
-        mask_k = offs_k < K - k * BLOCK_SIZE_K
-        a = tl.load(a_ptrs, mask=mask_k[None, :])
-        b = tl.load(b_ptrs, mask=mask_k[:, None])
-        a = cast_dtype(a, mm_dtype)
-        b = cast_dtype(b, mm_dtype)
-        acc = tl.dot(a, b, acc)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+    if K % BLOCK_SIZE_K == 0:
+        for _ in range(0, K // BLOCK_SIZE_K):
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            b = fp8e4m3fn_to_fp16(b)
+            acc = tl.dot(a, b, acc)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+    else:
+        for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
+            mask_k = offs_k < K - k * BLOCK_SIZE_K
+            a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+            b = fp8e4m3fn_to_fp16(b)
+            acc = tl.dot(a, b, acc)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
     acc = acc.to(c_ptr.dtype.element_ty)
 
@@ -108,15 +111,13 @@ def _scaled_mm_kernel(
         acc *= scale
 
     if HAS_BIAS:
-        bias_ptrs = bias_ptr + offs_bn
-        bias = tl.load(bias_ptrs, mask=offs_bn < N).to(acc.dtype)
+        bias = tl.load(bias_ptr + offs_bn).to(acc.dtype)
         acc += bias[None, :]
 
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, acc, mask=c_mask)
+    tl.store(c_ptrs, acc)
 
 
 def scaled_mm_triton(
@@ -130,6 +131,10 @@ def scaled_mm_triton(
     assert b.device == a.device
     assert a.ndim == 2
     assert b.ndim == 2
+    assert a.is_contiguous()
+    assert b.is_contiguous()
+    assert a.stride(1) == 1
+    assert b.stride(1) == 1
     assert a.shape[1] == b.shape[0]
     if scale is not None:
         assert scale.device == a.device
@@ -141,10 +146,24 @@ def scaled_mm_triton(
 
     M, K = a.shape
     _, N = b.shape
+    assert (M % 16) == 0
+    assert (N % 16) == 0
+    assert (K % 16) == 0
+
+    has_compatible_config = False
+    for config in get_autotune_configs():
+        block_size_m = config.kwargs["BLOCK_SIZE_M"]
+        block_size_n = config.kwargs["BLOCK_SIZE_N"]
+        block_size_k = config.kwargs["BLOCK_SIZE_K"]
+        if M % block_size_m == 0 and N % block_size_n == 0 and K % block_size_k == 0:
+            has_compatible_config = True
+            break
+    assert has_compatible_config, "No compatible Triton config: require M/N/K divisible by selected BLOCK sizes"
+
     c = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
-    _scaled_mm_kernel[grid](
+    grid = lambda META: ((M // META["BLOCK_SIZE_M"]) * (N // META["BLOCK_SIZE_N"]),)
+    _scaled_mm_kernel_interior[grid](
         # Pointers
         a,
         b,
