@@ -20,6 +20,7 @@ def fp8e4m3fn_to_fp16(x):
     bits = tl.where((x_u16 & 0x78) == 0, sign, bits)
     return bits.to(tl.float16, bitcast=True)
 
+
 @triton.autotune(
     configs=get_autotune_configs(),
     key=["M", "N", "K"],

@@ -207,7 +207,7 @@ void gemm_impl_wmma_noswap(CUDABLAS_GEMM_ARGTYPES(Dtype))
 
 __global__ void scale_bias_kernel(
     half* c,
-    const float* scale,
+    const half* scale,
     const half* bias,
     int64_t M,
     int64_t N,
@@ -223,7 +223,7 @@ __global__ void scale_bias_kernel(
         const int64_t n = idx - m * N;
         half val = c[m * stride_cm + n * stride_cn];
         if (has_scale) {
-            val = __hmul(val, __float2half_rn(scale[0]));
+            val = __hmul(val, scale[0]);
         }
         if (has_bias) {
             val = __hadd(val, bias[n]);
@@ -250,7 +250,7 @@ torch::Tensor scaled_mm_ck(
     if (has_scale) {
         TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor");
         TORCH_CHECK(scale.numel() == 1, "scale must have one element");
-        TORCH_CHECK(scale.scalar_type() == at::kFloat, "scale must be float32");
+        TORCH_CHECK(scale.scalar_type() == at::kHalf, "scale must be float16");
     }
     if (has_bias) {
         TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
@@ -366,7 +366,7 @@ torch::Tensor scaled_mm_ck(
             0,
             stream.stream(),
             reinterpret_cast<half*>(c_ptr),
-            has_scale ? scale.data_ptr<float>() : nullptr,
+            has_scale ? reinterpret_cast<const half*>(scale.data_ptr<at::Half>()) : nullptr,
             has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr,
             a.size(0),
             b.size(1),

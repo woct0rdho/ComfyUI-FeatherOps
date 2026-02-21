@@ -210,21 +210,21 @@ def scaled_mm_hip(
     assert out_dtype == torch.float16
 
     if scale is None:
-        scale_tensor = torch.empty(0, device=a.device, dtype=torch.float32)
+        scale = torch.empty(0, device=a.device, dtype=out_dtype)
         has_scale = False
     else:
         assert scale.device == a.device
         assert scale.numel() == 1
-        scale_tensor = scale.to(dtype=torch.float32)
+        scale = scale.to(out_dtype)
         has_scale = True
 
     if bias is None:
-        bias_tensor = torch.empty(0, device=a.device, dtype=out_dtype)
+        bias = torch.empty(0, device=a.device, dtype=out_dtype)
         has_bias = False
     else:
         assert bias.device == a.device
         assert bias.numel() == b.shape[1]
-        bias_tensor = bias.to(dtype=torch.float16)
+        bias = bias.to(out_dtype)
         has_bias = True
 
     ext = _load_hip_extension()
@@ -232,8 +232,8 @@ def scaled_mm_hip(
     warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config(
         a,
         b,
-        scale_tensor,
-        bias_tensor,
+        scale,
+        bias,
         has_scale,
         has_bias,
         ext,
@@ -241,8 +241,8 @@ def scaled_mm_hip(
     return ext.scaled_mm(
         a,
         b,
-        scale_tensor,
-        bias_tensor,
+        scale,
+        bias,
         has_scale,
         has_bias,
         warps_m,
