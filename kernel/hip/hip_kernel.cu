@@ -58,7 +58,7 @@ template <int kBlockWarpsM,
 __global__ void scaled_mm_kernel(
     const half* const a,
     const uint8_t* const b,
-    const float* const scale,
+    const half* const scale,
     const half* const bias,
     half* const c,
     const int64_t M,
@@ -486,7 +486,7 @@ __global__ void scaled_mm_kernel(
         constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
         half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
 
-        const half scale_h = has_scale ? __float2half_rn(scale[0]) : __float2half_rn(1.0f);
+        const half scale_h = has_scale ? scale[0] : __float2half_rn(1.0f);
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
 
@@ -583,7 +583,7 @@ torch::Tensor scaled_mm(
     if (has_scale) {
         TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor");
         TORCH_CHECK(scale.numel() == 1, "scale must have one element");
-        TORCH_CHECK(scale.scalar_type() == at::kFloat, "scale must be float32");
+        TORCH_CHECK(scale.scalar_type() == at::kHalf, "scale must be float16");
     }
     if (has_bias) {
         TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
@@ -596,7 +596,7 @@ torch::Tensor scaled_mm(
     const half* const a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b.data_ptr());
     auto stream = at::cuda::getCurrentCUDAStream();
-    const float* const scale_ptr = has_scale ? scale.data_ptr<float>() : nullptr;
+    const half* const scale_ptr = has_scale ? reinterpret_cast<const half*>(scale.data_ptr<at::Half>()) : nullptr;
     const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
     half* const c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
 

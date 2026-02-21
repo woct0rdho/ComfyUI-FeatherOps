@@ -103,22 +103,22 @@ def scaled_mm_ck(
     assert out_dtype == torch.float16
 
     if scale is None:
-        scale_tensor = torch.empty(0, device=a.device, dtype=torch.float32)
+        scale = torch.empty(0, device=a.device, dtype=out_dtype)
         has_scale = False
     else:
         assert scale.device == a.device
         assert scale.numel() == 1
-        scale_tensor = scale.to(dtype=torch.float32)
+        scale = scale.to(out_dtype)
         has_scale = True
 
     if bias is None:
-        bias_tensor = torch.empty(0, device=a.device, dtype=out_dtype)
+        bias = torch.empty(0, device=a.device, dtype=out_dtype)
         has_bias = False
     else:
         assert bias.device == a.device
         assert bias.numel() == b.shape[1]
-        bias_tensor = bias.to(dtype=torch.float16)
+        bias = bias.to(out_dtype)
         has_bias = True
 
     ext = _load_ck_extension()
-    return ext.scaled_mm_ck(a, b, scale_tensor, bias_tensor, has_scale, has_bias)
+    return ext.scaled_mm_ck(a, b, scale, bias, has_scale, has_bias)
