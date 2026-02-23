@@ -13,6 +13,7 @@ scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynami
 
 
 providers = {
+    "torch": scaled_mm_naive,
     "torch_compiled": scaled_mm_naive_compiled,
     "hip_prepacked": scaled_mm_hip_prepacked,
 }
@@ -51,7 +52,7 @@ def benchmark(N, provider):
     # Prepacking is done once and excluded from do_bench
     b_prepacked = prepack_b_for_scaled_mm_hip(b)
 
-    if provider == "torch_compiled":
+    if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
     elif provider == "hip_prepacked":
         fn = lambda: providers[provider](a, b_prepacked, scale, bias, out_dtype)
