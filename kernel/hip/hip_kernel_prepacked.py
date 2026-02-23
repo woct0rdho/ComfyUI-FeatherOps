@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 from torch.utils.cpp_extension import load, _import_module_from_library
 
-from .hip_kernel import _CONFIGS, _config_compatible, _get_forced_config, get_rocm_lib_dirs
+from .hip_kernel import _config_compatible, _get_forced_config, get_rocm_lib_dirs
 
 
 @functools.cache
@@ -70,14 +70,13 @@ def _load_hip_prepacked_extension():
     return module
 
 
-_PREPACKED_CONFIGS = tuple(
-    cfg
-    for cfg in (
-        (1, 8, 2, 2, 8, 2),
-        *_CONFIGS,
-    )
-    if cfg[3] == 2
-)
+_PREPACKED_CONFIGS = [
+    (1, 8, 2, 2, 8, 2),
+    (2, 2, 2, 2, 4, 4),
+    (2, 4, 2, 2, 4, 2),
+    (2, 4, 2, 2, 4, 4),
+    (4, 2, 2, 2, 2, 4),
+]
 _PREPACKED_AUTOTUNE_CACHE = {}
 
 
