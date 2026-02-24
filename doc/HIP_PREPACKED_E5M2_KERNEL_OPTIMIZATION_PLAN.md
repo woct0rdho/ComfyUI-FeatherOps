@@ -30,6 +30,63 @@
   - `rocprofv3 --kernel-trace --stats -d tmp_fp8e5m2_analysis/p14_stage2_noswizzle_only_profile -o p14_stage2_noswizzle_only_profile -- python -u profile_scaled_mm_hip_prepacked_e5m2.py`
   - target kernel average: `~25.653 us`.
 
+## PC Sampling Profile (config 1,8,2,2,8,2, N=8192, 200 iters)
+
+Profiled with `rocprofv3 --pc-sampling-method host_trap --pc-sampling-unit time --pc-sampling-interval 5000`.
+See `doc/GFX1151_REFERENCE.md` for PC sampling setup details.
+
+Two independent runs (ROCm driver, mainline kernel) produced ~572K samples
+each with identical distributions (all categories within +/-0.1pp), confirming
+reproducibility.
+
+### Instruction Breakdown
+
+| Category | Key Opcodes | Samples | % |
+|---|---|---:|---:|
+| LDS Read | `ds_load_b128` | 200,843 | 35.1 |
+| WMMA | `v_wmma_f32_16x16x16_f16` | 100,504 | 17.6 |
+| FP Convert | `v_perm_b32`, `v_pk_*`, `v_cvt_*` | 76,879 | 13.4 |
+| LDS Write | `ds_store_b128`, `ds_store_b16` | 69,748 | 12.2 |
+| Sync | `s_barrier`, `s_waitcnt`, `buffer_gl0_inv` | 64,016 | 11.2 |
+| SALU | `s_add_i32`, `s_ashr_i32`, `s_or_b32`, etc. | 30,771 | 5.4 |
+| VALU Other | `v_add_co_*`, `v_lshlrev_b64`, etc. | 23,417 | 4.1 |
+| Global Load | `global_load_b128` | 5,912 | 1.0 |
+| Global Store | `global_store_b128` | 295 | 0.1 |
+
+### Grouped Summary
+
+| Group | % |
+|---|---:|
+| Memory (LDS + Global) | 48.4 |
+| Compute (WMMA + FP convert) | 31.0 |
+| Sync (barrier + waitcnt) | 11.2 |
+| Other (SALU, VALU, etc.) | 9.5 |
+
+### WMMA / Load Overlap
+
+Temporal analysis using 5ms bins:
+- 85% of bins contain both WMMA and LDS operations simultaneously.
+- Per-bin ratios stable: WMMA ~17.6% (stdev 3.5%), LDS ~47.2% (stdev 4.6%).
+- Double-buffering (stages=2) keeps both pipelines fed throughout the main loop.
+
+### Key Takeaways
+
+1. **LDS-bandwidth-bound**: 48.4% memory vs 31.0% compute. LDS accounts for
+   97.7% of all memory samples -- global memory latency is hidden by the
+   2-stage software pipeline.
+2. **FP8->FP16 conversion is significant**: 13.4% in `v_perm_b32` and related
+   ops. Unavoidable on gfx1151 which lacks native fp8 WMMA.
+3. **Barriers at 11.2%**: non-trivial sync cost from 8 warps sharing a
+   128x256 tile through LDS.
+4. **Good overlap, memory still dominates**: WMMA and LDS are well-interleaved
+   (85% co-occurrence), but waves stall on LDS reads 2x more than on WMMA.
+
+### Data Files
+
+- `pc_sampling_profile_mainline/pc_sampling.db` -- 572K samples (mainline kernel run)
+- `pc_sampling_profile/rocprof_out/x2/` -- 572K samples CSV (ROCm kernel run)
+- `pc_sampling_profile/kernel_disasm_full.txt` -- full disassembly (11,739 lines)
+
 ## Durable Findings (Keep in Mind)
 
 - e5m2 conversion arithmetic is not the dominant limiter now; local scheduling/overlap is the main remaining lever.
