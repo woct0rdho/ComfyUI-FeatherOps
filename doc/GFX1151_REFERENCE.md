@@ -93,22 +93,83 @@ Conclusion:
 - For this case, occupancy is LDS-limited, not VGPR-limited.
 - Matching launch geometry alone does not close the gap.
 
-## Overlap Measurement Without PC Sampling
+## PC Sampling on gfx1151
 
-PC sampling is unavailable on gfx1151, so overlap can be estimated by controlled mode decomposition:
+PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, and ROCProfiler.
 
-- `full`
-- `no_overlap`
-- `comm_only`
-- `comp_only`
+### Running PC Sampling
 
-Derived metrics:
-- direct gain: `T_no_overlap - T_full`
-- decomposition gain: `T_comm_only + T_comp_only - T_full`
+Use `$ROCM_PATH/bin/rocprofv3` directly (not the venv wrapper, which loads
+stock libraries without gfx11 PC sampling support):
 
-Observed at `N=8192`:
-- config `2,2,2,2,4,4`: near-zero/negative overlap gain.
-- config `2,2,2,4,4,4`: positive overlap metric but slower total kernel.
+```bash
+$ROCM_PATH/bin/rocprofv3 \
+  --pc-sampling-method host_trap \
+  --pc-sampling-unit time \
+  --pc-sampling-interval 5000 \
+  -o <output_prefix> \
+  -- python <script>.py
+```
 
-Practical rule:
-- optimize total runtime first; overlap percentage alone is not the objective.
+- `--pc-sampling-interval 5000`: scan interval in microseconds (5ms).
+- Default output is SQLite (rocpd format) with a `rocpd_pc_sampling` table
+  containing columns: `timestamp`, `exec_mask`, `dispatch_id`, `instruction`,
+  `instruction_comment`, `correlation_id`.
+- Add `-f csv` for CSV output instead (columns match the DB schema).
+- rocprofv3 decodes PCs to instruction text directly (no manual
+  PC-to-disassembly mapping needed).
+
+### Querying the DB
+
+```bash
+# Sample count
+sqlite3 results.db "SELECT COUNT(*) FROM rocpd_pc_sampling;"
+
+# Category breakdown
+sqlite3 results.db "
+SELECT
+  CASE
+    WHEN instruction LIKE 'ds_load%' THEN 'LDS Read'
+    WHEN instruction LIKE 'ds_store%' THEN 'LDS Write'
+    WHEN instruction LIKE 'global_load%' THEN 'Global Load'
+    WHEN instruction LIKE 'global_store%' THEN 'Global Store'
+    WHEN instruction LIKE '%wmma%' THEN 'WMMA'
+    WHEN instruction LIKE 'v_perm_b32%' OR instruction LIKE 'v_pk_%'
+         OR instruction LIKE 'v_cvt_%' THEN 'FP Convert'
+    WHEN instruction LIKE 's_barrier%' OR instruction LIKE 's_waitcnt%'
+         OR instruction LIKE 'buffer_gl0_inv%' THEN 'Sync'
+    WHEN instruction LIKE 's_%' THEN 'SALU'
+    WHEN instruction LIKE 'v_%' THEN 'VALU Other'
+    ELSE 'Other'
+  END AS category,
+  COUNT(*) AS cnt,
+  ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM rocpd_pc_sampling), 1) AS pct
+FROM rocpd_pc_sampling GROUP BY category ORDER BY cnt DESC;
+"
+
+# Top instructions
+sqlite3 results.db "
+SELECT instruction, COUNT(*) AS cnt
+FROM rocpd_pc_sampling GROUP BY instruction ORDER BY cnt DESC LIMIT 20;
+"
+```
+
+### Typical Sample Counts
+
+At `--pc-sampling-interval 5000` with 200 iterations of an N=8192 GEMM
+(~7s wall time), expect ~570K samples.
+
+### Kernel dmesg Verification
+
+```bash
+dmesg | grep pcs
+# Expected: "pcs: thread started interval_us=5000 ..."
+# Expected: "pcs: thread exiting, total_delivered=NNNNNN loops=NNN"
+```
+
+### Overlap Measurement (Alternative)
+
+When PC sampling is not available (e.g. stock driver), overlap can be
+estimated by controlled mode decomposition (`full`, `no_overlap`,
+`comm_only`, `comp_only`). See experiment P6-A/P6-B in the e5m2
+optimization plan for details.
