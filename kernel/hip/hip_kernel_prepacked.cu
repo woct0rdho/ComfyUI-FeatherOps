@@ -13,7 +13,7 @@ constexpr int kWmmaK = 16;
 // rocwmma::Constants::AMDGCN_WAVE_SIZE returns 64 during host compilation
 constexpr int kWaveSize = 32;
 
-// Packed fp8e4m3fn → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
+// Packed fp8e4m3fn -> fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
 // Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
 // Ignores denormals (values with zero exponent map to small fp16 instead of zero).
 __device__ __forceinline__ void fp8e4m3x4_to_half2x2(
@@ -31,7 +31,7 @@ __device__ __forceinline__ void fp8e4m3x4_to_half2x2(
     out_hi = (hi_pair << 7) + ((hi_pair & 0x00800080u) << 7) + 0x20002000u;
 }
 
-// Packed fp8e5m2 → fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
+// Packed fp8e5m2 -> fp16 conversion: converts 4 fp8 bytes in a uint32 to 4 fp16 values.
 // Produces two uint32s in sequential half2 order: out_lo=[h1:h0], out_hi=[h3:h2].
 // fp8e5m2: [sign:1][exp:5][mantissa:2], fp16: [sign:1][exp:5][mantissa:10]
 // Exponent bias is 15 for both formats, so only mantissa needs zero-extension.
@@ -56,7 +56,7 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
 }
 
 // =============================================================================
-// Optimized kernel with K0×M×K1 LDS layout and direct WMMA intrinsics
+// Optimized kernel with K0xMxK1 LDS layout and direct WMMA intrinsics
 // Contiguous fast path only: requires aligned, contiguous inputs with
 // dimensions divisible by tile sizes.
 // K1 = 8 enables vec8 LDS reads (like CK)
@@ -92,7 +92,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16 (required by row swizzle)");
     static_assert(kBlockN % 16 == 0, "kBlockN must be a multiple of 16 (required by vec16 load)");
 
-    // K0×M×K1 layout for A matrix (no extra LDS padding).
+    // K0xMxK1 layout for A matrix (no extra LDS padding).
     // Apply row permutation on A store to improve LDS local-read banking while
     // keeping compact LDS footprint and 128-bit accesses.
     // K1 = 8 for fp16: enables vec8 LDS reads (like CK)
@@ -102,7 +102,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     constexpr int kAStrideK1 = kK1;
     constexpr int kShASize = kStages * kK0 * kBlockM * kAStrideK1;
 
-    // B uses K×N layout for efficient vec16 stores during loading
+    // B uses KxN layout for efficient vec16 stores during loading
     constexpr int kBPad = 8;
 
     // C-shuffle epilogue reuses sh_a memory. Each warp needs 16*24 halfs.
@@ -137,10 +137,10 @@ __global__ void scaled_mm_kernel_prepacked_b(
         }
     }
 
-    // Loading A: K0×M×K1 layout with physical/inverse row mapping and
+    // Loading A: K0xMxK1 layout with physical/inverse row mapping and
     // wave-separated global-read ownership.
     constexpr int kAVecs = kK0 * kBlockM;
-    // Use wave-separated ownership only when per-thread vec count stays small (≤4).
+    // Use wave-separated ownership only when per-thread vec count stays small (<=4).
     // For large kBlockM (e.g. kRepeatM=8, kBlockM=256) WSGR causes too many VGPRs
     // for the A prefetch buffer, hurting occupancy.
     constexpr bool kUseWsgrAStoreOwnership =
@@ -187,7 +187,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
         }
     };
 
-    // Loading B: K×N layout with vec16 fp8→fp16 conversion
+    // Loading B: KxN layout with vec16 fp8->fp16 conversion
     constexpr int kBVecs = (kBlockN * kWmmaK) / 16;
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
 
@@ -330,7 +330,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
         // Reuse sh_a memory for C-shuffle
-        // Each warp gets its own 16×24 buffer (24 = 16 + 8 padding for bank conflicts)
+        // Each warp gets its own 16x24 buffer (24 = 16 + 8 padding for bank conflicts)
         constexpr int kCPad = 8;
         constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
         half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
@@ -421,19 +421,17 @@ torch::Tensor scaled_mm_prepacked(
     TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
     TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
     TORCH_CHECK(a.scalar_type() == at::kHalf, "a must be float16");
+    TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
     TORCH_CHECK(a.dim() == 2, "a must be 2D");
     TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
-    TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
-    TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
-    TORCH_CHECK(stages == 2, "Only stages=2 is supported");
 
+    const int64_t M = a.size(0);
     const int64_t K = a.size(1);
+    const int64_t N = b_prepacked.size(1);
     TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
     TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK,
         "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
-
-    const int64_t N = b_prepacked.size(1);
-    TORCH_CHECK(bias.scalar_type() == at::kHalf || !has_bias, "bias must be float16");
+    TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
 
     // Contiguous fast path requirements
     TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
@@ -450,7 +448,9 @@ torch::Tensor scaled_mm_prepacked(
         TORCH_CHECK(bias.scalar_type() == at::kHalf, "bias must be float16");
     }
 
-    auto c = torch::empty({a.size(0), N}, a.options().dtype(at::kHalf));
+    TORCH_CHECK(stages == 2, "Only stages=2 is supported");
+
+    auto c = torch::empty({M, N}, a.options().dtype(at::kHalf));
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.data_ptr());
@@ -476,8 +476,8 @@ torch::Tensor scaled_mm_prepacked(
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
         constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-        TORCH_CHECK(a.size(0) % kBlockM == 0,
-            "M (", a.size(0), ") must be divisible by kBlockM (", kBlockM, ")");
+        TORCH_CHECK(M % kBlockM == 0,
+            "M (", M, ") must be divisible by kBlockM (", kBlockM, ")");
         TORCH_CHECK(N % kBlockN == 0,
             "N (", N, ") must be divisible by kBlockN (", kBlockN, ")");
         TORCH_CHECK(K % (kWmmaK * kUnrollK) == 0,
@@ -488,7 +488,7 @@ torch::Tensor scaled_mm_prepacked(
         const dim3 block(kThreadsPerBlock, 1, 1);
         const dim3 grid(
             static_cast<uint32_t>(N) / kBlockN,
-            static_cast<uint32_t>(a.size(0)) / kBlockM);
+            static_cast<uint32_t>(M) / kBlockM);
 
         const bool use_fp8_e5m2 = (b_dtype == 1);
 
@@ -497,7 +497,7 @@ torch::Tensor scaled_mm_prepacked(
                 (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, true>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), N, K,
+                M, N, K,
                 a.stride(0), c.stride(0),
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         } else {
@@ -505,7 +505,7 @@ torch::Tensor scaled_mm_prepacked(
                 (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, false>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
-                a.size(0), N, K,
+                M, N, K,
                 a.stride(0), c.stride(0),
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         }

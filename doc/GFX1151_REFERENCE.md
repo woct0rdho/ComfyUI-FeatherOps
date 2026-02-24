@@ -8,9 +8,9 @@ This file keeps hardware/profiling/runtime facts for this machine.
 |---|---|
 | GPU | RDNA 3.5 (`gfx1151`) |
 | Compute Units | 40 |
-| Wave Size | 32 only |
+| Wave Size | 32 |
 | Max Clock | 2900 MHz |
-| LDS per workgroup | 64 KB max |
+| LDS per workgroup | 64 KB |
 | Memory | LPDDR5 256-bit 8000 MT/s |
 | Theoretical BW | 256 GB/s |
 | Practical BW | ~200 GB/s |
@@ -24,7 +24,7 @@ Per-SIMD limits:
 - VGPR budget/SIMD: `1536`
 
 Rule of thumb:
-```text
+```
 waves_by_vgpr = floor(1536 / vgpr_per_wave)
 occupancy_per_simd = min(waves_by_vgpr, 16) / 16
 ```
@@ -33,9 +33,8 @@ Example: `176 VGPR` -> `floor(1536/176)=8 waves` -> `50%` per SIMD.
 
 ## WMMA Facts (gfx1151)
 
-- Tile shape: `16x16x16`
-- Rough instruction latency: `16 cycles`
-- Throughput target: ~1 WMMA op / 16 cycles / SIMD
+- Tile shape: `16x16 @ 16x16`
+- Instruction latency: `32 cycles`
 - Supported families include fp16/bf16 and i8/u8 WMMA variants.
 
 ## rocprofv3 Workflow (Known Good)

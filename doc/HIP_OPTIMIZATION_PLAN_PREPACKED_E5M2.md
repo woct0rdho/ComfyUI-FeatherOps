@@ -81,9 +81,25 @@ Temporal analysis using 5ms bins:
 4. **Good overlap, memory still dominates**: WMMA and LDS are well-interleaved
    (85% co-occurrence), but waves stall on LDS reads 2x more than on WMMA.
 
+### PC Sampling vs Overlap Measurement Cross-Validation
+
+PC sampling confirms the overlap decomposition results (P6-A, P6-B):
+
+- P6-A found only ~2-3% overlap headroom. PC sampling explains: 85% of time
+  bins already contain both WMMA and LDS simultaneously -- double-buffering is
+  working, there is little more overlap to extract.
+- P6-B showed VALU/LDS instruction counts flat between full and no_overlap,
+  with penalty only in `SQ_BUSY_CYCLES`. PC sampling explains: waves spend
+  48.4% stalled on memory (mostly LDS) vs 31.0% on compute. Disabling overlap
+  just makes waves wait longer on the same LDS operations.
+- "e5m2 conversion is not the dominant limiter" is confirmed: FP Convert is
+  13.4%, third behind LDS Read (35.1%) and WMMA (17.6%).
+- Global memory is not a concern: only 1.0% of samples. The 2-stage pipeline
+  hides global latency almost perfectly.
+
 ### Data Files
 
-- `pc_sampling_profile_mainline/pc_sampling.db` -- 572K samples (mainline kernel run)
+- `pc_sampling_profile_mainline/rocprof_out/db_results.db` -- 572K samples (mainline kernel, native rocpd DB)
 - `pc_sampling_profile/rocprof_out/x2/` -- 572K samples CSV (ROCm kernel run)
 - `pc_sampling_profile/kernel_disasm_full.txt` -- full disassembly (11,739 lines)
 
@@ -146,6 +162,7 @@ Temporal analysis using 5ms bins:
 | P12 | REJECT | stage2 B-only split-phase prefetch (`prefetch B -> compute -> wait -> load A + commit B`) | correctness failed in non-swizzle (`rel_l2` up to `~0.034`, max error `~39.2`) | stage2 pipelining around same-stage refill remains hazard-prone on current schedule; reverted, skipped benchmark/profile per protocol |
 | P13 | REJECT | stage2 B-only split-phase retry with `volatile uint4` prefetch buffer | compile failed (`volatile uint4` assignment/copy not supported by HIP vector type operators) | invalid implementation direction; reverted, skipped benchmark/profile per protocol |
 | P14 | KEEP baseline simplification | remove swizzle toggle and overlap profiling modes; enforce stages=2 only | correctness pass; benchmark/profile remain in prior noise band (`N=8192 ~42.68k`, kernel `~25.65 us`) | matches gfx1151 winner path and current optimization scope |
+| PCS | KEEP analysis | PC sampling profile (host_trap, 5ms interval, 200 iters N=8192) | 572K samples: LDS 48.4%, compute 31.0%, sync 11.2%, other 9.5%; confirms P6-A/P6-B overlap findings | kernel is LDS-bandwidth-bound; double-buffering works; no new pipeline optimization path |
 
 ## Do-Not-Repeat (Unless New Preconditions)
 
@@ -161,15 +178,33 @@ Temporal analysis using 5ms bins:
 - Re-trying P13 volatile-`uint4` variant (compiler-incompatible).
 - Re-introducing overlap-mode toggles or swizzle runtime toggle without a new requirement.
 
-## Next Experiments (Stage2-Focused)
+## Next Experiments (PC-Sampling-Informed)
 
-### P11: Stage2 software pipeline (no stage count increase)
+PC sampling identifies three cost centers: LDS (48.4%), compute (31.0%),
+sync (11.2%). Stage2 software-pipeline attempts (P10-P13) are exhausted.
+The following experiments target the cost centers directly.
 
-- Constraint: keep `kStages=2` focus (known that `kStages>2` does not help on gfx1151).
-- P10/P11/P12/P13 stage2 software-pipeline variants are all rejected (performance, correctness, or compile viability).
-- Any further stage2 pipeline attempt must include an explicit hazard-proof stage ownership argument before code changes.
+### P15: LDS Bank Conflict Analysis
 
-### P12: Baseline Hold
+- Rationale: LDS reads are 35.1% of time. If bank conflicts inflate this,
+  fixing access patterns could reduce stalls without changing tile shape.
+- Method: `rocprofv3 --pmc LDSBankConflict` on the forced winner config.
+- Decision: if bank conflict rate is high (>10%), investigate swizzled LDS
+  layout for A/B tiles. If low, LDS bandwidth is the hard limit -- skip.
 
-- Stage2 software-pipeline attempts currently failed (one performance, two correctness, one compile failure). Keep current baseline endpoint.
-- Next pivot (only if requested): algorithmic/ISA-level changes beyond local reordering.
+### P16: 4-Warp Tile Exploration
+
+- Rationale: barriers are 11.2%. Halving warp count (4 warps, 128x128 tile)
+  would roughly halve barrier cost and reduce LDS contention.
+- Risk: prior platform knowledge says fewer warps hurts occupancy on gfx1151.
+  Only attempt if P15 shows LDS contention (not bandwidth) is the limiter.
+- Method: add config `(1,4,2,2,8,2)` or `(2,2,2,2,8,2)`, run correctness +
+  benchmark. Keep only if N=8192 GFLOPS improves.
+
+### P17: Baseline Hold (Default)
+
+- If P15 shows low bank conflicts and P16 regresses, the kernel is at the
+  gfx1151 hardware limit for this tile shape and dtype.
+- The 13.4% FP8->FP16 conversion cost disappears on gfx1250 (native fp8 WMMA).
+  No further gfx1151-specific optimization is warranted unless a new
+  algorithmic approach emerges.
