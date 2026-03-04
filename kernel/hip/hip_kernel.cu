@@ -93,7 +93,9 @@ __global__ void scaled_mm_kernel(
 
     // C-shuffle epilogue reuses sh_a memory. Each warp needs 16*24 halfs.
     // Ensure sh_a is large enough for A layout and C-shuffle reuse.
-    constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * (kWmmaN + kBPad);
+    constexpr int kCPad = 8;
+    constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
+    constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * kCStride;
     static_assert(kShASize >= kCShuffleSize,
         "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
 
@@ -311,8 +313,6 @@ __global__ void scaled_mm_kernel(
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
         // Reuse sh_a memory for C-shuffle
         // Each warp gets its own 16x24 buffer (24 = 16 + 8 padding for bank conflicts)
-        constexpr int kCPad = 8;
-        constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
         half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
 
         const half scale_h = has_scale ? scale[0] : __float2half_rn(1.0f);
