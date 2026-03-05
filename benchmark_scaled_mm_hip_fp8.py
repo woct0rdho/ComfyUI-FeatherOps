@@ -5,7 +5,7 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hip_kernel_prepacked import prepack_b_for_scaled_mm_hip, scaled_mm_hip_prepacked
+from kernel.hip.hip_kernel_fp8 import prepack_b_for_scaled_mm_hip_fp8, scaled_mm_hip_fp8
 from kernel.naive import scaled_mm_naive
 
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
@@ -13,7 +13,7 @@ scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynami
 providers = {
     "torch": scaled_mm_naive,
     "torch_compiled": scaled_mm_naive_compiled,
-    "hip_prepacked": scaled_mm_hip_prepacked,
+    "hip_fp8": scaled_mm_hip_fp8,
 }
 provider_names = list(providers)
 
@@ -27,7 +27,7 @@ provider_names = list(providers)
             line_vals=provider_names,
             line_names=provider_names,
             ylabel="GFLOPS",
-            plot_name="scaled_mm_hip_prepacked_e5m2",
+            plot_name="scaled_mm_hip_fp8",
             args={},
         )
     ]
@@ -38,7 +38,7 @@ def benchmark(N, provider):
     torch.cuda.empty_cache()
 
     device = "cuda"
-    a_dtype = torch.float16
+    a_dtype = torch.float8_e5m2
     b_dtype = torch.float8_e5m2
     out_dtype = torch.float16
 
@@ -48,11 +48,11 @@ def benchmark(N, provider):
     bias = torch.randn(N, device=device, dtype=out_dtype)
 
     # Prepacking is done once and excluded from do_bench
-    b_prepacked = prepack_b_for_scaled_mm_hip(b)
+    b_prepacked = prepack_b_for_scaled_mm_hip_fp8(b)
 
     if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
-    elif provider == "hip_prepacked":
+    elif provider == "hip_fp8":
         fn = lambda: providers[provider](a, b_prepacked, scale, bias, out_dtype)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")

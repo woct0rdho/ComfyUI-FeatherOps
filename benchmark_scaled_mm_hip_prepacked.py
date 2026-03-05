@@ -9,9 +9,7 @@ from kernel.hip.hip_kernel import scaled_mm_hip
 from kernel.hip.hip_kernel_prepacked import prepack_b_for_scaled_mm_hip, scaled_mm_hip_prepacked
 from kernel.naive import scaled_mm_naive
 
-
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
-
 
 providers = {
     "torch_compiled": scaled_mm_naive_compiled,
