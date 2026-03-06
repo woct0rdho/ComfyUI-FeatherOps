@@ -99,8 +99,9 @@ PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, an
 ### Running PC Sampling
 
 Use `$ROCM_PATH/bin/rocprofv3` directly (not the venv wrapper, which loads
-stock libraries without gfx11 PC sampling support):
+stock libraries without gfx11 PC sampling support). Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling.
 
+**For Host-Trap (Time-based):**
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
   --pc-sampling-method host_trap \
@@ -109,8 +110,18 @@ $ROCM_PATH/bin/rocprofv3 \
   -o <output_prefix> \
   -- python <script>.py
 ```
-
 - `--pc-sampling-interval 5000`: scan interval in microseconds (5ms).
+
+**For Stochastic (Cycle-based):**
+```bash
+$ROCM_PATH/bin/rocprofv3 \
+  --pc-sampling-method stochastic \
+  --pc-sampling-unit cycles \
+  --pc-sampling-interval 1048576 \
+  -o <output_prefix> \
+  -- python <script>.py
+```
+- **Important:** GFX11.5 hardware stochastic sampling *only* supports `cycles` (not `time`), and the interval *must* be a power of 2 (e.g., `1048576` cycles). Using `time` or non-power-of-2 intervals will result in a "configuration is not supported" error.
 - Default output is SQLite (rocpd format) with a `rocpd_pc_sampling` table
   containing columns: `timestamp`, `exec_mask`, `dispatch_id`, `instruction`,
   `instruction_comment`, `correlation_id`.
@@ -156,14 +167,16 @@ FROM rocpd_pc_sampling GROUP BY instruction ORDER BY cnt DESC LIMIT 20;
 ### Typical Sample Counts
 
 At `--pc-sampling-interval 5000` with 200 iterations of an N=8192 GEMM
-(~7s wall time), expect ~570K samples.
+(~7s wall time):
+- Old SQ_IND driver: ~570K samples (reads all active waves per scan)
+- Host-trap driver (mainline): ~10K samples (traps one wave per SIMD/slot per SQ_CMD)
 
 ### Kernel dmesg Verification
 
 ```bash
 dmesg | grep pcs
-# Expected: "pcs: thread started interval_us=5000 ..."
-# Expected: "pcs: thread exiting, total_delivered=NNNNNN loops=NNN"
+# Expected: "pcs: thread started interval_us=5000 vmid=N"
+# Expected: "pcs: thread exiting, sent NNN traps"
 ```
 
 ### Overlap Measurement (Alternative)
