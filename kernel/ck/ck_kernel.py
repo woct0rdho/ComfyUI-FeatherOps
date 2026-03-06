@@ -1,10 +1,10 @@
-import os
 import functools
+import os
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load, _import_module_from_library
+from torch.utils.cpp_extension import _import_module_from_library, load
 
 
 def get_rocm_lib_dirs() -> list[str]:
