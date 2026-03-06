@@ -1,10 +1,10 @@
 # HIP Prepacked-B Kernel Optimization Plan (gfx1151)
 
-## Scope and KPI
+## Scope and metric
 
 - Target kernel family: prepacked B (`uint8` fp8 bytes), gfx1151, winner track around `1,8,2,2,8,2`.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Primary KPI: benchmark GFLOPS (kernel runtime); profile kernel-time is diagnostic only.
+- Primary metric: benchmark GFLOPS (kernel runtime); profile kernel-time is diagnostic only.
 - Keep rule:
   - correctness passes,
   - forced `N=8192` does not regress,
@@ -77,7 +77,7 @@ Interpretation:
 | P11-B6a | KEEP (analysis) | roofline/issue model | quantified peak gap | confirmed compute-side bottleneck |
 | P11-B6b | REJECT | prepack lane transform + mask/shift decode | no robust gain | `v_perm` removed but replaced by similar-cost ops |
 | P11-B6c | REJECT | load-phase fp8->fp16 conversion | large regression | moved decode to non-overlapped path + larger LDS payload |
-| P11-B6d | REJECT | remove load-phase `s_setprio` | no robust gain | slightly worse forced KPI |
+| P11-B6d | REJECT | remove load-phase `s_setprio` | no robust gain | slightly worse forced metric |
 | P11-B6e | REJECT | lazy decode at `rm==0` | no robust gain | profile worse |
 | P11-B6f | REJECT | add config `1,8,1,2,8,2` | NaN correctness | exposed `kStages > kUnrollK` stage-write issue |
 | P11-B6g | REJECT | fix stage-write issue then re-test `1,8,1,2,8,2` | ~38.7k forced | finer chunking loses to control overhead |

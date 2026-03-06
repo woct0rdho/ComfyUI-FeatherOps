@@ -175,7 +175,7 @@ E.8 proved waits are already hidden by compiler interleaving (insight #2).
 | K-major global load for B | Dead end | Destroys coalescing |
 | ds_load_2addr_b32 for B reads | Dead end | 4-byte alignment fails for odd lanes |
 | uint32 B read (avoid d16 packing) | -3.2% | VGPR pressure + pack VALU > benefit |
-| packed-u8 pair conversion (B17) | -3% | Benchmark KPI down |
+| packed-u8 pair conversion (B17) | -3% | Benchmark metric down |
 | asm-u8 conversion (B18) | -16% | VALU/scheduling cost |
 | C compile-time has_scale/has_bias (C03) | -1% | No benefit |
 | C bias half2 pairing (C05) | -1% | No benefit |
