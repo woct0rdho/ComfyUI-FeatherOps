@@ -44,8 +44,8 @@ __device__ __forceinline__ void fp8e5m2x4_to_half2x2(
     out_hi = __builtin_amdgcn_perm(0u, p, 0x030c020cu);
 }
 
-// 16-row swizzle used by A LDS physical mapping.
-__device__ __forceinline__ constexpr int a_row_logical_to_phys_16(const int x)
+// 16-row swizzle used by LDS physical mapping.
+__device__ __forceinline__ constexpr int c_row_logical_to_phys_16(const int x)
 {
     return ((x & 7) << 1) | ((x >> 3) & 1);
 }
@@ -105,16 +105,18 @@ __global__ void scaled_mm_kernel_prepacked_b(
     // B uses KxN layout for efficient vec16 stores during loading
     constexpr int kBPad = 8;
 
-    // C-shuffle epilogue reuses sh_a memory. Each warp needs 16*24 halfs.
-    // Ensure sh_a is large enough for A layout and C-shuffle reuse.
+    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*24 halfs.
     constexpr int kCPad = 8;
     constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
-    constexpr int kCShuffleSize = kBlockWarpsM * kBlockWarpsN * kWmmaM * kCStride;
-    static_assert(kShASize >= kCShuffleSize,
-        "sh_a too small for C-shuffle epilogue. Increase kStages or kRepeatM.");
 
-    __shared__ __align__(16) half sh_a[kShASize];
-    __shared__ __align__(16) uint8_t sh_b[kStages][kBlockN + kBPad][kWmmaK];
+    union SharedStorage {
+        struct {
+            half a[kShASize];
+            uint8_t b[kStages][kBlockN + kBPad][kWmmaK];
+        } ab;
+        half c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
+    };
+    __shared__ __align__(16) SharedStorage sh;
 
     const int block_m = static_cast<int>(blockIdx.y) * kBlockM;
     const int block_n = static_cast<int>(blockIdx.x) * kBlockN;
@@ -158,7 +160,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
-        return &sh_a[idx];
+        return &sh.ab.a[idx];
     };
 
     const auto load_a_lds_k0mk1 = [&](const int stage, const int64_t kk) -> void {
@@ -213,7 +215,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
 
             const int64_t gidx = ((static_cast<int64_t>(ktile) * N + packed_col) * kWmmaK);
             const uint8_t* const b_src = b_prepacked + gidx;
-            uint8_t* const b_dst = &sh_b[stage][col_local][0];
+            uint8_t* const b_dst = &sh.ab.b[stage][col_local][0];
             *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
         }
     };
@@ -239,7 +241,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
             const int n_col = tile_n * kWmmaN + lane_in_subgroup;
-            const uint4 p = *reinterpret_cast<const uint4*>(&sh_b[stage][n_col][0]);
+            const uint4 p = *reinterpret_cast<const uint4*>(&sh.ab.b[stage][n_col][0]);
             const uint32_t p32[4] = {p.x, p.y, p.z, p.w};
             uint32_t h32[8];
             #pragma unroll
@@ -333,7 +335,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
         // Reuse sh_a memory for C-shuffle
         // Each warp gets its own 16x24 buffer (24 = 16 + 8 padding for bank conflicts)
-        half* const sh_c = sh_a + wave_id * kWmmaM * kCStride;
+        half* const sh_c = sh.c[wave_id][0];
 
         const half scale_h = has_scale ? scale[0] : __float2half_rn(1.0f);
         const int subgroup = lane / 16;
@@ -355,7 +357,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logical = subgroup * 8 + acc_idx;
-                    const int row_phys = a_row_logical_to_phys_16(row_logical);
+                    const int row_phys = c_row_logical_to_phys_16(row_logical);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     val = __hmul(val, scale_h);
                     sh_c[row_phys * kCStride + col] = val;
@@ -367,7 +369,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 // Step 2: Read from LDS in row-major order for coalesced global write
                 // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
                 const int read_row = lane / 2;
-                const int read_row_phys = a_row_logical_to_phys_16(read_row);
+                const int read_row_phys = c_row_logical_to_phys_16(read_row);
                 const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
                 const int read_col_base = col_half * 8;
 
@@ -524,7 +526,7 @@ torch::Tensor scaled_mm_prepacked(
         return false;
     };
 
-    // Autotune candidate configs (kept in sync with kernel/hip/hip_kernel.py::_CONFIGS).
+    // Autotune candidate configs
     // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
     const bool launched =
         try_launch(ConfigTag<1, 8, 2, 2, 8, 2>{}) ||
