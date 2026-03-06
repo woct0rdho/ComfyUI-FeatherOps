@@ -8,7 +8,7 @@ from kernel.naive import scaled_mm_naive
 
 def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
     """Test a specific config and return (pass, error_msg)."""
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
@@ -16,7 +16,7 @@ def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
     bias = torch.randn(N, device=device, dtype=torch.float16)
 
     try:
-        out_hip = ext.scaled_mm(a, b, scale, bias, with_scale, with_bias, warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
+        out_hip = ext.scaled_mm(a, b, scale, bias, with_scale, with_bias, warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
 
@@ -49,14 +49,14 @@ def main():
     ]
 
     print(f"Testing {len(_CONFIGS)} configs across {len(test_sizes)} matrix sizes\n")
-    print("Config format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)")
+    print("Config format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)")
     print("=" * 80)
 
     failed_configs = []
     passed_configs = []
 
     for cfg in sorted(_CONFIGS):
-        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         block_m = 16 * warps_m * repeat_m
         block_n = 16 * warps_n * repeat_n
         chunk_k = 16 * unroll_k

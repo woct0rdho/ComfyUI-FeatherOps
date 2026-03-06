@@ -68,11 +68,11 @@ def _load_hip_fp8_extension():
 
 
 _FP8_CONFIGS = [
-    (1, 8, 2, 2, 8, 2),
-    (2, 2, 2, 2, 4, 4),
-    (2, 4, 2, 2, 4, 2),
-    (2, 4, 2, 2, 4, 4),
-    (4, 2, 2, 2, 2, 4),
+    (1, 8, 2, 8, 2),
+    (2, 2, 2, 4, 4),
+    (2, 4, 2, 4, 2),
+    (2, 4, 2, 4, 4),
+    (4, 2, 2, 2, 4),
 ]
 _FP8_AUTOTUNE_CACHE = {}
 
@@ -114,7 +114,7 @@ def _select_config_fp8(
     best_ms = None
 
     def run(cfg):
-        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         return ext.scaled_mm_fp8(
             a,
             b_prepacked,
@@ -125,7 +125,6 @@ def _select_config_fp8(
             warps_m,
             warps_n,
             unroll_k,
-            stages,
             repeat_m,
             repeat_n,
         )
@@ -148,8 +147,8 @@ def _select_config_fp8(
             best_cfg = cfg
 
     _FP8_AUTOTUNE_CACHE[key] = best_cfg
-    wm, wn, uk, st, rm, rn = best_cfg
-    print(f"HIP fp8 autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    wm, wn, uk, rm, rn = best_cfg
+    print(f"HIP fp8 autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
@@ -210,7 +209,7 @@ def scaled_mm_hip_fp8(
         has_bias = True
 
     ext = _load_hip_fp8_extension()
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config_fp8(
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = _select_config_fp8(
         a,
         b_prepacked,
         scale,
@@ -230,7 +229,6 @@ def scaled_mm_hip_fp8(
         warps_m,
         warps_n,
         unroll_k,
-        stages,
         repeat_m,
         repeat_n,
     )
