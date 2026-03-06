@@ -71,11 +71,19 @@ def _load_hip_prepacked_extension():
 
 
 _PREPACKED_CONFIGS = [
-    (1, 8, 2, 2, 8, 2),
-    (2, 2, 2, 2, 4, 4),
-    (2, 4, 2, 2, 4, 2),
-    (2, 4, 2, 2, 4, 4),
-    (4, 2, 2, 2, 2, 4),
+    (1, 8, 2, 8, 2),
+    (1, 8, 4, 8, 2),
+    (2, 2, 2, 4, 4),
+    (2, 2, 4, 4, 4),
+    (2, 2, 8, 4, 4),
+    (2, 4, 2, 4, 2),
+    (2, 4, 4, 4, 2),
+    (2, 4, 8, 4, 2),
+    (2, 4, 2, 4, 4),
+    (2, 4, 4, 4, 4),
+    (4, 2, 2, 2, 4),
+    (4, 2, 4, 2, 4),
+    (4, 2, 8, 2, 4),
 ]
 _PREPACKED_AUTOTUNE_CACHE = {}
 
@@ -109,7 +117,16 @@ def _select_config_prepacked(
 
     M, K = a.shape
     N = b_prepacked.shape[1]
-    candidates = [c for c in _PREPACKED_CONFIGS if _config_compatible(c, M, N, K)]
+
+    # We redefine _config_compatible internally without stages
+    def _cfg_compat(cfg, M, N, K):
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
+        block_m = 16 * warps_m * repeat_m
+        block_n = 16 * warps_n * repeat_n
+        chunk_k = 16 * unroll_k
+        return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
+
+    candidates = [c for c in _PREPACKED_CONFIGS if _cfg_compat(c, M, N, K)]
     if not candidates:
         raise RuntimeError(f"No compatible prepacked config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
 
@@ -119,7 +136,7 @@ def _select_config_prepacked(
     best_ms = None
 
     def run(cfg):
-        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         return ext.scaled_mm_prepacked(
             a,
             b_prepacked,
@@ -130,7 +147,6 @@ def _select_config_prepacked(
             warps_m,
             warps_n,
             unroll_k,
-            stages,
             repeat_m,
             repeat_n,
             b_dtype,
@@ -154,9 +170,9 @@ def _select_config_prepacked(
             best_cfg = cfg
 
     _PREPACKED_AUTOTUNE_CACHE[key] = best_cfg
-    wm, wn, uk, st, rm, rn = best_cfg
+    wm, wn, uk, rm, rn = best_cfg
     dtype_str = "fp8e5m2" if b_dtype == 1 else "fp8e4m3"
-    print(f"HIP prepacked autotune M={M} N={N} K={K} dtype={dtype_str} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    print(f"HIP prepacked autotune M={M} N={N} K={K} dtype={dtype_str} warps=({wm},{wn}) unroll_k={uk} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
@@ -224,7 +240,7 @@ def scaled_mm_hip_prepacked(
         has_bias = True
 
     ext = _load_hip_prepacked_extension()
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config_prepacked(
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = _select_config_prepacked(
         a,
         b_prepacked,
         scale,
@@ -245,7 +261,6 @@ def scaled_mm_hip_prepacked(
         warps_m,
         warps_n,
         unroll_k,
-        stages,
         repeat_m,
         repeat_n,
         b_dtype,

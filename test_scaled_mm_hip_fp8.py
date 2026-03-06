@@ -8,7 +8,7 @@ from kernel.naive import scaled_mm_naive
 
 def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
     """Test a specific config and return (pass, error_msg)."""
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float8_e5m2)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e5m2)
@@ -29,7 +29,6 @@ def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
             warps_m,
             warps_n,
             unroll_k,
-            stages,
             repeat_m,
             repeat_n,
         )
@@ -60,7 +59,7 @@ def main():
 
     failed_configs = []
     for cfg in sorted(_FP8_CONFIGS):
-        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         block_m = 16 * warps_m * repeat_m
         block_n = 16 * warps_n * repeat_n
         chunk_k = 16 * unroll_k

@@ -65,7 +65,6 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
 template <int kBlockWarpsM,
           int kBlockWarpsN,
           int kUnrollK,
-          int kStages,
           int kRepeatM,
           int kRepeatN,
           bool kUseFp8E5M2>
@@ -83,9 +82,6 @@ __global__ void scaled_mm_kernel_prepacked_b(
     const int has_scale,
     const int has_bias)
 {
-    static_assert(kStages == 2, "Only kStages=2 is supported");
-    static_assert(kStages >= kUnrollK, "kStages must be >= kUnrollK");
-
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
     static_assert(kBlockM % 16 == 0, "kBlockM must be a multiple of 16 (required by row swizzle)");
@@ -99,7 +95,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     // K0 = kWmmaK / K1 = 16 / 8 = 2
     constexpr int kK0 = kWmmaK / kK1;
     constexpr int kAStrideK1 = kK1;
-    constexpr int kShASize = kStages * kK0 * kBlockM * kAStrideK1;
+    constexpr int kShASize = kUnrollK * kK0 * kBlockM * kAStrideK1;
 
     // B uses KxN layout for efficient vec16 stores during loading
     constexpr int kBPad = 8;
@@ -111,7 +107,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     union SharedStorage {
         struct {
             half a[kShASize];
-            uint8_t b[kStages][kBlockN + kBPad][kWmmaK];
+            uint8_t b[kUnrollK][kBlockN + kBPad][kWmmaK];
         } ab;
         half c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
@@ -291,14 +287,11 @@ __global__ void scaled_mm_kernel_prepacked_b(
     }
     __syncthreads();
 
-    // =========================================================================
-    // Main loop: fixed stage2 schedule (compute current chunk, then refill next chunk).
-    // =========================================================================
+    // Main loop
     for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
         #pragma unroll
         for (int u = 0; u < kUnrollK; ++u) {
-            const int stage = u;
-            wmma_compute_stage(stage);
+            wmma_compute_stage(u);
         }
 
         if (iter_idx + 1 < total_chunks) {
@@ -306,15 +299,13 @@ __global__ void scaled_mm_kernel_prepacked_b(
             asm volatile("s_setprio 1" ::: "memory");
             #pragma unroll
             for (int u = 0; u < kUnrollK; ++u) {
-                const int stage = u;
                 const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                load_a_lds_k0mk1(stage, k);
+                load_a_lds_k0mk1(u, k);
             }
             #pragma unroll
             for (int u = 0; u < kUnrollK; ++u) {
-                const int stage = u;
                 const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                load_b_lds_prepacked(stage, k);
+                load_b_lds_prepacked(u, k);
             }
             asm volatile("s_setprio 0" ::: "memory");
         }
@@ -386,12 +377,11 @@ __global__ void scaled_mm_kernel_prepacked_b(
 } // namespace
 
 // Config tag for kernel (no vec_a/vec_b params - always uses vec8 A, vec16 B)
-template <int M, int N, int U, int STAGES, int RM, int RN>
+template <int M, int N, int U, int RM, int RN>
 struct ConfigTag {
     static constexpr int kBlockWarpsM = M;
     static constexpr int kBlockWarpsN = N;
     static constexpr int kUnrollK = U;
-    static constexpr int kStages = STAGES;
     static constexpr int kRepeatM = RM;
     static constexpr int kRepeatN = RN;
 };
@@ -406,7 +396,6 @@ torch::Tensor scaled_mm_prepacked(
     const int64_t block_warps_m,
     const int64_t block_warps_n,
     const int64_t unroll_k,
-    const int64_t stages,
     const int64_t repeat_m,
     const int64_t repeat_n,
     const int64_t b_dtype)
@@ -441,8 +430,6 @@ torch::Tensor scaled_mm_prepacked(
         TORCH_CHECK(bias.scalar_type() == at::kHalf, "bias must be float16");
     }
 
-    TORCH_CHECK(stages == 2, "Only stages=2 is supported");
-
     auto c = torch::empty({M, N}, a.options().dtype(at::kHalf));
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.data_ptr<at::Half>());
@@ -463,7 +450,6 @@ torch::Tensor scaled_mm_prepacked(
         constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
         constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
         constexpr int kUnrollK = decltype(tag)::kUnrollK;
-        constexpr int kStages = decltype(tag)::kStages;
         constexpr int kRepeatM = decltype(tag)::kRepeatM;
         constexpr int kRepeatN = decltype(tag)::kRepeatN;
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
@@ -487,7 +473,7 @@ torch::Tensor scaled_mm_prepacked(
 
         if (use_fp8_e5m2) {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true>),
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 M, N, K,
@@ -495,7 +481,7 @@ torch::Tensor scaled_mm_prepacked(
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         } else {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false>),
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 M, N, K,
@@ -508,7 +494,6 @@ torch::Tensor scaled_mm_prepacked(
         if (block_warps_m == decltype(tag)::kBlockWarpsM &&
             block_warps_n == decltype(tag)::kBlockWarpsN &&
             unroll_k == decltype(tag)::kUnrollK &&
-            stages == decltype(tag)::kStages &&
             repeat_m == decltype(tag)::kRepeatM &&
             repeat_n == decltype(tag)::kRepeatN) {
             launch(tag);
@@ -518,13 +503,21 @@ torch::Tensor scaled_mm_prepacked(
     };
 
     // Autotune candidate configs
-    // Format: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
+    // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     const bool launched =
-        try_launch(ConfigTag<1, 8, 2, 2, 8, 2>{}) ||
-        try_launch(ConfigTag<2, 2, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 4, 2, 2, 4, 2>{}) ||
-        try_launch(ConfigTag<2, 4, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTag<4, 2, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
+        try_launch(ConfigTag<2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 2, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 2, 8, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 8, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 8, 2, 4>{}) ||
         false;
 
     TORCH_CHECK(launched, "Unsupported config");
@@ -546,7 +539,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("block_warps_m"),
         py::arg("block_warps_n"),
         py::arg("unroll_k"),
-        py::arg("stages"),
         py::arg("repeat_m"),
         py::arg("repeat_n"),
         py::arg("b_dtype"),

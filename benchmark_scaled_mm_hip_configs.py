@@ -64,7 +64,7 @@ def _run_config(
     rep: int,
     warmup: int,
 ) -> float:
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
 
     def run_kernel():
         ext.scaled_mm(
@@ -77,7 +77,6 @@ def _run_config(
             warps_m,
             warps_n,
             unroll_k,
-            stages,
             repeat_m,
             repeat_n,
         )

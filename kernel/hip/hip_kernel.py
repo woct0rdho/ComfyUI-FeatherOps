@@ -85,19 +85,19 @@ def _load_hip_extension():
     return module
 
 
-# Autotune configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
+# Autotune configs: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
 _CONFIGS = [
-    (2, 2, 2, 2, 4, 4),
-    (2, 4, 2, 2, 4, 2),
-    (2, 4, 2, 2, 4, 4),
-    (4, 2, 2, 2, 2, 4),
+    (2, 2, 2, 4, 4),
+    (2, 4, 2, 4, 2),
+    (2, 4, 2, 4, 4),
+    (4, 2, 2, 2, 4),
 ]
 _AUTOTUNE_CACHE = {}
 
 
 def _config_compatible(cfg, M, N, K):
     """Check if a config's tile sizes evenly divide the matrix dimensions."""
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
     block_m = 16 * warps_m * repeat_m
     block_n = 16 * warps_n * repeat_n
     chunk_k = 16 * unroll_k
@@ -110,8 +110,8 @@ def _get_forced_config():
     if not cfg:
         return None
     values = tuple(int(v.strip()) for v in cfg.split(",") if v.strip())
-    if len(values) != 6:
-        raise RuntimeError("HIP_FORCE_CONFIG must contain 6 comma-separated integers: warps_m,warps_n,unroll_k,stages,repeat_m,repeat_n")
+    if len(values) != 5:
+        raise RuntimeError("HIP_FORCE_CONFIG must contain 5 comma-separated integers: warps_m,warps_n,unroll_k,repeat_m,repeat_n")
     return values
 
 
@@ -152,7 +152,7 @@ def _select_config(
     best_ms = None
 
     def run(cfg):
-        warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = cfg
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         return ext.scaled_mm(
             a,
             b,
@@ -163,7 +163,6 @@ def _select_config(
             warps_m,
             warps_n,
             unroll_k,
-            stages,
             repeat_m,
             repeat_n,
         )
@@ -186,8 +185,8 @@ def _select_config(
             best_cfg = cfg
 
     _AUTOTUNE_CACHE[key] = best_cfg
-    wm, wn, uk, st, rm, rn = best_cfg
-    print(f"HIP autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} stages={st} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    wm, wn, uk, rm, rn = best_cfg
+    print(f"HIP autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
@@ -227,7 +226,7 @@ def scaled_mm_hip(
 
     ext = _load_hip_extension()
 
-    warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n = _select_config(
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = _select_config(
         a,
         b,
         scale,
@@ -246,7 +245,6 @@ def scaled_mm_hip(
         warps_m,
         warps_n,
         unroll_k,
-        stages,
         repeat_m,
         repeat_n,
     )

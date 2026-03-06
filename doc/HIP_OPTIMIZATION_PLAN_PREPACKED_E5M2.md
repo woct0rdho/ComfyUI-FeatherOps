@@ -106,6 +106,7 @@ Cycle-accurate Thread Tracing (`--att`) was used to plot execution timelines, re
 | PCS-1/2/3 | KEEP analysis | PC sampling (SQ_IND, Host-Trap, Stochastic) | Consistent 45% LDS, 23% Sync stall distribution | Uncovered `SQ_WAVE_INST` drift issue, confirmed accurate stall breakdown |
 | TT-1 | KEEP analysis | Thread Tracing (ATT) timeline | Found ~3,500 cycle gap between chunks | Proved kernel is global-memory bound on `vmcnt`, plus instruction fetch bottleneck on `v_perm_b32` |
 | P15 | REJECT | hoist `v_perm_b32` literals to VGPRs | `N=8192` regressed ~42.62k | did not fix VOP3 issue latency (VGPR read ports), compiler barrier worsened global memory scheduling (`vmcnt` stalls up 18%) |
+| P16 | KEEP | Chunk Size Expansion (`unroll_k`=4,8) + `stages` cleanup | `N=8192` flat (~43.1k), but HUGE gains on `N=1024..4096` (+15-35%) | verified code has no A/B double buffering (synchronous wait); increasing chunk size drastically reduces frequency of hitting the 3,500-cycle `vmcnt` stall |
 
 ## Do-Not-Repeat (Unless New Preconditions)
 
@@ -119,9 +120,3 @@ Cycle-accurate Thread Tracing (`--att`) was used to plot execution timelines, re
 ## Next Experiments (Thread-Tracing-Informed)
 
 Based on the definitive Thread Tracing evidence, the previous hypothesis of "LDS bank conflicts" is invalid, and the true culprits are global memory starvation and `v_perm_b32` instruction bloat.
-
-### P16: Chunk Size Expansion (K-Dimension)
-
-- **Rationale:** Since stages > 2 is non-viable on gfx1151 due to occupancy loss, we cannot pipeline deeper. To reduce the impact of the ~3,500 cycle `vmcnt` global memory starvation penalty that occurs *between* chunks, we must decrease the *frequency* of these chunk boundaries.
-- **Method:** Increase the `unroll_k` parameter (which dictates the K-chunk size per iteration). If `unroll_k` is increased from 2 to 4 or 8, the inner loop will execute 2x or 4x more WMMA math before hitting the global memory fetch boundary, amortizing the 3,500 cycle stall over a much larger block of compute.
-- **Decision:** Requires increasing LDS allocation per stage. Monitor LDS capacity limits and occupancy. Keep if N=8192 GFLOPS improves.
