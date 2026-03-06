@@ -1,6 +1,6 @@
-# GFX1151 Reference
+# gfx1151 Reference
 
-This file keeps hardware/profiling/runtime facts for this machine.
+This file keeps hardware/runtime/profiling facts for gfx1151 (this machine).
 
 ## Hardware Snapshot
 
@@ -31,13 +31,15 @@ occupancy_per_simd = min(waves_by_vgpr, 16) / 16
 
 Example: `176 VGPR` -> `floor(1536/176)=8 waves` -> `50%` per SIMD.
 
-## WMMA Facts (gfx1151)
+Besides VGPR capacity, occupancy is also bounded by LDS capacity.
+
+## WMMA Facts
 
 - Tile shape: `16x16 @ 16x16`
 - Instruction latency: `32 cycles`
 - Supported families include fp16/bf16 and i8/u8 WMMA variants.
 
-## rocprofv3 Workflow (Known Good)
+## rocprofv3 Workflow
 
 Basic profiling:
 ```bash
@@ -66,40 +68,13 @@ Known pitfalls:
 - JIT and lock-file issues can make profiling look hung.
 - Profile overhead changes wall-time; use benchmark scripts for performance decisions.
 
-## N=8192 Runtime Facts from Existing Artifacts
-
-Data sources:
-- `rocprof_torch_8192_steady/torch8192_steady_results.db`
-- `rocprof_hip_8192/hip8192_results.db`
-- `rocprof_hip_8192_matched/hip8192_matched_results.db`
-
-Measured main kernels:
-
-| Kernel | Avg time (ms) | VGPR | SGPR | LDS (B) | Grid | Workgroup |
-|---|---:|---:|---:|---:|---|---|
-| `torch.compile` GEMM | 40.186 | 256 | 128 | 17408 | (8192, 64) | (128, 1) |
-| HIP (before launch-shape match) | 40.272 | 192 | 128 | 16896 | (4096, 128) | (64, 2) |
-| HIP (after launch-shape match) | 41.082 | 192 | 128 | 16896 | (8192, 64) | (128, 1) |
-
-Occupancy implication for this tile:
-- `128` threads/WG = `4` wave32/WG.
-- LDS-limited WGs/CU:
-  - torch: `floor(65536/17408)=3`
-  - hip: `floor(65536/16896)=3`
-- So both sit at `3 WG/CU = 12 waves/CU = 37.5%` CU wave occupancy.
-
-Conclusion:
-- For this case, occupancy is LDS-limited, not VGPR-limited.
-- Matching launch geometry alone does not close the gap.
-
-## PC Sampling on gfx1151
+## PC Sampling
 
 PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, and ROCProfiler.
 
 ### Running PC Sampling
 
-Use `$ROCM_PATH/bin/rocprofv3` directly (not the venv wrapper, which loads
-stock libraries without gfx11 PC sampling support). Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling.
+Use `$ROCM_PATH/bin/rocprofv3` directly (not the venv wrapper, which loads stock libraries without GFX11 PC sampling support). Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling.
 
 **For Host-Trap (Time-based):**
 ```bash
@@ -185,3 +160,20 @@ When PC sampling is not available (e.g. stock driver), overlap can be
 estimated by controlled mode decomposition (`full`, `no_overlap`,
 `comm_only`, `comp_only`). See experiment P6-A/P6-B in the e5m2
 optimization plan for details.
+
+## Thread Tracing
+
+Thread Tracing captures per-wave instruction execution timelines. It is supported on gfx1151 and does not require a custom kernel (works with mainline driver).
+
+**Running Thread Tracing:**
+```bash
+$ROCM_PATH/bin/rocprofv3 --att -d <output_dir> -o <prefix> -- python <script>.py
+```
+*Note: By default, it only traces the FIRST dispatch of each kernel. If your script loops over the kernel multiple times, only the first one is captured, so you can reduce `N_ITER` to save time.*
+
+**Outputs:**
+- `stats_*.csv`: Aggregated latency, stall, and idle cycle counts for every instruction in the kernel.
+- `*.att`: Raw SQTT binary trace data.
+- `ui_output_agent_*/`: Directory containing `wave_*.json` and `code.json` which map out the exact cycle-by-cycle execution of every wave.
+
+You can load the `.att` file or the `ui_output_agent_*/` directory into the **ROCprof Compute Viewer** to visualize the overlap between memory operations (LDS/Global) and compute (WMMA) on a timeline.

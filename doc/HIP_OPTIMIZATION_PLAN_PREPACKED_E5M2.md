@@ -16,7 +16,7 @@
   - forced `N=8192` does not regress,
   - large-N trend (`4096`, `8192`) does not regress materially.
 
-## Current Baseline Snapshot (2026-02-18)
+## Current Baseline Snapshot
 
 - Correctness:
   - `python test_scaled_mm_hip_prepacked_e5m2.py` -> `5/5` pass.
@@ -35,7 +35,7 @@
 All runs used `rocprofv3 --pc-sampling-method host_trap --pc-sampling-unit time --pc-sampling-interval 5000`.
 See `doc/GFX1151_REFERENCE.md` for PC sampling setup details.
 
-### PCS-1: SQ_IND Approach (Feb 2026)
+### PCS-1: SQ_IND Approach
 
 Two independent runs (ROCm driver, mainline kernel) produced ~572K samples
 each with identical distributions (all categories within +/-0.1pp), confirming
@@ -54,7 +54,7 @@ debug registers, capturing ALL active waves (~480) per scan.
 | Global Load | `global_load_b128` | 5,912 | 1.0 |
 | Global Store | `global_store_b128` | 295 | 0.1 |
 
-### PCS-2: Host-Trap Approach (Mar 2026)
+### PCS-2: Host-Trap Approach
 
 Uses the mainline kernel with CWSR daisy-chain trap handler (SQ_CMD
 BROADCAST+CHECK_VMID). The trap handler captures `ttmp0:1` (the wave's
@@ -289,7 +289,7 @@ The following experiments target the cost centers directly.
   No further gfx1151-specific optimization is warranted unless a new
   algorithmic approach emerges.
 
-### PCS-3: True Stochastic PC Sampling (Mar 2026)
+### PCS-3: True Stochastic PC Sampling
 
 Uses the hardware-driven stochastic timer (`--pc-sampling-method stochastic`, `cycles`, `1048576` interval). The kernel programs the hardware timer, which autonomously counts and fires a `PERF_SNAPSHOT` trap. Captured 827,514 samples.
 
@@ -316,3 +316,27 @@ Uses the hardware-driven stochastic timer (`--pc-sampling-method stochastic`, `c
 2. **Bandwidth Limited:** The kernel remains heavily LDS-bandwidth-bound (LDS Read = ~45%).
 3. **Perfect Overlap:** Double buffering works flawlessly; WMMA and LDS execute concurrently in 99.7% of all 5ms time bins.
 4. **Sample Volume:** Stochastic mode easily delivered 800K+ samples without the CPU-overhead or skid associated with software-issued host traps.
+
+### TT-1: Thread Tracing Baseline
+
+Run with `HIP_FORCE_CONFIG=1,8,2,2,8,2`, extracting instruction latencies and stall cycle counts from the Thread Tracing (`--att`) hardware capability.
+
+Thread Tracing captures the exact cycle states indicating when the pipeline fails to issue an instruction (Stall) and total time inside the pipeline (Latency). The highest-stalling instruction categories:
+
+| Category | Stall Cycles | % of Total Stalls | Top Contributing Instructions |
+|---|---:|---:|---|
+| Sync | 77,061,395 | 49.6% | `s_waitcnt vmcnt(3)` (~35M), `s_waitcnt vmcnt(1)` (~7.6M), `s_waitcnt lgkmcnt(x)` (~5M) |
+| FP Convert | 39,642,173 | 25.5% | `v_perm_b32` (FP8->FP16 emulation) |
+| WMMA | 34,234,533 | 22.0% | `v_wmma_f32_16x16x16_f16` |
+| VALU Other | 2,721,430 | 1.7% | Math/Address generation |
+| SALU | 1,378,651 | 0.8% | Loop/Address scalar math |
+| LDS Read/Write | 137,515 | ~0.1% | `ds_load_b128`, `ds_store_b128` |
+
+**Findings from Thread Trace:**
+1. **Global Memory Latency:** The absolute highest stalling instructions are waiting on global vector loads (`s_waitcnt vmcnt(3)` and `vmcnt(1)`). This definitively proves that despite software pipelining (stages=2), the tile compute phase is finishing *before* the global memory loads for the subsequent tile are fully returned from L2/DRAM. The kernel is **Global Memory Bandwidth/Latency Bound** on the fetch edges.
+2. **VALU Contention:** `v_perm_b32` accounts for ~25% of all stall cycles. Since `gfx1151` lacks native FP8 WMMA instructions, the manual unpacking of e5m2 layout to FP16 places a severe strain on the vector ALU, effectively acting as a massive secondary compute bottleneck inside the inner loop.
+3. **Consistency with PC Sampling:** This perfectly cross-validates with PC Sampling. PC Sampling highlighted that the waves were mostly sitting on `s_waitcnt` (Sync) and `ds_load` limits. Thread Tracing clarifies that the `s_waitcnt` stalls are primarily waiting on `vmcnt` (Global Memory), heavily slowing down the pipeline throughput.
+
+**Actionable Insights:**
+- Software Pipelining (double buffering) is working, but it isn't deep enough to hide the full global memory latency on this hardware (`vmcnt` waits).
+- RDNA 3.5 is taking a heavy penalty performing FP8-to-FP16 unpacking (`v_perm_b32`), creating a dense VALU bubble that limits WMMA throughput.

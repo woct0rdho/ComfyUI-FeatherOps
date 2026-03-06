@@ -190,7 +190,7 @@ E.8 proved waits are already hidden by compiler interleaving (insight #2).
 
 ## Next Steps
 
-### Fresh baseline (2026-02-13)
+### Fresh baseline
 
 Profiled at N=8192, 20 iters. Benchmark: **35,057 GFLOPS** (59.0% of peak).
 
