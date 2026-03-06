@@ -156,7 +156,7 @@ Therefore the tuned path here is not an inductor CK template kernel. It is:
 
 Implication: your HIP design goal (load fp8 to shared/LDS and upcast inside GEMM rather than global pre-convert) directly targets a real overhead in torch.compile’s current path on gfx1151.
 
-## New Findings (2026-02-10): delta vs current HIP kernel
+## New Findings: delta vs current HIP kernel
 
 Compared artifacts:
 

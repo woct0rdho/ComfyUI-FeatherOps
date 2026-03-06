@@ -10,7 +10,7 @@
   - forced `N=8192` does not regress,
   - large-N sweep (`4096/6144/8192`) does not regress materially.
 
-## Current Stable Baseline (2026-02-17)
+## Current Stable Baseline
 
 - Data path kept: prepacked B as fp8 bytes in `[K/16, N, 16]`.
 - Current production winner: `1,8,2,2,8,2` (no-swizzle).

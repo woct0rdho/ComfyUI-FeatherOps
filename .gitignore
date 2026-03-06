@@ -211,5 +211,6 @@ __marimo__/
 /pc_sampling*/
 /profile*/
 /rocprof*/
+/thread_trace*/
 /tmp*/
 /triton*/
