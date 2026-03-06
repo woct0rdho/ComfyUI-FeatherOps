@@ -500,19 +500,26 @@ torch::Tensor scaled_mm_prepacked(
     // Autotune candidate configs
     // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     const bool launched =
+        try_launch(ConfigTag<1, 1, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 2, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 4, 4, 2>{}) ||
         try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
         try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
         try_launch(ConfigTag<2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTag<2, 2, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 2, 8, 4, 4>{}) ||
         try_launch(ConfigTag<2, 4, 2, 4, 2>{}) ||
         try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
-        try_launch(ConfigTag<2, 4, 8, 4, 2>{}) ||
         try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
         try_launch(ConfigTag<2, 4, 4, 4, 4>{}) ||
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
-        try_launch(ConfigTag<4, 2, 8, 2, 4>{}) ||
         false;
 
     TORCH_CHECK(launched, "Unsupported config");
