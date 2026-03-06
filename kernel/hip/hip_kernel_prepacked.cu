@@ -68,7 +68,6 @@ template <int kBlockWarpsM,
           int kStages,
           int kRepeatM,
           int kRepeatN,
-          bool kUseSwizzle,
           bool kUseFp8E5M2>
 __global__ void scaled_mm_kernel_prepacked_b(
     const half* const a,
@@ -205,15 +204,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
             const int col_local = vec_idx;
             const int logical_col = block_n + col_local;
 
-            int packed_col = logical_col;
-            if constexpr (kUseSwizzle) {
-                const int group = logical_col >> 4;
-                const int inner = logical_col & 15;
-                const int swizzled_group = group ^ (ktile & 7);
-                packed_col = (swizzled_group << 4) | inner;
-            }
-
-            const int64_t gidx = ((static_cast<int64_t>(ktile) * N + packed_col) * kWmmaK);
+            const int64_t gidx = ((static_cast<int64_t>(ktile) * N + logical_col) * kWmmaK);
             const uint8_t* const b_src = b_prepacked + gidx;
             uint8_t* const b_dst = &sh.ab.b[stage][col_local][0];
             *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
@@ -496,7 +487,7 @@ torch::Tensor scaled_mm_prepacked(
 
         if (use_fp8_e5m2) {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, true>),
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, true>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 M, N, K,
@@ -504,7 +495,7 @@ torch::Tensor scaled_mm_prepacked(
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         } else {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false, false>),
+                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kStages, kRepeatM, kRepeatN, false>),
                 grid, block, 0, stream.stream(),
                 a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
                 M, N, K,
