@@ -98,16 +98,13 @@ __global__ void scaled_mm_kernel_prepacked_b(
     constexpr int kShASize = kUnrollK * kK0 * kBlockM * kAStrideK1;
 
     // B uses KxN layout for efficient vec16 stores during loading
-    constexpr int kBPad = 8;
-
-    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*24 halfs.
-    constexpr int kCPad = 8;
-    constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
+    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 halfs.
+    constexpr int kCStride = kWmmaN;  // 16 halfs per row
 
     union SharedStorage {
         struct {
             half a[kShASize];
-            uint8_t b[kUnrollK][kBlockN + kBPad][kWmmaK];
+            uint8_t b[kUnrollK][kBlockN][kWmmaK];
         } ab;
         half c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
@@ -315,8 +312,6 @@ __global__ void scaled_mm_kernel_prepacked_b(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        // Reuse sh_a memory for C-shuffle
-        // Each warp gets its own 16x24 buffer (24 = 16 + 8 padding for bank conflicts)
         half* const sh_c = sh.c[wave_id][0];
 
         const half scale_h = has_scale ? scale[0] : __float2half_rn(1.0f);

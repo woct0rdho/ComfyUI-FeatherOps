@@ -59,16 +59,13 @@ __global__ void scaled_mm_kernel_fp8(
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-    constexpr int kAPad = 8;
-    constexpr int kBPad = 8;
-    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*24 halfs.
-    constexpr int kCPad = 8;
-    constexpr int kCStride = kWmmaN + kCPad;  // 24 halfs per row
+    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 halfs.
+    constexpr int kCStride = kWmmaN;  // 16 halfs per row
 
     union SharedStorage {
         struct {
-            uint8_t a[kUnrollK][kBlockM + kAPad][kWmmaK];
-            uint8_t b[kUnrollK][kBlockN + kBPad][kWmmaK];
+            uint8_t a[kUnrollK][kBlockM][kWmmaK];
+            uint8_t b[kUnrollK][kBlockN][kWmmaK];
         } ab;
         half c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
@@ -266,8 +263,6 @@ __global__ void scaled_mm_kernel_fp8(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        // Reuse sh_a memory for C-shuffle
-        // Each warp gets its own 16x24 buffer (24 = 16 + 8 padding for bank conflicts)
         half* const sh_c = sh.c[wave_id][0];
 
         const half scale_h = has_scale ? scale[0] : __float2half_rn(1.0f);
