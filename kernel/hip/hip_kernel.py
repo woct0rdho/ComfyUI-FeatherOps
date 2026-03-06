@@ -86,7 +86,6 @@ def _load_hip_extension():
 
 
 # Autotune configs: (warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n)
-# Keep this list in sync with kernel/hip/hip_kernel.cu::try_launch table.
 _CONFIGS = [
     (2, 2, 2, 2, 4, 4),
     (2, 4, 2, 2, 4, 2),
