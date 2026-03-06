@@ -32,10 +32,10 @@
   - direct B conversion call in-loop (`fp8e4m3fn_to_fp16(b)`)
 - Latest compiler-path status:
   - Step11 non-k B vec2 shared-layout change is currently kept in local Triton (`~/triton` `feather`).
-  - Step12 vec4 follow-up was rejected (no stable KPI gain; backend output effectively unchanged vs Step11).
+  - Step12 vec4 follow-up was rejected (no stable metric gain; backend output effectively unchanged vs Step11).
   - Step13 perPhase/maxPhase follow-up was rejected (no spill, but clear regression); local Triton is reverted to Step11 vec2.
   - Previous failed compiler-path attempts (Step08/Step09) remain reverted.
-- Best current fixed-config KPI (`N=8192`):
+- Best current fixed-config metric (`N=8192`):
   - Triton: `45.028 ms` (`24418.396 GFLOPS`) from repeat run
   - HIP: `30.932 ms` (`35545.538 GFLOPS`) from repeat run
   - Gap: Triton is ~`1.46x` slower in time
@@ -51,7 +51,7 @@
 4. gfx1151 is highly schedule-sensitive.
    - Source rewrites that look simpler can worsen `s_waitcnt` and regress heavily.
 5. Source-level P2 rewrites are near saturation.
-   - Best kept source delta (Step07) gave only a small KPI win with no structural ISA change.
+   - Best kept source delta (Step07) gave only a small metric win with no structural ISA change.
 6. Forced B shared-order override in compiler is currently a do-not-repeat path.
    - On gfx1151 it triggered a spill cliff (`VGPR=256`, scratch traffic, private segment allocation) and severe regression.
 7. Even simplified B shared layout forcing (`vec=1`, `order=[0,1]`) still spills.
@@ -61,7 +61,7 @@
 9. Non-k B-path vectorization can help if order is preserved.
    - Moving B shared layout from `vec=1` to `vec=2` with preserved `order=[1,0]` improved fixed `N=8192` performance without spills.
 10. Increasing non-k B vec width from `2` to `4` is not a reliable next lever for this kernel.
-   - TTGIR changed (`vec=4`) but final AMDGCN binary hash matched Step11 (`vec=2`), and repeat KPI did not beat gate.
+   - TTGIR changed (`vec=4`) but final AMDGCN binary hash matched Step11 (`vec=2`), and repeat metric did not beat gate.
 11. Swizzle phase tuning (`perPhase/maxPhase`) can regress without spills.
    - `vec=2, perPhase=2, maxPhase=8` raised wait pressure and VGPR usage and regressed runtime despite zero scratch/private segment.
 
@@ -88,7 +88,7 @@ Conclusion:
 
 ### Step01 (kept) - fixed baseline
 
-- KPI: Triton `47.820 ms` vs HIP `31.527 ms`.
+- metric: Triton `47.820 ms` vs HIP `31.527 ms`.
 - Profiling: Triton `VGPR=224`, HIP `VGPR=192`.
 - Why it matters: reference point and parity gap definition.
 - Artifacts: `triton_hip_compare_fixed_step01/*`.
@@ -96,42 +96,42 @@ Conclusion:
 ### Step02 (rejected, reverted) - strict fast-path constraints only
 
 - Change: removed modulo/masked behavior aggressively.
-- KPI: regressed to Triton `50.277 ms`.
+- metric: regressed to Triton `50.277 ms`.
 - Key reason: `s_waitcnt` rose (`108 -> 148`) while B-path bottleneck stayed.
 - Artifacts: `triton_hip_compare_fixed_step02/*`.
 
 ### Step03 (kept) - interior/edge split
 
 - Change: interior no modulo; edge masked correctness path.
-- KPI: improved to Triton `47.234 ms`.
+- metric: improved to Triton `47.234 ms`.
 - Why kept: measurable win with stable counters.
 - Artifacts: `triton_hip_compare_fixed_step03/*`.
 
 ### Step04 (kept) - interior-only policy + constrained tests
 
 - Change: removed edge path; enforced constrained inputs; pruned incompatible configs.
-- KPI: near-neutral vs Step03 (`47.266 ms`), still better than Step01.
+- metric: near-neutral vs Step03 (`47.266 ms`), still better than Step01.
 - Notes: early runs hit intermittent KFD/rocprof instability; later runs recovered.
 - Artifacts: `triton_hip_compare_fixed_step05/*`.
 
 ### Step05 (rejected, reverted) - manual K-loop prefetch
 
 - Change: software-pipelined `a_next/b_next` pattern.
-- KPI: catastrophic regression to Triton `163.340 ms`.
+- metric: catastrophic regression to Triton `163.340 ms`.
 - Key reason: `VGPR` hit `256`, `s_waitcnt`/barrier pressure jumped.
 - Artifacts: `triton_hip_compare_fixed_step06/*`.
 
 ### Step06 (rejected, reverted) - remove interior leftovers
 
 - Change: removed `pid>=num_pid` guard and K-tail branch.
-- KPI: regressed to Triton `50.115 ms`.
+- metric: regressed to Triton `50.115 ms`.
 - Key reason: worse scheduling (`s_waitcnt 108 -> 148`, `VGPR 210 -> 215`).
 - Artifacts: `triton_hip_compare_fixed_step07/*`.
 
 ### Step07 (kept) - minimal B conversion rewrite
 
 - Change: use direct `fp8e4m3fn_to_fp16(b)` call in loop; keep control structure.
-- KPI: Triton `47.171 ms` (repeat `47.071 ms`).
+- metric: Triton `47.171 ms` (repeat `47.071 ms`).
 - Profiling: Triton median ~`48.164 ms`; static counters unchanged from Step04.
 - Why kept: small positive fixed-config gain, no counter regression.
 - Artifacts: `triton_hip_compare_fixed_step08/*`.
@@ -139,7 +139,7 @@ Conclusion:
 ### Step08 (rejected, reverted) - compiler-path B shared-order override (gfx1151)
 
 - Change (in `~/triton`): in `LowerLoops.cpp`, for `gfx1151` + WMMA + dot operand B (`opIdx=1`) + fp8 byte-source (`bitWidth=8`), force shared order toward K-contiguous (`repOrder`) when current order is not K-contiguous.
-- KPI (fixed `N=8192`): Triton `183.233 ms` (repeat `184.044 ms`) vs HIP `30.841/30.774 ms`.
+- metric (fixed `N=8192`): Triton `183.233 ms` (repeat `184.044 ms`) vs HIP `30.841/30.774 ms`.
 - Profiling/codegen deltas vs Step07 baseline:
   - Triton profile median `48.164 -> 189.809 ms`.
   - `VGPR: 216 -> 256` (rocprof kernel metadata), `private_segment_fixed_size: 0 -> 596`.
@@ -152,7 +152,7 @@ Conclusion:
 ### Step09 (rejected, reverted) - compiler-path simple B shared layout (gfx1151)
 
 - Change (in `~/triton`): in `LowerLoops.cpp` dot-operand path for `gfx1151` WMMA B fp8 (`opIdx=1`, `bitWidth=8`), bypass composed swizzle and force simple shared encoding with `vec=1, perPhase=1, maxPhase=1, order=repOrder`.
-- KPI (fixed `N=8192`): Triton `93.505 ms` (repeat `93.640 ms`) vs HIP `30.675/30.836 ms`.
+- metric (fixed `N=8192`): Triton `93.505 ms` (repeat `93.640 ms`) vs HIP `30.675/30.836 ms`.
 - Profiling/codegen deltas vs Step07 baseline:
   - Triton profile median `48.164 -> 94.143 ms`.
   - `VGPR: 216 -> 256`; scratch/private segment still present (`scratch_size=128`, private segment fixed size `128`).
@@ -165,7 +165,7 @@ Conclusion:
 ### Step10 (rejected) - N8192-only env trial `AMDGCN_USE_BUFFER_OPS=0`
 
 - Change: disable Triton AMD buffer ops to move generated memory ops closer to HIP-style globals.
-- KPI (fixed `N=8192`): Triton `104.486 ms` (repeat `104.529 ms`) vs HIP `30.670/30.544 ms`.
+- metric (fixed `N=8192`): Triton `104.486 ms` (repeat `104.529 ms`) vs HIP `30.670/30.544 ms`.
 - Profiling/codegen deltas vs Step07 baseline:
   - Triton profile median `48.164 -> 107.994 ms`.
   - `VGPR: 216 -> 256` (rocprof metadata), scratch/private segment enabled (`scratch_size=580`, private segment fixed size `580`).
@@ -177,31 +177,31 @@ Conclusion:
 ### Step11 (kept) - compiler-path non-k B vec2 shared layout (gfx1151)
 
 - Change (in `~/triton` `LowerLoops.cpp`): for gfx1151 WMMA B fp8 byte-source (`opIdx=1`, `bitWidth=8`) in non-k-contig shared order path, force swizzled-shared encoding to `vec=2, perPhase=1, maxPhase=1`, preserving order (`[1,0]` for this kernel).
-- KPI (fixed `N=8192`): Triton `45.113 ms` (repeat `45.028 ms`) vs HIP `30.651/30.932 ms`.
+- metric (fixed `N=8192`): Triton `45.113 ms` (repeat `45.028 ms`) vs HIP `30.651/30.932 ms`.
 - Profiling/codegen deltas vs Step07 baseline:
   - Triton profile median `48.164 -> 46.532 ms`.
   - No spill regression: `VGPR=216`, `scratch_size=0`, private segment fixed size `0`.
   - TTGIR B shared layout changed `#shared1 vec=1 order=[1,0] -> vec=2 order=[1,0]`.
   - Static counters changed (`v_perm_b32 128 -> 188`, `s_waitcnt 108 -> 117`) but runtime still improved.
-- Keep reason: first compiler-path variant that improves fixed KPI while preserving no-spill guardrails.
+- Keep reason: first compiler-path variant that improves fixed metric while preserving no-spill guardrails.
 - Artifacts: `triton_hip_compare_fixed_step12/*`.
 
 ### Step12 (rejected, reverted) - compiler-path non-k B vec4 follow-up (gfx1151)
 
 - Change (in `~/triton` `LowerLoops.cpp`): for the same Step11-matched path (`gfx1151`, WMMA, B operand fp8 byte-source, non-k-contig order), set swizzled-shared encoding to `vec=4, perPhase=1, maxPhase=1`, preserving order.
-- KPI (fixed `N=8192`): Triton `44.997 ms` (repeat `45.125 ms`) vs HIP `30.961/30.842 ms`.
+- metric (fixed `N=8192`): Triton `44.997 ms` (repeat `45.125 ms`) vs HIP `30.961/30.842 ms`.
 - Profiling/codegen deltas vs Step11 baseline:
   - Triton profile median `46.532 -> 46.619 ms` (neutral/slightly worse).
   - No spill regression: rocprof `VGPR=216`, private segment fixed size `0`.
   - TTGIR changed (`#shared1 vec=2 -> vec=4`), but final AMDGCN hash was identical to Step11 (`f2ef3faf7b0a29ed96044ffbf7f3f3e551b03a492ab5f75338d8ab02a59dcdb6`), with unchanged static counters (`v_perm_b32=188`, `s_waitcnt=117`).
-- Reject reason: no stable KPI improvement and no backend codegen delta worth keeping.
+- Reject reason: no stable metric improvement and no backend codegen delta worth keeping.
 - Action taken: reverted local Triton back to Step11 vec2 setting, rebuilt wheel, reinstalled local Triton.
 - Artifacts: `triton_hip_compare_fixed_step13/*`.
 
 ### Step13 (rejected, reverted) - compiler-path non-k B swizzle-phase tuning (gfx1151)
 
 - Change (in `~/triton` `LowerLoops.cpp`): keep Step11 `vec=2` preserved-order path, but change swizzled-shared params to `perPhase=2, maxPhase=8` for the same non-k B path.
-- KPI (fixed `N=8192`): Triton `48.767 ms` (repeat `48.895 ms`) vs HIP `30.872/30.679 ms`.
+- metric (fixed `N=8192`): Triton `48.767 ms` (repeat `48.895 ms`) vs HIP `30.872/30.679 ms`.
 - Profiling/codegen deltas vs Step11 baseline:
   - Triton profile median `46.532 -> 50.457 ms`.
   - No spill regression: private segment fixed size `0`, scratch disabled; but rocprof `VGPR` increased `216 -> 224`.
@@ -264,7 +264,7 @@ Conclusion:
 - [x] Validate/reject vec4 follow-up around Step11 baseline.
 - [x] Validate/reject swizzle-phase (`perPhase/maxPhase`) follow-up around Step11 baseline.
 - [ ] Reduce B operand permute/wait pressure via compiler changes.
-- [x] Beat Step07 fixed-config KPI while preserving correctness.
+- [x] Beat Step07 fixed-config metric while preserving correctness.
 
 ## Next Plan (Step14: HIP-parity-oriented compiler follow-up)
 
@@ -279,4 +279,4 @@ Conclusion:
    - target B conversion/permute lowering in compiler passes (e.g., `OptimizeDotOperands`) while preserving Step11 shared-order behavior,
    - reduce wait-heavy scheduling side effects in non-k B operand lowering without increasing VGPR.
 7. Rerun fixed protocol for each new compiler change and gate on beating Step11 (`45.028 ms`) without correctness regression.
-8. If no guarded compiler variant improves KPI, document an upstream follow-up item with minimal repro and side-by-side Triton/HIP codegen evidence.
+8. If no guarded compiler variant improves metric, document an upstream follow-up item with minimal repro and side-by-side Triton/HIP codegen evidence.
