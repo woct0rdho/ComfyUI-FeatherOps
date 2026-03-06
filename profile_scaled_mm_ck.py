@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+
 import torch
 
 from kernel.ck.ck_kernel import scaled_mm_ck

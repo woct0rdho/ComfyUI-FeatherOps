@@ -2,7 +2,7 @@
 
 import torch
 
-from kernel.hip.hip_kernel import _load_hip_extension, _CONFIGS
+from kernel.hip.hip_kernel import _CONFIGS, _load_hip_extension
 from kernel.naive import scaled_mm_naive
 
 

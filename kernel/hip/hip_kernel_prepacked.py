@@ -1,11 +1,11 @@
+import functools
 import os
 import time
-import functools
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load, _import_module_from_library
+from torch.utils.cpp_extension import _import_module_from_library, load
 
 from .hip_kernel import _config_compatible, _get_forced_config, get_rocm_lib_dirs
 
