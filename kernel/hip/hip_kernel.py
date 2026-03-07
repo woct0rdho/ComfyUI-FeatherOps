@@ -48,9 +48,6 @@ def _load_hip_extension():
 
     includes = []
 
-    # rocwmma_root = os.path.expanduser("~/rocm-libraries/projects/rocwmma")
-    # includes.append(os.path.join(rocwmma_root, "library", "include"))
-
     try:
         import _rocm_sdk_core
 

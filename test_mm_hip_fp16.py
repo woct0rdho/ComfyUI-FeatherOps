@@ -2,41 +2,36 @@
 
 import torch
 
-from kernel.hip.hip_kernel_prepacked import _PREPACKED_CONFIGS, _load_hip_prepacked_extension, prepack_b_for_scaled_mm_hip
+from kernel.hip.hip_kernel_fp16 import _FP16_CONFIGS, _load_hip_fp16_extension, prepack_b_for_mm_fp16
 from kernel.naive import scaled_mm_naive
 
 
-def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
-    """Test a specific config and return (pass, error_msg)."""
+def test_config(ext, cfg, M, N, K, device):
     warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
 
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
-    b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
-    scale = torch.tensor(2.34, device=device, dtype=torch.float16)
+    b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float16)
     bias = torch.randn(N, device=device, dtype=torch.float16)
 
-    b_prepacked = prepack_b_for_scaled_mm_hip(b)
+    b_prepacked = prepack_b_for_mm_fp16(b)
 
     try:
-        out_hip = ext.scaled_mm_prepacked(
+        out_hip = ext.mm_fp16(
             a,
             b_prepacked,
-            scale,
             bias,
-            with_scale,
-            with_bias,
+            True,
             warps_m,
             warps_n,
             unroll_k,
             repeat_m,
             repeat_n,
-            0,  # b_dtype=0 for fp8e4m3fn
         )
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
 
     # Compute reference
-    out_ref = scaled_mm_naive(a, b, scale if with_scale else None, bias if with_bias else None, torch.float16)
+    out_ref = scaled_mm_naive(a, b, None, bias, torch.float16)
 
     # Compare
     diff = (out_hip.float() - out_ref.float()).abs()
@@ -52,7 +47,7 @@ def test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True):
 
 def main():
     device = "cuda"
-    ext = _load_hip_prepacked_extension()
+    ext = _load_hip_fp16_extension()
 
     # Test matrix sizes - must be divisible by tile sizes for contiguous fast path.
     test_sizes = [
@@ -62,14 +57,14 @@ def main():
         (512, 512, 512),
     ]
 
-    print(f"Testing {len(_PREPACKED_CONFIGS)} configs across {len(test_sizes)} matrix sizes\n")
+    print(f"Testing fp16 prepacked HIP kernel ({len(_FP16_CONFIGS)} configs across {len(test_sizes)} matrix sizes)\n")
     print("Config format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)")
     print("=" * 80)
 
     failed_configs = []
     passed_configs = []
 
-    for cfg in sorted(_PREPACKED_CONFIGS):
+    for cfg in sorted(_FP16_CONFIGS):
         warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         block_m = 16 * warps_m * repeat_m
         block_n = 16 * warps_n * repeat_n
@@ -83,7 +78,7 @@ def main():
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
 
-            passed, msg = test_config(ext, cfg, M, N, K, device, with_scale=True, with_bias=True)
+            passed, msg = test_config(ext, cfg, M, N, K, device)
             if not passed:
                 config_passed = False
                 config_errors.append(f"  M={M} N={N} K={K}: {msg}")
@@ -98,7 +93,7 @@ def main():
             passed_configs.append(cfg)
 
     print("=" * 80)
-    print(f"\nSummary: {len(passed_configs)}/{len(_PREPACKED_CONFIGS)} configs passed")
+    print(f"\nSummary: {len(passed_configs)}/{len(_FP16_CONFIGS)} configs passed")
 
     if failed_configs:
         print(f"\nFailed configs ({len(failed_configs)}):")
