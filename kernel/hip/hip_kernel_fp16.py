@@ -11,13 +11,13 @@ from .hip_kernel import _config_compatible, _get_forced_config, get_rocm_lib_dir
 
 
 @functools.cache
-def _load_hip_fp8_extension():
+def _load_hip_fp16_extension():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
-    name = "scaled_mm_hip_fp8_ext"
+    name = "mm_hip_fp16_ext"
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
 
-    source_file = os.path.join(cur_dir, "hip_kernel_fp8.cu")
+    source_file = os.path.join(cur_dir, "hip_kernel_fp16.cu")
     ninja_log = os.path.join(build_dir, ".ninja_log")
     should_rebuild = False
 
@@ -67,22 +67,35 @@ def _load_hip_fp8_extension():
     return module
 
 
-_FP8_CONFIGS = [
+_FP16_CONFIGS = [
+    (1, 1, 2, 2, 2),
+    (1, 1, 4, 2, 2),
+    (1, 1, 2, 4, 4),
+    (1, 1, 4, 4, 4),
+    (1, 2, 2, 2, 2),
+    (1, 2, 4, 2, 2),
+    (2, 1, 2, 2, 2),
+    (2, 1, 4, 2, 2),
+    (1, 4, 2, 4, 2),
+    (1, 4, 4, 4, 2),
     (1, 8, 2, 8, 2),
+    (1, 8, 4, 8, 2),
     (2, 2, 2, 4, 4),
+    (2, 2, 4, 4, 4),
     (2, 4, 2, 4, 2),
+    (2, 4, 4, 4, 2),
     (2, 4, 2, 4, 4),
+    (2, 4, 4, 4, 4),
     (4, 2, 2, 2, 4),
+    (4, 2, 4, 2, 4),
 ]
-_FP8_AUTOTUNE_CACHE = {}
+_FP16_AUTOTUNE_CACHE = {}
 
 
-def _select_config_fp8(
+def _select_config_fp16(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    scale: torch.Tensor,
     bias: torch.Tensor,
-    has_scale: bool,
     has_bias: bool,
     ext,
 ):
@@ -95,18 +108,18 @@ def _select_config_fp8(
         tuple(b_prepacked.shape),
         tuple(a.stride()),
         tuple(b_prepacked.stride()),
-        has_scale,
         has_bias,
     )
-    cached = _FP8_AUTOTUNE_CACHE.get(key)
+    cached = _FP16_AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
 
     M, K = a.shape
     N = b_prepacked.shape[1]
-    candidates = [c for c in _FP8_CONFIGS if _config_compatible(c, M, N, K)]
+
+    candidates = [c for c in _FP16_CONFIGS if _config_compatible(c, M, N, K)]
     if not candidates:
-        raise RuntimeError(f"No compatible fp8 config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
+        raise RuntimeError(f"No compatible fp16 config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
 
     warmup_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_WARMUP", "1")))
     bench_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_ITERS", "10")))
@@ -115,12 +128,10 @@ def _select_config_fp8(
 
     def run(cfg):
         warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
-        return ext.scaled_mm_fp8(
+        return ext.mm_fp16(
             a,
             b_prepacked,
-            scale,
             bias,
-            has_scale,
             has_bias,
             warps_m,
             warps_n,
@@ -146,16 +157,16 @@ def _select_config_fp8(
             best_ms = ms
             best_cfg = cfg
 
-    _FP8_AUTOTUNE_CACHE[key] = best_cfg
+    _FP16_AUTOTUNE_CACHE[key] = best_cfg
     wm, wn, uk, rm, rn = best_cfg
-    print(f"HIP fp8 autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} repeat=({rm},{rn}) time={best_ms:.3f} ms")
+    print(f"HIP fp16 autotune M={M} N={N} K={K} warps=({wm},{wn}) unroll_k={uk} repeat=({rm},{rn}) time={best_ms:.3f} ms")
     return best_cfg
 
 
-def prepack_b_for_scaled_mm_hip_fp8(b: torch.Tensor) -> torch.Tensor:
+def prepack_b_for_mm_fp16(b: torch.Tensor) -> torch.Tensor:
     assert b.is_cuda
     assert b.ndim == 2
-    assert b.dtype == torch.float8_e5m2
+    assert b.dtype == torch.float16
 
     K, N = b.shape
     if K % 16 != 0:
@@ -168,35 +179,24 @@ def prepack_b_for_scaled_mm_hip_fp8(b: torch.Tensor) -> torch.Tensor:
     return packed
 
 
-def scaled_mm_hip_fp8(
+def mm_fp16_prepacked(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Scaled matmul path using A fp8e5m2 and prepacked B layout [K/16, N, 16] fp8e5m2."""
     assert a.is_cuda
     assert b_prepacked.device == a.device
     assert a.ndim == 2
     assert b_prepacked.ndim == 3
-    assert a.dtype == torch.float8_e5m2
-    assert b_prepacked.dtype == torch.float8_e5m2
+    assert a.dtype == torch.float16
+    assert b_prepacked.dtype == torch.float16
     assert out_dtype == torch.float16
 
     M, K = a.shape
     K_tiles, N, kfrag = b_prepacked.shape
     assert kfrag == 16
     assert K_tiles * 16 == K
-
-    if scale is None:
-        scale = torch.empty(0, device=a.device, dtype=out_dtype)
-        has_scale = False
-    else:
-        assert scale.device == a.device
-        assert scale.numel() == 1
-        scale = scale.to(out_dtype)
-        has_scale = True
 
     if bias is None:
         bias = torch.empty(0, device=a.device, dtype=out_dtype)
@@ -207,23 +207,19 @@ def scaled_mm_hip_fp8(
         bias = bias.to(out_dtype)
         has_bias = True
 
-    ext = _load_hip_fp8_extension()
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = _select_config_fp8(
+    ext = _load_hip_fp16_extension()
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n = _select_config_fp16(
         a,
         b_prepacked,
-        scale,
         bias,
-        has_scale,
         has_bias,
         ext,
     )
 
-    return ext.scaled_mm_fp8(
+    return ext.mm_fp16(
         a,
         b_prepacked,
-        scale,
         bias,
-        has_scale,
         has_bias,
         warps_m,
         warps_n,

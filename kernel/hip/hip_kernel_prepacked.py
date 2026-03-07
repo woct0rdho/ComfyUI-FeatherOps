@@ -33,9 +33,6 @@ def _load_hip_prepacked_extension():
 
     includes = []
 
-    # rocwmma_root = os.path.expanduser("~/rocm-libraries/projects/rocwmma")
-    # includes.append(os.path.join(rocwmma_root, "library", "include"))
-
     try:
         import _rocm_sdk_core
 
@@ -125,15 +122,7 @@ def _select_config_prepacked(
     M, K = a.shape
     N = b_prepacked.shape[1]
 
-    # We redefine _config_compatible internally without stages
-    def _cfg_compat(cfg, M, N, K):
-        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
-        block_m = 16 * warps_m * repeat_m
-        block_n = 16 * warps_n * repeat_n
-        chunk_k = 16 * unroll_k
-        return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
-
-    candidates = [c for c in _PREPACKED_CONFIGS if _cfg_compat(c, M, N, K)]
+    candidates = [c for c in _PREPACKED_CONFIGS if _config_compatible(c, M, N, K)]
     if not candidates:
         raise RuntimeError(f"No compatible prepacked config for M={M} N={N} K={K}. Dimensions must be divisible by tile sizes.")
 
@@ -214,7 +203,6 @@ def scaled_mm_hip_prepacked(
     assert a.dtype == torch.float16
     assert b_prepacked.dtype in {torch.float8_e4m3fn, torch.float8_e5m2}
     assert out_dtype == torch.float16
-    assert b_prepacked.shape[2] == 16
 
     if b_prepacked.dtype == torch.float8_e4m3fn:
         b_dtype = 0

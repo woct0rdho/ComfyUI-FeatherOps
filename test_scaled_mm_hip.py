@@ -40,7 +40,6 @@ def main():
     ext = _load_hip_extension()
 
     # Test matrix sizes - must be divisible by tile sizes for contiguous fast path.
-    # Max block_m=128, max block_n=256, chunk_k=32 across all configs.
     test_sizes = [
         (128, 128, 128),
         (256, 256, 256),
