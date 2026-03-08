@@ -202,15 +202,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-*.csv
-*.db
 *.hip
-*.html
-*.png
-/.rocprof*/
-/pc_sampling*/
-/profile*/
-/rocprof*/
-/thread_trace*/
-/tmp*/
-/triton*/
+/.rocprofv3/
