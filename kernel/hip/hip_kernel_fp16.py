@@ -1,70 +1,17 @@
 import functools
 import os
 import time
-from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import _import_module_from_library, load
 
-from .hip_kernel import _config_compatible, _get_forced_config, get_rocm_lib_dirs
+from .utils import _config_compatible, _get_forced_config, load_hip_extension
 
 
 @functools.cache
 def _load_hip_fp16_extension():
     cur_dir = os.path.dirname(os.path.abspath(__file__))
-    name = "mm_hip_fp16_ext"
-    build_dir = os.path.join(cur_dir, "build", name)
-    os.makedirs(build_dir, exist_ok=True)
-
-    source_file = os.path.join(cur_dir, "hip_kernel_fp16.cu")
-    ninja_log = os.path.join(build_dir, ".ninja_log")
-    should_rebuild = False
-
-    if os.path.exists(source_file) and os.path.exists(ninja_log):
-        if os.path.getmtime(source_file) > os.path.getmtime(ninja_log):
-            should_rebuild = True
-
-    if not should_rebuild:
-        try:
-            return _import_module_from_library(name, build_dir, is_python_module=True)
-        except ImportError:
-            pass
-
-    includes = []
-
-    try:
-        import _rocm_sdk_core
-
-        rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
-        if os.path.exists(rocm_sdk_inc):
-            includes.append(rocm_sdk_inc)
-    except ImportError:
-        pass
-
-    extra_ldflags = []
-    for lib_dir in dict.fromkeys(get_rocm_lib_dirs()):
-        extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
-
-    module = load(
-        name=name,
-        sources=[source_file],
-        extra_cflags=["-O3", "--std=c++20"],
-        extra_cuda_cflags=[
-            "-O3",
-            "--std=c++20",
-            "-U__HIP_NO_HALF_OPERATORS__",
-            "-U__HIP_NO_HALF_CONVERSIONS__",
-            "-U__HIP_NO_HALF2_OPERATORS__",
-        ],
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=includes,
-        build_directory=build_dir,
-        with_cuda=True,
-        verbose=False,
-    )
-    Path(ninja_log).touch(exist_ok=True)
-    return module
+    return load_hip_extension("mm_hip_fp16_ext", cur_dir, "hip_kernel_fp16.cu")
 
 
 _FP16_CONFIGS = [
