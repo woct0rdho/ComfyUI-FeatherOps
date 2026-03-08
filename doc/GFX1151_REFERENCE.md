@@ -141,7 +141,7 @@ FROM rocpd_pc_sampling GROUP BY instruction ORDER BY cnt DESC LIMIT 20;
 
 ### Typical Sample Counts
 
-At `--pc-sampling-interval 5000` with 200 iterations of an N=8192 GEMM
+At `--pc-sampling-interval 5000` with 200 iterations of an N=8192 matmul
 (~7s wall time):
 - Old SQ_IND driver: ~570K samples (reads all active waves per scan)
 - Host-trap driver (mainline): ~10K samples (traps one wave per SIMD/slot per SQ_CMD)
@@ -169,11 +169,20 @@ Thread Tracing captures per-wave instruction execution timelines. It is supporte
 ```bash
 $ROCM_PATH/bin/rocprofv3 --att -d <output_dir> -o <prefix> -- python <script>.py
 ```
-*Note: By default, it only traces the FIRST dispatch of each kernel. If your script loops over the kernel multiple times, only the first one is captured, so you can reduce `N_ITER` to save time.*
+*Note: By default, it only traces the FIRST dispatch of each kernel. If your script loops over the kernel multiple times, only the first one is captured, so you can reduce `N_ITER` to save time. If the target kernel is not the first dispatch (e.g. initialization/random generation kernels run first), check `ui_output_agent_*/code.json` in each directory to find the target kernel trace.*
 
 **Outputs:**
 - `stats_*.csv`: Aggregated latency, stall, and idle cycle counts for every instruction in the kernel.
 - `*.att`: Raw SQTT binary trace data.
 - `ui_output_agent_*/`: Directory containing `wave_*.json` and `code.json` which map out the exact cycle-by-cycle execution of every wave.
 
+### Analyzing Thread Trace Data
+
 You can load the `.att` file or the `ui_output_agent_*/` directory into the **ROCprof Compute Viewer** to visualize the overlap between memory operations (LDS/Global) and compute (WMMA) on a timeline.
+
+Alternatively, you can write python scripts using `matplotlib` and `pandas` to programmatically plot the timeline directly from the `wave_*.json` and `code.json` pairs.
+
+**Important Pitfalls to Remember:**
+1. **Single-Wave Perspective:** A trace timeline only plots the execution of *one specific wave* on *one specific SIMD*. If you see a massive `Sync` stall (e.g. `s_waitcnt vmcnt`), that single wave is indeed completely stalled.
+2. **Macro-Level Hiding:** Do not confuse a single-wave stall with global GPU starvation. Even if the traced wave shows it is stalled 50% of the time, the *overall* GPU TFLOPS might be hitting 75%+ of theoretical max. This indicates the massive `Sync` blocks are being successfully hidden by the hardware's macro-level scheduler staggering the memory requests across the other 79 SIMDs on the chip.
+3. **Internal Bottleneck:** To find the true *internal* kernel bottleneck, calculate the ratio of instructions executed *within the active math loop phase* (ignoring the global wait stalls).

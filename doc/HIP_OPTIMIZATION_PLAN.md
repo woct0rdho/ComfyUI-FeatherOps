@@ -1,8 +1,8 @@
-# HIP GEMM Kernel Optimization Plan
+# HIP Matmul Kernel Optimization Plan
 
 ## Target
 
-Kernel: `scaled_mm_kernel` - fp8xfp16 mixed-precision GEMM on RDNA 3.5 (gfx1151).
+Kernel: `scaled_mm_kernel` - fp8xfp16 mixed-precision matmul on RDNA 3.5 (gfx1151).
 Best config: `(2,4,2,2,4,4)` -> BlockM=128, BlockN=256, 256 threads, VGPR=189, SGPR=105, LDS=25088.
 Peak: 40 CUs x 2 SIMD/CU x 32 ALUs/SIMD x 2 (VOPD/WMMA) x 2 (fp16 pack) x 2 (FMA) x 2.9 GHz = **59.4 TFLOPS**.
 No native fp8 conversion instructions on gfx1151.
