@@ -108,7 +108,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
     const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
-        return row_phys; // Disable swizzle for now to test correctness
+        return row_phys; // TODO: Check whether we need A swizzle
     };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
@@ -146,9 +146,6 @@ __global__ void mm_kernel_fp16_prepacked_b(
     // Loading B: K0xNxK1 layout
     constexpr int kBVecs = kK0 * kBlockN;
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
-    const auto b_row_phys_to_logi = [&](const int col_phys) -> int {
-        return col_phys; // Disable swizzle for now to test correctness
-    };
     const auto sh_b_row_ptr = [&](const int stage, const int k0, const int n) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockN + n) * kBStrideK1);
         return &sh.ab.b[idx];
@@ -160,19 +157,17 @@ __global__ void mm_kernel_fp16_prepacked_b(
             const int vec_idx = tid + v * kThreads;
             if (vec_idx >= kBVecs) continue;
 
-            // Decode vec_idx to [k0][n_phys].
             const int k0 = vec_idx / kBlockN;
             const int n_phys = vec_idx % kBlockN;
-            const int n_logi = b_row_phys_to_logi(n_phys);
 
             const int64_t ktile = kk / kWmmaK;
-            const int64_t n_col = block_n + n_logi;
+            const int64_t n_col_phys = block_n + n_phys; // Use physical col directly since data is pre-swizzled
+
             half* const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
 
-            // The python prepack permuted b from [K, N] to [K/16, N, 16]
-            // where the last dimension is the 16 elements of the K-tile.
-            // gidx = (ktile * N + n_col) * 16 + k0 * 8;
-            const int64_t gidx = (ktile * N + n_col) * kWmmaK + k0 * kK1;
+            // The python prepack permuted b to [K/16, 2, N, 8].
+            // This layout ensures adjacent n_col_phys access adjacent 8-element (uint4) chunks.
+            const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_col_phys * 8;
             const half* const b_src = b_prepacked + gidx;
 
             *reinterpret_cast<uint4*>(sh_b_dst) = *reinterpret_cast<const uint4*>(b_src);
@@ -199,11 +194,15 @@ __global__ void mm_kernel_fp16_prepacked_b(
         #pragma unroll
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
-            const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+            const int n_logi = tile_n * kWmmaN + lane_in_subgroup;
+
+            // Map logical col back to the physical row where it was stored
+            const int n_phys = (n_logi & ~15) | c_row_logi_to_phys_16(n_logi & 15);
+
             _Float16 reg_b_fp16[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
-                const half* const sh_b_src = sh_b_row_ptr(stage, k0, n_col);
+                const half* const sh_b_src = sh_b_row_ptr(stage, k0, n_phys);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
                     reg_b_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_b_src[k1]);
@@ -262,6 +261,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
         for (int u = 0; u < kUnrollK; ++u) {
             wmma_compute_stage(u);
         }
+        __syncthreads();
 
         if (iter_idx + 1 < total_chunks) {
             const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
@@ -277,8 +277,8 @@ __global__ void mm_kernel_fp16_prepacked_b(
                 load_b_lds_k0nk1(u, k);
             }
             asm volatile("s_setprio 0" ::: "memory");
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
@@ -303,7 +303,10 @@ __global__ void mm_kernel_fp16_prepacked_b(
                 const int col = lane_in_subgroup;
                 #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                    const int row_logi = subgroup * 8 + acc_idx;
+                    // v_wmma_f32_16x16x16_f16_w32 layout:
+                    // subgroup 0 (lanes 0-15) holds even rows: 0, 2, 4, 6, 8, 10, 12, 14
+                    // subgroup 1 (lanes 16-31) holds odd rows: 1, 3, 5, 7, 9, 11, 13, 15
+                    const int row_logi = acc_idx * 2 + subgroup;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     sh_c[row_phys * kCStride + col] = val;
@@ -315,6 +318,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
                 // Step 2: Read from LDS in row-major order for coalesced global write
                 // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
                 const int read_row = lane / 2;
+                const int read_row_phys = c_row_logi_to_phys_16(read_row);
                 const int col_half = lane % 2;
                 const int read_col_base = col_half * 8;
 
@@ -322,7 +326,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
                 const int64_t out_col = tile_n_base + read_col_base;
 
                 half* const out_ptr = c + out_row * stride_cm + out_col;
-                half* const h = sh_c + read_row * kCStride + read_col_base;
+                half* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
                     #pragma unroll
@@ -365,19 +369,20 @@ torch::Tensor mm_fp16(
     TORCH_CHECK(a.scalar_type() == at::kHalf, "a must be float16");
     TORCH_CHECK(b_prepacked.scalar_type() == at::kHalf, "b_prepacked must be float16");
     TORCH_CHECK(a.dim() == 2, "a must be 2D");
-    TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
+    TORCH_CHECK(b_prepacked.dim() == 4, "b_prepacked must be 4D [K/16, 2, N, 8]");
 
     const int64_t M = a.size(0);
     const int64_t K = a.size(1);
-    const int64_t N = b_prepacked.size(1);
+    const int64_t N = b_prepacked.size(2);
     TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
     TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK,
         "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
-    TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
+    TORCH_CHECK(b_prepacked.size(1) == 2, "b_prepacked.shape[1] must be 2");
+    TORCH_CHECK(b_prepacked.size(3) == 8, "b_prepacked.shape[3] must be 8");
 
     // Contiguous fast path requirements
     TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
-    TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
+    TORCH_CHECK(b_prepacked.stride(3) == 1, "b_prepacked last dim must be contiguous");
 
     if (has_bias) {
         TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
@@ -448,25 +453,33 @@ torch::Tensor mm_fp16(
     // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     const bool launched =
         try_launch(ConfigTag<1, 1, 2, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
         try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
         try_launch(ConfigTag<1, 1, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 1, 8, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 8, 4, 4>{}) ||
         try_launch(ConfigTag<1, 2, 2, 2, 2>{}) ||
         try_launch(ConfigTag<1, 2, 4, 2, 2>{}) ||
-        try_launch(ConfigTag<2, 1, 2, 2, 2>{}) ||
-        try_launch(ConfigTag<2, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 8, 2, 2>{}) ||
         try_launch(ConfigTag<1, 4, 2, 4, 2>{}) ||
         try_launch(ConfigTag<1, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 8, 4, 2>{}) ||
         try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
         try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 8, 2, 2>{}) ||
         try_launch(ConfigTag<2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTag<2, 2, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 2, 8, 4, 4>{}) ||
         try_launch(ConfigTag<2, 4, 2, 4, 2>{}) ||
-        try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
         try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
         try_launch(ConfigTag<2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 8, 4, 2>{}) ||
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 8, 2, 4>{}) ||
         false;
 
     TORCH_CHECK(launched, "Unsupported config");
