@@ -32,12 +32,12 @@ __device__ __forceinline__ void fp8e4m3x4_to_half2x2(
 }
 
 // 16-row swizzle used by LDS physical mapping.
-__device__ __forceinline__ constexpr int c_row_logical_to_phys_16(const int x)
+__device__ __forceinline__ constexpr int c_row_logi_to_phys_16(const int x)
 {
     return ((x & 7) << 1) | ((x >> 3) & 1);
 }
 
-__device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
+__device__ __forceinline__ constexpr int a_row_phys_to_logi_16(const int x)
 {
     return ((x & 1) << 3) | ((x >> 1) & 7);
 }
@@ -132,10 +132,10 @@ __global__ void scaled_mm_kernel(
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
-    const auto a_row_phys_to_logical = [&](const int physical_row) -> int {
-        const int tile_base = physical_row & ~15;
-        const int local = physical_row & 15;
-        return tile_base + a_row_phys_to_logical_16(local);
+    const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
+        const int tile_base = row_phys & ~15;
+        const int local = row_phys & 15;
+        return tile_base + a_row_phys_to_logi_16(local);
     };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
@@ -159,9 +159,9 @@ __global__ void scaled_mm_kernel(
             // Decode vec_idx to [k0][m_phys].
             const int k0 = vec_idx / kBlockM;
             const int m_phys = vec_idx % kBlockM;
-            const int m_logical = a_row_phys_to_logical(m_phys);
+            const int m_logi = a_row_phys_to_logi(m_phys);
 
-            const int64_t a_row = block_m + m_logical;
+            const int64_t a_row = block_m + m_logi;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
             half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
 
@@ -322,8 +322,8 @@ __global__ void scaled_mm_kernel(
                 const int col = lane_in_subgroup;
                 #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                    const int row_logical = subgroup * 8 + acc_idx;
-                    const int row_phys = c_row_logical_to_phys_16(row_logical);
+                    const int row_logi = subgroup * 8 + acc_idx;
+                    const int row_phys = c_row_logi_to_phys_16(row_logi);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     val = __hmul(val, scale_h);
                     sh_c[row_phys * kCStride + col] = val;
@@ -335,7 +335,7 @@ __global__ void scaled_mm_kernel(
                 // Step 2: Read from LDS in row-major order for coalesced global write
                 // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
                 const int read_row = lane / 2;
-                const int read_row_phys = c_row_logical_to_phys_16(read_row);
+                const int read_row_phys = c_row_logi_to_phys_16(read_row);
                 const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
                 const int read_col_base = col_half * 8;
 
