@@ -14,12 +14,12 @@ constexpr int kWmmaK = 16;
 constexpr int kWaveSize = 32;
 
 // 16-row swizzle used by LDS physical mapping.
-__device__ __forceinline__ constexpr int c_row_logical_to_phys_16(const int x)
+__device__ __forceinline__ constexpr int c_row_logi_to_phys_16(const int x)
 {
     return ((x & 7) << 1) | ((x >> 3) & 1);
 }
 
-__device__ __forceinline__ constexpr int a_row_phys_to_logical_16(const int x)
+__device__ __forceinline__ constexpr int a_row_phys_to_logi_16(const int x)
 {
     return ((x & 1) << 3) | ((x >> 1) & 7);
 }
@@ -107,8 +107,8 @@ __global__ void mm_kernel_fp16_prepacked_b(
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
-    const auto a_row_phys_to_logical = [&](const int physical_row) -> int {
-        return physical_row; // Disable swizzle for now to test correctness
+    const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
+        return row_phys; // Disable swizzle for now to test correctness
     };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
@@ -132,9 +132,9 @@ __global__ void mm_kernel_fp16_prepacked_b(
             // Decode vec_idx to [k0][m_phys].
             const int k0 = vec_idx / kBlockM;
             const int m_phys = vec_idx % kBlockM;
-            const int m_logical = a_row_phys_to_logical(m_phys);
+            const int m_logi = a_row_phys_to_logi(m_phys);
 
-            const int64_t a_row = block_m + m_logical;
+            const int64_t a_row = block_m + m_logi;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
             half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
 
@@ -146,8 +146,8 @@ __global__ void mm_kernel_fp16_prepacked_b(
     // Loading B: K0xNxK1 layout
     constexpr int kBVecs = kK0 * kBlockN;
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
-    const auto b_row_phys_to_logical = [&](const int physical_col) -> int {
-        return physical_col; // Disable swizzle for now to test correctness
+    const auto b_row_phys_to_logi = [&](const int col_phys) -> int {
+        return col_phys; // Disable swizzle for now to test correctness
     };
     const auto sh_b_row_ptr = [&](const int stage, const int k0, const int n) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockN + n) * kBStrideK1);
@@ -163,10 +163,10 @@ __global__ void mm_kernel_fp16_prepacked_b(
             // Decode vec_idx to [k0][n_phys].
             const int k0 = vec_idx / kBlockN;
             const int n_phys = vec_idx % kBlockN;
-            const int n_logical = b_row_phys_to_logical(n_phys);
+            const int n_logi = b_row_phys_to_logi(n_phys);
 
             const int64_t ktile = kk / kWmmaK;
-            const int64_t n_col = block_n + n_logical;
+            const int64_t n_col = block_n + n_logi;
             half* const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
 
             // The python prepack permuted b from [K, N] to [K/16, N, 16]
@@ -303,8 +303,8 @@ __global__ void mm_kernel_fp16_prepacked_b(
                 const int col = lane_in_subgroup;
                 #pragma unroll
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                    const int row_logical = subgroup * 8 + acc_idx;
-                    const int row_phys = c_row_logical_to_phys_16(row_logical);
+                    const int row_logi = subgroup * 8 + acc_idx;
+                    const int row_phys = c_row_logi_to_phys_16(row_logi);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     sh_c[row_phys * kCStride + col] = val;
                 }
