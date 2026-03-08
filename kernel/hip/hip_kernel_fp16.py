@@ -16,25 +16,33 @@ def _load_hip_fp16_extension():
 
 _FP16_CONFIGS = [
     (1, 1, 2, 2, 2),
-    (1, 1, 4, 2, 2),
     (1, 1, 2, 4, 4),
+    (1, 1, 4, 2, 2),
     (1, 1, 4, 4, 4),
+    (1, 1, 8, 2, 2),
+    (1, 1, 8, 4, 4),
     (1, 2, 2, 2, 2),
     (1, 2, 4, 2, 2),
-    (2, 1, 2, 2, 2),
-    (2, 1, 4, 2, 2),
+    (1, 2, 8, 2, 2),
     (1, 4, 2, 4, 2),
     (1, 4, 4, 4, 2),
+    (1, 4, 8, 4, 2),
     (1, 8, 2, 8, 2),
     (1, 8, 4, 8, 2),
+    (2, 1, 2, 2, 2),
+    (2, 1, 4, 2, 2),
+    (2, 1, 8, 2, 2),
     (2, 2, 2, 4, 4),
     (2, 2, 4, 4, 4),
+    (2, 2, 8, 4, 4),
     (2, 4, 2, 4, 2),
-    (2, 4, 4, 4, 2),
     (2, 4, 2, 4, 4),
+    (2, 4, 4, 4, 2),
     (2, 4, 4, 4, 4),
+    (2, 4, 8, 4, 2),
     (4, 2, 2, 2, 4),
     (4, 2, 4, 2, 4),
+    (4, 2, 8, 2, 4),
 ]
 _FP16_AUTOTUNE_CACHE = {}
 
@@ -62,7 +70,7 @@ def _select_config_fp16(
         return cached
 
     M, K = a.shape
-    N = b_prepacked.shape[1]
+    N = b_prepacked.shape[2]
 
     candidates = [c for c in _FP16_CONFIGS if _config_compatible(c, M, N, K)]
     if not candidates:
@@ -121,8 +129,15 @@ def prepack_b_for_mm_fp16(b: torch.Tensor) -> torch.Tensor:
     if N % 16 != 0:
         raise RuntimeError(f"N must be divisible by 16 for prepack layout, got N={N}")
 
-    kt = K // 16
-    packed = b.view(kt, 16, N).permute(0, 2, 1).contiguous()
+    # Reshape to separate K and N components into K0(2) x K1(8) and N_outer x N_inner_2(2) x N_inner_8(8)
+    packed = b.view(K // 16, 2, 8, N // 16, 2, 8)
+
+    # Permute to layout: [kt, k0, n_outer, n_inner_8, n_inner_2, k1]
+    # This automatically applies the inverse of c_row_logi_to_phys_16 across the N dimension
+    packed = packed.permute(0, 1, 3, 5, 4, 2).contiguous()
+
+    # Flatten the N components to form n_phys
+    packed = packed.view(K // 16, 2, N, 8)
     return packed
 
 
@@ -135,14 +150,15 @@ def mm_fp16_prepacked(
     assert a.is_cuda
     assert b_prepacked.device == a.device
     assert a.ndim == 2
-    assert b_prepacked.ndim == 3
+    assert b_prepacked.ndim == 4
     assert a.dtype == torch.float16
     assert b_prepacked.dtype == torch.float16
     assert out_dtype == torch.float16
 
     M, K = a.shape
-    K_tiles, N, kfrag = b_prepacked.shape
-    assert kfrag == 16
+    K_tiles, k0_dim, N, k1_dim = b_prepacked.shape
+    assert k0_dim == 2
+    assert k1_dim == 8
     assert K_tiles * 16 == K
 
     if bias is None:
