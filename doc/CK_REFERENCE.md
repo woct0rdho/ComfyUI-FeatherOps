@@ -1,12 +1,12 @@
 # CK Reference
 
-This file is the CK-specific reference for `kernel/ck/ck_kernel.cu` and related CK source.
+This file keeps facts and implementation details of the CK kernel.
 
 ## Scope
 
 - Wrapper source: `kernel/ck/ck_kernel.cu`
 - Python loader: `kernel/ck/ck_kernel.py`
-- CK source tree: `~/rocm-libraries/projects/composablekernel`
+- CK source tree: `~/rocm-libraries/projects/composablekernel/`
 
 ## End-to-End Flow in `ck_kernel.cu`
 

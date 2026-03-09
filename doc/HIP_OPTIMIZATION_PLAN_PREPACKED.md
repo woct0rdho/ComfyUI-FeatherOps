@@ -1,27 +1,24 @@
-# HIP Prepacked-B Kernel Optimization Plan (gfx1151)
+# gfx1151 HIP Prepacked-B Matmul Kernel Optimization Plan (Outdated)
 
 ## Scope and metric
 
-- Target kernel family: prepacked B (`uint8` fp8 bytes), gfx1151, winner track around `1,8,2,2,8,2`.
+- Target kernel family: prepacked B (fp8 bytes), winner track around `1,8,2,2,8,2`.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
 - Primary metric: benchmark GFLOPS (kernel runtime); profile kernel-time is diagnostic only.
 - Keep rule:
   - correctness passes,
-  - forced `N=8192` does not regress,
-  - large-N sweep (`4096/6144/8192`) does not regress materially.
+  - `N=8192` does not regress,
+  - large-N trend (`2048, 4096`) does not regress materially.
 
-## Current Stable Baseline
+## Current Baseline
 
 - Data path kept: prepacked B as fp8 bytes in `[K/16, N, 16]`.
-- Current production winner: `1,8,2,2,8,2` (no-swizzle).
-- Representative full benchmark (`benchmark_scaled_mm_hip_prepacked.py`):
+- Best autotune config: `1,8,2,2,8,2` (no-swizzle).
+- Latest full benchmark (`benchmark_scaled_mm_hip_prepacked.py`):
   - `N=8192`: `hip_prepacked ~40.5k`, `hip ~36.2k`, `torch_compiled ~32.4k` GFLOPS.
-- Forced thermal-anchor comparison (same process window):
-  - baseline hip `2,4,2,2,4,4`: ~`35.5k` GFLOPS,
-  - prepacked winner `1,8,2,2,8,2`: ~`40.3k` GFLOPS.
 - Thermal note: gains under ~2% are treated as noise unless repeated.
 
-## Current Bottleneck Model (Important)
+## Current Bottleneck Model
 
 From target-kernel-only profiling (`P11-B6a`, forced `1,8,2,2,8,2`, `N=8192`):
 
@@ -40,20 +37,22 @@ Interpretation:
 - Dominant limiter is on-chip issue/scheduling pressure (decode/VALU + control/other), not DRAM.
 - LDS is non-trivial but no longer the primary limiter for the winner path.
 
-## Durable Findings
+## Non-Negotiable Run Protocol
 
-1. fp8-byte transport is mandatory; fp16-prepack paths were large regressions.
-2. `1,8,2,2,8,2` no-swizzle is the strongest robust winner at large N.
-3. Stage4 overlap direction is non-viable on this hardware/kernel family.
-4. Epilogue is a minor contributor (no-scale/no-bias gave only ~`+0.35%`).
-5. Conversion approximation slack is small (aggressive approximations fail gate).
-6. Removing `v_perm` alone does not guarantee speedup; replacement ops can cancel gains.
-7. Forced-config cache pitfall is real (`_get_forced_config` cache must be cleared in same-process A/B scripts).
-8. Benchmark wins are the decision metric; profile-time and counters are supporting evidence.
+1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+2. Per-step order:
+   - `python test_scaled_mm_hip_prepacked.py`
+   - `python benchmark_scaled_mm_hip_prepacked.py`
+   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
+3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+4. If a new baseline is kept, commit the kernel immediately.
+5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
-## Experiment Ledger (Condensed, keep/reject reasons)
+## Condensed Experiment Ledger
 
-| ID | Keep? | Change | Result | Reason |
+| ID | Keep? | Change | Key Result | Why |
 |---|---|---|---|---|
 | P0/P1 | REJECT | fp16-prepack transport variants | ~24k class | bandwidth/traffic regression |
 | P3 | KEEP | fp8-byte prepack path | major recovery | restored transport efficiency |
@@ -82,6 +81,17 @@ Interpretation:
 | P11-B6f | REJECT | add config `1,8,1,2,8,2` | NaN correctness | exposed `kStages > kUnrollK` stage-write issue |
 | P11-B6g | REJECT | fix stage-write issue then re-test `1,8,1,2,8,2` | ~38.7k forced | finer chunking loses to control overhead |
 
+## Durable Findings
+
+- fp8-byte transport is mandatory; fp16-prepack paths were large regressions.
+- `1,8,2,2,8,2` no-swizzle is the strongest robust winner at large N.
+- Stage4 overlap direction is non-viable on this hardware/kernel family.
+- Epilogue is a minor contributor (no-scale/no-bias gave only ~`+0.35%`).
+- Conversion approximation slack is small (aggressive approximations fail gate).
+- Removing `v_perm` alone does not guarantee speedup; replacement ops can cancel gains.
+- Forced-config cache pitfall is real (`_get_forced_config` cache must be cleared in same-process A/B scripts).
+- Benchmark wins are the decision metric; profile-time and counters are supporting evidence.
+
 ## Do-Not-Repeat (Unless New Preconditions)
 
 - fp16-prepack transport variants.
@@ -93,21 +103,6 @@ Interpretation:
 - asymmetric priority scopes (`B`-only or `A`-only).
 - direct conversion-pack rewrites that break swizzle correctness.
 - `1,8,1,2,8,2` as a performance path (validated slower after bugfix).
-- re-running rejected items without a clear new precondition.
-
-## Non-Negotiable Run Protocol
-
-1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, gate with:
-   - `ps -eo pid,cmd | rg -n "benchmark_scaled_mm_hip_prepacked.py|profile_scaled_mm_hip_prepacked.py|rocprofv3" -S`
-2. Per-step order:
-   - `python test_scaled_mm_hip_prepacked.py`
-   - `python benchmark_scaled_mm_hip_prepacked.py`
-   - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip_prepacked.py`
-3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
-4. If a new baseline is kept, commit the kernel immediately.
-5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
-6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
 ## Next Plan (P12)
 
