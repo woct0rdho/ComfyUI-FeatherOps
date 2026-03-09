@@ -60,6 +60,20 @@ Single-PMC run (safer on gfx1151):
 rocprofv3 --kernel-trace --stats --pmc LDSBankConflict -d <out_dir> -o <prefix> -- python <script>.py
 ```
 
+Verified multi-counter run for this project:
+```bash
+rocprofv3 --kernel-trace --stats \
+  --pmc L2CacheHit VALUInsts LDSBankConflict \
+  -d <out_dir> -o <prefix> -- python <script>.py
+```
+
+To restrict output to the target kernel, use a kernel filter:
+```bash
+rocprofv3 --kernel-trace --stats --pmc LDSBankConflict \
+  --kernel-include-regex <kernel_regex> \
+  -d <out_dir> -o <prefix> -- python <script>.py
+```
+
 Read DB quickly:
 ```bash
 sqlite3 <db> ".tables"
@@ -76,6 +90,7 @@ Known pitfalls:
 - Error 38 for unsupported/overpacked counter sets.
 - JIT and lock-file issues can make profiling look hung.
 - Profile overhead changes wall-time; use benchmark scripts for performance decisions.
+- If a counter-collection run produces no DB, first verify the output directory was actually created; on gfx1151, the above `L2CacheHit + VALUInsts + LDSBankConflict` combination does work.
 
 ## PC Sampling
 
@@ -188,12 +203,42 @@ Thread tracing captures per-wave instruction execution timelines. It is supporte
 ```bash
 $ROCM_PATH/bin/rocprofv3 --att -d <output_dir> -o <prefix> -- python <script>.py
 ```
-*Note: By default, it only traces the FIRST dispatch of each kernel. If your script loops over the kernel multiple times, only the first one is captured, so you can reduce `N_ITER` to save time. If the target kernel is not the first dispatch (e.g. initialization/random generation kernels run first), check `ui_output_agent_*/code.json` in each directory to find the target kernel trace.*
+
+Useful gfx1151-specific notes:
+- By default, it only traces the FIRST dispatch of each kernel. If your script loops over the kernel multiple times, only the first instance is captured, so reduce `N_ITER` when possible.
+- If the target kernel is not the first dispatch (e.g. random generation or copy kernels run first), inspect `ui_output_agent_*/code.json` to find the correct traced dispatch.
+- `--kernel-include-regex <regex>` also applies to thread-trace data and is useful for excluding helper kernels from the decoded output.
+- On gfx10+/gfx11, `--att-simd-select` is a SIMD ID (`0x0..0x3`), not a bitmask. `0x0` is a good starting choice on gfx1151.
+- A safer reduced-scope command is:
+```bash
+$ROCM_PATH/bin/rocprofv3 \
+  --att \
+  --att-buffer-size 0x1000000 \
+  --att-target-cu 1 \
+  --att-simd-select 0x0 \
+  --att-shader-engine-mask 0x1 \
+  -d <output_dir> -o <prefix> -- python <script>.py
+```
+- For large or unstable kernels on gfx1151, prefer no-detail ATT first:
+```bash
+$ROCM_PATH/bin/rocprofv3 \
+  --att \
+  --att-no-detail \
+  --att-target-cu 1 \
+  --att-simd-select 0x0 \
+  --att-shader-engine-mask 0x1 \
+  -d <output_dir> -o <prefix> -- python <script>.py
+```
+- Smaller `--att-buffer-size` values are valid (minimum 1 MB), but if you see `Thread trace buffer full!`, the trace is partial and you should increase the buffer or reduce trace scope/workload.
+- If you use `--att-consecutive-kernels`, rocprofv3 switches to device-mode ATT. In that mode, `--att-serialize-all` is invalid and setup fails with error 19 (`INVALID_ARGUMENT`).
+- For unstable kernels or if a full-size trace causes a reset, first try a smaller problem size (e.g. `N=2048` or `N=4096`) and the reduced-scope command above before attempting `N=8192`.
+- `--att-no-detail` is validated on this machine: it can still emit `Thread trace buffer full!`, but it avoids the `N=8192` detailed-trace reset seen on the FP16 kernel.
 
 **Outputs:**
 - `stats_*.csv`: Aggregated latency, stall, and idle cycle counts for every instruction in the kernel.
 - `*.att`: Raw SQTT binary trace data.
-- `ui_output_agent_*/`: Directory containing `wave_*.json` and `code.json` which map out the exact cycle-by-cycle execution of every wave.
+- `ui_output_agent_*/`: Directory containing per-wave JSON files (e.g. `se0_sm0_sl0_wv0.json`), `code.json`, and occupancy/timeline metadata.
+- In `--att-no-detail` mode, `code.json` is expected to contain `"code": null` and `stats_*.csv` may contain only the header row. The useful outputs are `occupancy.json`, `wstates*.json`, `realtime.json`, and the wave-slot JSON files.
 
 ### Analyzing Thread Trace Data
 

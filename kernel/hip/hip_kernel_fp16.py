@@ -129,14 +129,16 @@ def prepack_b_for_mm_fp16(b: torch.Tensor) -> torch.Tensor:
     if N % 16 != 0:
         raise RuntimeError(f"N must be divisible by 16 for prepack layout, got N={N}")
 
-    # Reshape to separate K and N components into K0(2) x K1(8) and N_outer x N_inner_2(2) x N_inner_8(8)
+    # Reshape to separate K and N components into K0(2) x K1(8) and
+    # N_outer x N_inner_2(2) x N_inner_8(8).
     packed = b.view(K // 16, 2, 8, N // 16, 2, 8)
 
-    # Permute to layout: [kt, k0, n_outer, n_inner_8, n_inner_2, k1]
-    # This automatically applies the inverse of c_row_logi_to_phys_16 across the N dimension
-    packed = packed.permute(0, 1, 3, 5, 4, 2).contiguous()
+    # Permute to layout: [kt, k0, n_outer, n_inner_2, n_inner_8, k1].
+    # This keeps logical N order while still storing each [k1=8] fragment contiguously
+    # for 128-bit global and LDS transfers.
+    packed = packed.permute(0, 1, 3, 4, 5, 2).contiguous()
 
-    # Flatten the N components to form n_phys
+    # Flatten the N components to form the logical N dimension directly.
     packed = packed.view(K // 16, 2, N, 8)
     return packed
 
