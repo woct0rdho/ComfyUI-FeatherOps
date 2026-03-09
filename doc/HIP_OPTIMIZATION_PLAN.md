@@ -1,31 +1,13 @@
-# HIP Matmul Kernel Optimization Plan
+# gfx1151 HIP Mixed-Precision Matmul Kernel Optimization Plan (Outdated)
 
 ## Target
 
-Kernel: `scaled_mm_kernel` - fp8xfp16 mixed-precision matmul on RDNA 3.5 (gfx1151).
-Best config: `(2,4,2,2,4,4)` -> BlockM=128, BlockN=256, 256 threads, VGPR=189, SGPR=105, LDS=25088.
-Peak: 40 CUs x 2 SIMD/CU x 32 ALUs/SIMD x 2 (VOPD/WMMA) x 2 (fp16 pack) x 2 (FMA) x 2.9 GHz = **59.4 TFLOPS**.
-No native fp8 conversion instructions on gfx1151.
-
-Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-Approximation policy: denorm/NaN exact behavior may be relaxed if gate stays green.
-
-## Performance History
-
-| Change | N=8192 GFLOPS | % of peak | Delta |
-|---|---|---|---|
-| Step24: removed coarse preload barrier | 28780 | 48.5% | - |
-| Step33: split preload order A then B | 30336 | 51.1% | +5.4% |
-| Step42: compile-time contig fastpath | 30846 | 51.9% | +1.7% |
-| Step65: selective s_setprio | 32404 | 54.6% | +5.0% |
-| StepB12: A phys/inv mapping + WSGR A-store | 34404 | 57.9% | +6.2% |
-| StepC04: C-shuffle physical row mapping | 34747 | 58.5% | +1.0% |
-| + packed fp8->fp16 conversion (fp8x4_to_half2x2) | 35485 | 59.7% | +2.1% |
-| + register-tiled compute | **36134** | **60.8%** | +1.8% |
-
-Beats `torch_compiled` (31494) at N=8192 by +14.7%.
-Note: benchmarks affected by thermal throttling; gains <2% should be interpreted with caution.
-We've updated the benchmark scripts to use longer repetition time for more steady results. The above benchmark results are now invalid and we need to benchmark thee baseline again.
+- Kernel: `scaled_mm_kernel` - fp16 @ fp8 mixed-precision matmul on RDNA3.5 (gfx1151).
+- Best config: `(2,4,2,2,4,4)` -> BlockM=128, BlockN=256, 256 threads, VGPR=189, SGPR=105, LDS=25088.
+- Peak: 40 CUs x 2 SIMD/CU x 32 ALUs/SIMD x 2 (VOPD or WMMA) x 2 (fp16 pack) x 2 (FMA) x 2.9 GHz = **59.4 TFLOPS**.
+- No native fp8 conversion instructions on gfx1151.
+- Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
+- Approximation policy: denorm/NaN exact behavior may be relaxed if accuracy gate passes.
 
 ## Current Bottleneck Analysis
 
@@ -74,12 +56,12 @@ Precise instruction counts from ASM (`.LBB7_8` through `.LBB7_16`):
 - Conversion VALU (~121 ops) fills LDS stall slots - effectively free
 - Address calc VALU is only ~14 ops in the hot loop (negligible)
 - The ~305 addr calc from whole-function static analysis is mostly prologue/epilogue
-- All B/A read addresses use precomputed base registers (v175, v176) with compile-time offsets - no per-iteration address calc in compute phase
+- All A/B read addresses use precomputed base registers (v175, v176) with compile-time offsets - no per-iteration address calc in compute phase
 
 ### B read d16 WAW hazard pattern
 
 ```asm
-ds_load_u16_d16     v128, v175           // B[0][col] -> v128.lo
+ds_load_u16_d16     v128, v175            // B[0][col] -> v128.lo
 s_waitcnt lgkmcnt(0)                      // WAIT (WAW on v128)
 ds_load_u16_d16_hi  v128, v175 offset:528 // B[1][col] -> v128.hi
 ds_load_u16_d16     v129, v175 offset:1056
@@ -98,6 +80,38 @@ Compiler hides these waits by interleaving conversion VALU. E.8 proved eliminati
 | kStages=4 LDS | 50 KB | Occupancy=1 -> -20% (rejected) |
 | VGPR per SIMD | 1536 | 189 VGPR -> 8 waves/SIMD |
 | kStages >= kUnrollK | Enforced by static_assert | kUnrollK=4 requires kStages>=4 |
+
+## Non-Negotiable Run Protocol
+
+1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+2. Per-step order:
+   - `python test_scaled_mm_hip.py`
+   - `python benchmark_scaled_mm_hip.py`
+   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
+3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+4. If a new baseline is kept, commit the kernel immediately.
+5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
+
+## Performance History
+
+| Change | N=8192 GFLOPS | % of peak | Delta |
+|---|---|---|---|
+| Step24: removed coarse preload barrier | 28780 | 48.5% | - |
+| Step33: split preload order A then B | 30336 | 51.1% | +5.4% |
+| Step42: compile-time contig fastpath | 30846 | 51.9% | +1.7% |
+| Step65: selective s_setprio | 32404 | 54.6% | +5.0% |
+| StepB12: A phys/inv mapping + WSGR A-store | 34404 | 57.9% | +6.2% |
+| StepC04: C-shuffle physical row mapping | 34747 | 58.5% | +1.0% |
+| + packed fp8->fp16 conversion (fp8x4_to_half2x2) | 35485 | 59.7% | +2.1% |
+| + register-tiled compute | **36134** | **60.8%** | +1.8% |
+
+Beats `torch_compiled` (31494) at N=8192 by +14.7%.
+
+Note: benchmarks affected by thermal throttling; gains <2% should be interpreted with caution.
+
+We've updated the benchmark scripts to use longer repetition time for more steady results. The above benchmark results are now invalid and we need to benchmark the baseline again.
 
 ## Critical Insights
 
@@ -131,14 +145,16 @@ Operates within wave32 only. Cannot distribute data between the 8 waves in our w
 
 ### 8. Tile shape changes cannot improve LDS throughput alone
 
-Direction H (kRepeatM=8,kRepeatN=2) proved that reducing total LDS instruction count by 43% yields zero speedup. The reason: in the (4,4) config, B reads' WAW waits are filled by conversion VALU (effectively free work). Replacing B reads with A reads trades "B read + free VALU filling stalls" for "A reads + idle stall slots". The LDS+VALU+WMMA interleaving is a tightly coupled system; reducing any one component doesn't help because it removes the latency-hiding work for the others. **Any approach that merely reshuffles LDS reads between A and B will be neutral or negative.**
+Direction H (`kRepeatM=8, kRepeatN=2`) proved that reducing total LDS instruction count by 43% yields zero speedup. The reason: in the (4,4) config, B reads' WAW waits are filled by conversion VALU (effectively free work). Replacing B reads with A reads trades "B read + free VALU filling stalls" for "A reads + idle stall slots". The LDS+VALU+WMMA interleaving is a tightly coupled system; reducing any one component doesn't help because it removes the latency-hiding work for the others. **Any approach that merely reshuffles LDS reads between A and B will be neutral or negative.**
 
 ## Rejected Experiments (Do Not Repeat)
 
 ### Direction A: Reduce conversion VALU - REJECTED
+
 Kernel is LDS-bound; reducing VALU removes latency-hiding work (insight #1).
 
 ### Direction C: kUnrollK=4 - REJECTED
+
 Requires kStages>=4 -> 50KB LDS -> occupancy=1 -> -20%.
 
 ### Direction E: Reduce LDS instruction count - REJECTED (all approaches)
@@ -154,9 +170,11 @@ Requires kStages>=4 -> 50KB LDS -> occupancy=1 -> -20%.
 | E.8: ASM ds_load_u16 separate stmts | Failed | Compiler reorders past s_waitcnt |
 
 ### Direction F: Reduce address calc VALU - REJECTED
+
 ASM analysis shows only ~14 addr calc VALU in hot loop. Not a bottleneck (insight #4).
 
 ### Direction I: Reduce s_waitcnt overhead - REJECTED
+
 E.8 proved waits are already hidden by compiler interleaving (insight #2).
 
 ### Other rejected experiments
@@ -205,6 +223,7 @@ Profiled at N=8192, 20 iters. Benchmark: **35,057 GFLOPS** (59.0% of peak).
 | Bank conflict rate | 6.45% | (3.07M / 47.6M) |
 
 Effective issue-cycle breakdown: **LDS ~48%**, VALU ~24%, Other ~28%.
+
 VALU has ~50% headroom (dual-issues via VOPD).
 
 ### Direction H: Tile config `(2,4,2,2,8,2)` - REJECTED
@@ -233,20 +252,6 @@ Insight #8 shows the kernel's LDS/VALU/WMMA scheduling is tightly coupled - redu
 3. **Reduce "Other" 22.8%**: waitcnt/barrier/branch overhead - 19.4M instructions, potentially reducible
 4. **Better compiler scheduling**: ASM-level tuning of instruction ordering
 
-## Non-Negotiable Run Protocol
-
-1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, gate with:
-   - `ps -eo pid,cmd | rg -n "benchmark_scaled_mm_hip.py|profile_scaled_mm_hip.py|rocprofv3" -S`
-2. Per-step order:
-   - `python test_scaled_mm_hip.py`
-   - `python benchmark_scaled_mm_hip.py`
-   - `rocprofv3 --kernel-trace --stats -d ... -o ... -- python -u profile_scaled_mm_hip.py`
-3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
-4. If a new baseline is kept, commit the kernel immediately.
-5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
-6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
-
 ## Profiling Quick Reference
 
 rocprofv3 on gfx1151: max ~6 PMC counters per run (more causes crash). Use two runs:
@@ -263,7 +268,7 @@ JOIN rocpd_info_pmc_<UUID> ipm ON p.pmc_id = ipm.id
 GROUP BY ipm.name ORDER BY avg_val DESC;"
 ```
 
-## ASM Inspection
+## ASM Inspection Quick Reference
 
 Compile single config with `-save-temps` (edit `_CONFIGS` and dispatch table to 1 config first):
 ```bash
@@ -291,7 +296,7 @@ Can disable autotune with `HIP_FORCE_CONFIG=2,4,2,2,4,4` env var.
 - Tall-narrow-N: `(2,4,2,2,4,2)` or `(4,2,2,2,2,4)` can be stronger
 - kCPad=8 is best among {0, 8, 16}
 
-## File Reference
+## File References
 
 - `kernel/hip/hip_kernel.cu` - Main kernel (**baseline, 36134 GFLOPS**)
 - `kernel/hip/hip_kernel.py` - Python wrapper, JIT, autotune, `HIP_FORCE_CONFIG`
@@ -300,3 +305,4 @@ Can disable autotune with `HIP_FORCE_CONFIG=2,4,2,2,4,4` env var.
 - `profile_scaled_mm_hip.py` - Profiling script for rocprofv3
 - `profile_out/` - Profiling output directory
 - `~/rdna35-isa-markdown/` - ISA reference (large, grep don't read)
+- `~/amd-llvm-project/`, especially `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst` - hipcc source code

@@ -2,36 +2,45 @@
 
 This file keeps hardware/runtime/profiling facts for gfx1151 (this machine).
 
-## Hardware Snapshot
+## Hardware Facts
 
-| Item | Value |
-|---|---|
-| GPU | RDNA 3.5 (`gfx1151`) |
-| Compute Units | 40 |
-| Wave Size | 32 |
-| Max Clock | 2900 MHz |
-| LDS per workgroup | 64 KB |
-| Memory | LPDDR5 256-bit 8000 MT/s |
-| Theoretical BW | 256 GB/s |
-| Practical BW | ~200 GB/s |
+- ISA: RDNA3.5
+- Compute units: 40 (20 work-group processors)
+- Wave size: 32
+- Max clock: 2900 MHz
+- LDS per CU: 64 KB (128 KB per WGP)
+- VRAM: LPDDR5 256-bit 8000 MT/s
 
-Theoretical fp16 compute: 40 CUs * 2 SIMD units/CU * 32 Vector ALUs/SIMD unit * 2 (VOPD dual issue or WMMA) * 2 (fp16 packing) * 2 (fused multiply-add) * 2.9 GHz = 59.4 TFLOPS
+Theoretical fp16 compute: 40 CUs * 2 SIMD units per CU * 32 Vector ALUs per SIMD unit * 2 (VOPD dual issue or WMMA) * 2 (fp16 packing) * 2 (fused multiply-add) * 2.9 GHz = 59.4 TFLOPS
 
-## Occupancy Quick Math
+Theoretical VRAM bandwidth: 256 bits * 8000 MT/s = 256 GB/s
+
+## Occupancy Calculation
 
 Per-SIMD limits:
-- Max waves/SIMD: `16`
-- VGPR budget/SIMD: `1536`
+- Max waves per SIMD: 16
+- VGPR budget per SIMD: 1536
 
-Rule of thumb:
+1 VGPR consumes 4 bytes per thread. Since a wave has 32 threads, 1 VGPR consumes 128 bytes of register file space. 1536 VGPRs = 192 KB register file space per SIMD.
+
+The hardware limit for waves per workgroup is 32 (1024 threads per workgroup). Common choices of waves per workgroup are 4 or 8.
+
 ```
-waves_by_vgpr = floor(1536 / vgpr_per_wave)
-occupancy_per_simd = min(waves_by_vgpr, 16) / 16
+# VGPRs are allocated in blocks of 24 (for wave32).
+vgpr_allocated_per_wave = ceil(vgpr_used_per_wave / 24) * 24
+waves_by_vgpr = floor(1536 / vgpr_allocated_per_wave)
+
+# A WGP has 4 SIMDs. LDS is shared across the WGP.
+workgroups_by_lds = floor(131072 / lds_per_workgroup_in_bytes)
+waves_by_lds_per_simd = floor(workgroups_by_lds * waves_per_workgroup / 4)
+
+occupancy_per_simd = min(waves_by_vgpr, waves_by_lds_per_simd, 16) / 16
 ```
 
-Example: `176 VGPR` -> `floor(1536/176)=8 waves` -> `50%` per SIMD.
+- Example 1: `192 VGPR allocated per wave` -> `floor(1536/192) = 8 waves per SIMD` -> `50%` occupancy limit by VGPR.
+- Example 2: `65536 bytes LDS per workgroup` and `4 waves per workgroup` -> `floor(131072/65536) = 2 workgroups per WGP` -> `floor(2 * 4 / 4) = 2 waves per SIMD` -> `12.5%` occupancy limit by LDS.
 
-Besides VGPR capacity, occupancy is also bounded by LDS capacity.
+*Note on LDS capacity:* A WGP has **128 KB** of physical LDS (64 KB per CU). However, the architecture restricts a single workgroup to allocating a maximum of **64 KB**. Therefore, tools like rocminfo and sysfs will report 64 KB (the software allocation limit per-workgroup, which corresponds to the per-CU physical size), but a WGP can physically fit two such 64 KB workgroups simultaneously. Occupancy bottlenecks on LDS only when the combined LDS requests of all active workgroups exceed the 128 KB per-WGP limit.
 
 ## WMMA Facts
 
@@ -104,6 +113,16 @@ $ROCM_PATH/bin/rocprofv3 \
 - rocprofv3 decodes PCs to instruction text directly (no manual
   PC-to-disassembly mapping needed).
 
+### Interpreting PC Sampling Data
+
+A critical architectural detail of PC sampling is that it records the instruction the program counter (PC) is currently pointing to, which is the instruction **waiting to be issued**. It does *not* necessarily record instructions currently executing in the pipeline.
+
+If an instruction has a high sample count, it means the sequencer spent a long time stalled trying to *issue* that instruction, not necessarily that the instruction took a long time to compute.
+
+**Canonical Examples:**
+1. **Instruction Fetch Stalls (e.g., `v_perm_b32`):** A `v_wmma` executes in 32 cycles, while a `v_perm_b32` executes in 1 cycle. However, if you use inline 32-bit literal constants (e.g., `0x30c020c`), the `v_perm_b32` becomes a massive 96-bit (3 DWORD) instruction. When the sequencer tries to fetch these massive instructions for multiple concurrent waves, it chokes the instruction fetch frontend. The PC freezes, pointing at the `v_perm` instruction for dozens of cycles waiting for instruction memory. Thus, `v_perm_b32` will incorrectly appear to take more "time" than `v_wmma` in the PC trace. It's actually an *instruction fetch stall*.
+2. **Structural Queue Stalls (e.g., `ds_load_b128`):** A wave issuing `ds_load_b128` requests 512 bytes of LDS data. The LDS unit can process 128 bytes/cycle, so one load takes 4 cycles. If 8 resident waves constantly fire these massive loads, the internal LDS memory instruction queue becomes fully saturated. The sequencer is structurally blocked from issuing further LDS instructions. During this wait, the PC is frozen pointing at the blocked `ds_load`, resulting in massive sample counts. This is a *queue-full stall*, not execution time.
+
 ### Querying the DB
 
 ```bash
@@ -163,9 +182,9 @@ optimization plan for details.
 
 ## Thread Tracing
 
-Thread Tracing captures per-wave instruction execution timelines. It is supported on gfx1151 and does not require a custom kernel (works with mainline driver).
+Thread tracing captures per-wave instruction execution timelines. It is supported on gfx1151 and does not require a custom kernel (works with mainline driver).
 
-**Running Thread Tracing:**
+**Running thread tracing:**
 ```bash
 $ROCM_PATH/bin/rocprofv3 --att -d <output_dir> -o <prefix> -- python <script>.py
 ```
@@ -183,6 +202,7 @@ You can load the `.att` file or the `ui_output_agent_*/` directory into the **RO
 Alternatively, you can write python scripts using `matplotlib` and `pandas` to programmatically plot the timeline directly from the `wave_*.json` and `code.json` pairs.
 
 **Important Pitfalls to Remember:**
-1. **Single-Wave Perspective:** A trace timeline only plots the execution of *one specific wave* on *one specific SIMD*. If you see a massive `Sync` stall (e.g. `s_waitcnt vmcnt`), that single wave is indeed completely stalled.
-2. **Macro-Level Hiding:** Do not confuse a single-wave stall with global GPU starvation. Even if the traced wave shows it is stalled 50% of the time, the *overall* GPU TFLOPS might be hitting 75%+ of theoretical max. This indicates the massive `Sync` blocks are being successfully hidden by the hardware's macro-level scheduler staggering the memory requests across the other 79 SIMDs on the chip.
-3. **Internal Bottleneck:** To find the true *internal* kernel bottleneck, calculate the ratio of instructions executed *within the active math loop phase* (ignoring the global wait stalls).
+1. **Single-Wave Perspective:** A trace timeline only plots the execution of *one specific wave* on *one specific SIMD*. If you see a massive sync stall (e.g. `s_waitcnt vmcnt`), that single wave is indeed completely stalled.
+2. **Macro-Level Hiding (Occupancy):** Do not confuse a single-wave stall with global GPU starvation. For example, a single wave might spend 60% of its time stalled on global memory (`vmcnt`), but if occupancy is 8 waves per SIMD, the hardware scheduler seamlessly context-switches to the other 7 resident waves. This allows the physical Vector ALUs (Matrix Cores) to remain busy computing `v_wmma` instructions for other waves, hiding the latency globally and achieving high TFLOPS (e.g., ~75% utilization).
+3. **Internal Bottleneck (The "FP Convert Tax"):** To find the true *internal* kernel bottleneck, calculate the ratio of instructions executed *within the active math loop phase* (ignoring the global wait stalls). For instance, unpacking fp8 data on RDNA3.5 requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma`. If this unpacking takes ~23% of the math pipeline time, your maximum possible WMMA utilization is hard-capped at ~77%.
+4. **SQTT Profiling Overhead:** Thread tracing (`--att`) forces the hardware sequencer (SQ) to stall instruction issue when its internal trace token FIFO fills up, waiting for trace data to be written to VRAM (`SQ_STALL_EN` and `SPI_STALL_EN`). This stuttering loop artificially inflates the wall-clock cycles between instructions. Therefore, if you manually calculate WMMA utilization from trace data (e.g., `total_wmma_busy_cycles / total_trace_duration_cycles`), the result (e.g., ~30%) will be drastically lower than the true benchmarked utilization (e.g., ~75%) because the trace duration is heavily inflated by profiling stalls.

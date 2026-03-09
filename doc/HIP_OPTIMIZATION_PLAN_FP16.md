@@ -1,27 +1,27 @@
-# HIP FP16 Matmul Optimization Plan (gfx1151)
+# gfx1151 HIP FP16 Matmul Kernel Optimization Plan
 
 ## Scope and Metric
 
-- Target kernel path: FP16 (`a`=fp16, `b`=fp16) on gfx1151.
 - Prepack contract:
-  - `b` is pre-transposed and swizzled into `[K/16, 2, N, 8]` layout.
+  - B is pre-transposed and swizzled into `[K/16, 2, N, 8]` layout.
   - The C++ kernel consumes this prepacked storage to perform direct loads into LDS without additional transposition.
-- Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0` (some slight relaxation for extreme N=8192 accumulations).
-- Performance metric: `benchmark_mm_hip_fp16.py` GFLOPS.
+- Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
+- Performance metric: `benchmark_mm_hip_fp16.py` GFLOPS (prepack excluded from timed region).
+- Keep rule:
+  - correctness passes,
+  - `N=8192` does not regress,
+  - large-N trend (`2048`, `4096`) does not regress materially.
 
-## Current Baseline Snapshot
+## Current Baseline
 
-- Correctness:
-  - `python test_mm_hip_fp16.py` -> `28/28` pass (fixed LDS Swizzle and `__syncthreads` missing barrier).
 - Latest full benchmark (`python benchmark_mm_hip_fp16.py`):
-  - `N=4096`: `~32.1k` GFLOPS
   - `N=8192`: `~26.7k` GFLOPS
 
 ## Hardware Profiling Insights
 
 ### The FP16 vs FP8 Gap
 
-We have established a highly optimized FP8 kernel (`scaled_mm_hip_prepacked`) that achieves ~44.7 TFLOPS. The primary difference between our optimized FP8 kernel and this baseline FP16 kernel is the memory footprint and LDS layout:
+We have established a highly optimized FP8 kernel (`scaled_mm_hip_prepacked`) that achieves ~44 TFLOPS. The primary difference between our optimized FP8 kernel and this baseline FP16 kernel is the memory footprint and LDS layout:
 1. **LDS Footprint:** FP16 data is 2 bytes per element, whereas FP8 is 1 byte. To load an equivalent `128x256` chunk, the FP16 kernel requires exactly twice as much LDS memory (`32 KB` vs `16 KB`).
 2. **VGPR Footprint:** Loading and holding FP16 data requires twice as many vector registers (`uint4` loads 8 `fp16` elements instead of 16 `fp8` elements).
 3. **LDS Swizzle (Bank Conflicts):** Our baseline FP16 kernel now successfully maps logical indices to physical indices to avoid bank conflicts using the `[K/16, 2, N, 8]` layout.

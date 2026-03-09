@@ -1,8 +1,7 @@
-# HIP Prepacked-B fp8e5m2 Optimization Plan (gfx1151)
+# gfx1151 HIP Prepacked-B fp8e5m2 Matmul Kernel Optimization Plan
 
-## Scope and metric
+## Scope and Metric
 
-- Target kernel path: prepacked-B HIP (`b_dtype=1`, fp8e5m2) on gfx1151.
 - Prepack contract:
   - keep B physically as fp8 values in prepack output,
   - kernel consumes prepacked storage as raw bytes (`uint8_t*`) in device code.
@@ -12,65 +11,42 @@
 - Performance metric: `benchmark_scaled_mm_hip_prepacked_e5m2.py` GFLOPS (prepack excluded from timed region).
 - Keep rule:
   - correctness passes,
-  - forced `N=8192` does not regress,
-  - large-N trend (`4096`, `8192`) does not regress materially.
+  - `N=8192` does not regress,
+  - large-N trend (`2048`, `4096`) does not regress materially.
 
-## Current Baseline Snapshot
+## Current Baseline
 
-- Correctness:
-  - `python test_scaled_mm_hip_prepacked_e5m2.py` -> `5/5` pass.
-  - `python test_scaled_mm_hip_prepacked.py` -> `5/5` pass.
 - Latest full benchmark (`python benchmark_scaled_mm_hip_prepacked_e5m2.py`):
-  - `N=4096`: `~35.89k` GFLOPS
-  - `N=8192`: `~42.68k` GFLOPS
-- Forced-config anchor (`HIP_FORCE_CONFIG=1,8,2,2,8,2`):
-  - `N=8192`: `24.996 ms` (`~43.99k` GFLOPS).
-- Latest profile anchor:
-  - `rocprofv3 --kernel-trace --stats -d tmp_fp8e5m2_analysis/p14_stage2_noswizzle_only_profile -o p14_stage2_noswizzle_only_profile -- python -u profile_scaled_mm_hip_prepacked_e5m2.py`
-  - target kernel average: `~25.653 us`.
+  - `N=8192`: ~44.0 TFLOPS
 
-## Hardware Profiling Insights
+## Profiling Insights
 
-### PC Sampling Evolution (SQ_IND -> Host-Trap -> Stochastic)
+### PC Sampling
 
-Extensive PC sampling was conducted, moving from legacy SQ_IND (which read stale `SQ_WAVE_INST` buffers) to precise `ttmp0:1` host-trap, and finally zero-skid hardware stochastic sampling (~827K samples).
-All modern methods consistently agree on the stall distribution:
-- **LDS Read:** ~45% of samples
-- **Sync (waitcnt/barrier):** ~23-24%
-- **FP Convert (`v_perm_b32`):** ~10-11%
-- **WMMA:** ~8-9%
+Extensive PC sampling was conducted, moving from legacy `SQ_IND` (which read stale `SQ_WAVE_INST` buffers) to precise `ttmp0:1` host-trap, and finally zero-skid hardware stochastic sampling. With the optimal `(1,8,4,8,2)` configuration, the pure stall distribution is:
+- **LDS Read (`ds_load_b128`):** ~50% of samples
+- **FP Convert (`v_perm_b32`):** ~15%
+- **Sync (`s_waitcnt` / barrier):** ~14%
+- **WMMA:** ~10%
 
-While PC sampling showed LDS was the dominant memory operation within the active wave execution, it did not fully explain the *duration* of the sync stalls or the reason for the low WMMA throughput.
+**Crucial Insight (Issue vs. Execution Latency):** Hardware stochastic sampling records the instruction the program counter (PC) is currently pointing to, which is the instruction *waiting to be issued*, not necessarily the instruction currently executing in the pipeline.
+1. **The `v_perm` Fetch Stall:** Even though `v_wmma` executes in 32 cycles and `v_perm_b32` executes in 1 cycle, `v_perm_b32` receives significantly more PC samples! This happens because `v_perm_b32` with inline literal constants (e.g., `0x30c020c`) is a massive 96-bit (3 DWORD) instruction. Fetching 32 consecutive massive instructions for 8 concurrent waves completely chokes the sequencer's instruction fetch frontend. The PC gets stuck pointing at `v_perm_b32` waiting for instruction memory. This front-end starvation physically robs the pipeline of the clock cycles needed to issue `v_wmma`.
+2. **The LDS Read Queue Stall:** `ds_load_b128` instructions account for ~50% of all samples. A single `ds_load_b128` for a full wave (32 threads) requests 512 bytes, which takes the hardware LDS unit 4 clock cycles (at 128 bytes/cycle bandwidth) to process. With 8 waves constantly issuing these large loads, the internal LDS memory instruction queue becomes fully saturated. The sequencer must stall and wait for the LDS unit to drain its queue before it can issue the next `ds_load`. During this structural stall, the PC remains pointing at the blocked `ds_load` instruction, racking up massive sample counts.
 
-### Thread Tracing (ATT) Ground Truth
+### Thread Tracing
 
-Cycle-accurate Thread Tracing (`--att`) was used to plot execution timelines, revealing the true underlying bottlenecks that statistical sampling obscured:
+Cycle-accurate thread tracing was used to plot execution timelines, revealing the true underlying bottlenecks that statistical sampling obscured:
+1. **Global Memory Wait (The `vmcnt` Gap):** Although PC sampling showed very few `global_load` samples (~1%), thread tracing proved that individual waves experience massive `s_waitcnt` (sync) stalls waiting on `vmcnt`. A single wave's timeline reveals a **~3,500 cycle bubble** between outer chunk iterations where it completely halts waiting for global memory to return from L2/VRAM. However, as detailed below, this single-wave stall does not translate to global starvation.
+2. **Instruction Fetch Bottleneck (`v_perm_b32`):** The FP8->FP16 conversion uses `v_perm_b32` with inline 32-bit literal constants (e.g., `0x010c000cu`). This makes it a 96-bit (3 DWORD) instruction. When multiple waves attempt to unroll 16 of these massive instructions simultaneously, it overwhelms the SIMD instruction cache and fetch/decode frontend. What should take 16 cycles stretches into hundreds of wall-clock cycles, starving the VALU and heavily delaying WMMA issue. The apparent 1:4 time ratio of convert vs WMMA on the timeline (compared to the 1:32 theoretical ratio) is driven by this fetch stall, making it a severe secondary bottleneck.
 
-1. **Global Memory Starvation (The `vmcnt` Gap)**
-   Although PC Sampling showed very few `global_load` samples (~1%), Thread Tracing proved that the massive `s_waitcnt` (Sync) stalls are actually waiting on `vmcnt(3)` and `vmcnt(1)`. The timeline reveals a **~3,500 cycle bubble** between outer chunk iterations where the kernel completely halts waiting for global memory to return from L2/VRAM. The `stages=2` double-buffering perfectly hides LDS latency *within* the chunk, but is insufficient to hide the global load latency across chunks.
+### The Final Bottleneck
 
-2. **Instruction Fetch Bottleneck (`v_perm_b32`)**
-   The FP8->FP16 conversion uses `v_perm_b32` with inline 32-bit literal constants (e.g., `0x010c000cu`). This makes it a 96-bit (3 DWORD) instruction. When 30+ waves attempt to unroll 16 of these massive instructions simultaneously, it overwhelms the SIMD instruction cache and fetch/decode frontend. What should take 16 cycles stretches into hundreds of wall-clock cycles, starving the VALU and heavily delaying WMMA issue. The apparent 1:4 time ratio of convert vs WMMA on the timeline (compared to the 1:32 theoretical ratio) is driven by this fetch stall, making it a severe secondary bottleneck.
-
-## Durable Findings (Keep in Mind)
-
-- The kernel is definitively bounded by **Global Memory Latency/Bandwidth at the fetch edges** between chunk iterations, causing massive `vmcnt` wait bubbles.
-- `stages=2` software pipelining is too shallow to hide global memory latency on this hardware.
-- The `v_perm_b32` e5m2 unpacking acts as a severe fetch/decode bottleneck due to 96-bit bloated instructions.
-- Epilogue (scale/bias) is not the bottleneck (`~0.13%` delta).
-- Overlap decomposition showed limited headroom because the internal loop is already perfectly overlapping WMMA and LDS; the problem is the inter-loop global boundary.
-- Platform prior (from `doc/HIP_OPTIMIZATION_PLAN.md` + `kernel/hip/hip_kernel.cu`):
-  - stage>2 historically hurts on gfx1151 via occupancy loss, but this was tested before understanding the exact `vmcnt` starvation.
-  - prior stage2 split-phase attempts with extra sync overhead regressed.
-
-### The Final Bottleneck: Hardware Limitations vs Efficiency
-
-Through cycle-accurate Thread Tracing (`--att`) and hardware occupancy analysis of our final `(2,2,2,4,4)` configuration (~44.7 TFLOPS), we have proven the kernel is near the absolute limit of the hardware:
-1. **Hardware Latency Hiding:** While individual SIMDs stall for ~3,500 cycles on global memory fetches, the `(2,2,2,4,4)` configuration fits exactly 2 workgroups per SIMD (due to a 768 VGPR footprint fitting twice into the 1536 limit). This allows the hardware scheduler to seamlessly context-switch to a second workgroup during memory stalls. Combined with macro-level scheduling staggering across the 80 CUs, the global memory latency is completely hidden without needing an explicit software pipeline.
-2. **The FP Convert Tax (97.5% Efficiency):** The RDNA3.5 (`gfx1151`) lacks native `fp8` hardware matrix instructions. Unpacking `fp8` data requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma` (Matrix Core). Thread Tracing reveals that the VALU unpacking consumes **~22.8%** of the math pipeline execution time, leaving only **~77.2%** of the time for actual matrix math.
-   - Theoretical Peak: `59.4 TFLOPS`
-   - Hard Cap (due to 77.2% WMMA availability): `45.86 TFLOPS`
-   - Actual Achieved: `44.7 TFLOPS` (**97.5% efficiency** against the cap).
+Through thread tracing and hardware occupancy analysis of the chosen autotune config `(1,8,4,8,2)`, we have proven the kernel is near the absolute limit of the hardware:
+1. **Hardware Latency Hiding:** While an individual wave stalls for ~3,500 cycles on global memory fetches, the `(1,8,4,8,2)` configuration achieves 50% occupancy. It uses 184 VGPRs (fitting 8 waves per SIMD within the 1536 limit) and 32 KB of LDS per 8-wave workgroup (fitting 4 workgroups into the 128 KB per-WGP limit). This allows 8 resident waves per SIMD. The hardware scheduler seamlessly context-switches among these 8 waves during memory stalls. Combined with macro-level scheduling staggering across the 80 SIMDs, the global memory latency is well hidden by the hardware without needing an explicit software pipeline.
+2. **FP Convert:** RDNA3.5 (`gfx1151`) lacks native `fp8` instructions. Unpacking `fp8` data requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma` (matrix core). Thread tracing reveals that the VALU unpacking consumes **~23%** of the math pipeline execution time, creating a hard ceiling of **~77%** for matrix math (WMMA) execution time.
+   - Theoretical Peak (assuming 100% WMMA time): ~59.4 TFLOPS
+   - Hard Cap (due to ~77% WMMA time): ~45.7 TFLOPS
+   - Actually Achieved: ~44.0 TFLOPS
 
 ## Non-Negotiable Run Protocol
 
@@ -85,12 +61,6 @@ Through cycle-accurate Thread Tracing (`--att`) and hardware occupancy analysis 
 6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
 7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
-## Reference Note (When in Doubt)
-
-- You may consult ISA/compiler references before changing low-level decode/packing logic:
-  - `~/amd-llvm-project/`
-  - `~/rdna35-isa-markdown/`
-
 ## Condensed Experiment Ledger
 
 | ID | Keep? | Change | Key Result | Why |
@@ -98,31 +68,55 @@ Through cycle-accurate Thread Tracing (`--att`) and hardware occupancy analysis 
 | P0 | KEEP baseline | initial e5m2 baseline | `N=8192 ~42.86k` | starting point |
 | P1 | REJECT | direct-write decode staging removal | `~+0.15%` only | noise-level |
 | P2 | REJECT | `cvt_pk_f16_fp8` builtin path | compile fail | requires gfx1250 insts |
-| P3 | REJECT | add tile `(1,8,2,2,16,1)` | tiny `~+0.24%`, unstable small-N | not robust |
+| P3 | REJECT | add tile `(1,8,2,16,1)` | tiny `~+0.24%`, unstable small-N | not robust |
 | P4 | REJECT | remove load-phase `s_setprio` | large-N regression | metric down |
 | P5 | KEEP analysis | no-scale/no-bias ablation | `~+0.13%` delta | epilogue not bottleneck |
 | P6 | KEEP analysis infra | `HIP_PREPACKED_OVERLAP_MODE` runtime modes | decomposition enabled | needed for overlap study |
-| P6-A | KEEP analysis | overlap decomposition | low headroom (`~2-3%`) | overlap exists but limited |
-| P6-B | KEEP analysis | SQ + extra PMCs | busy-cycles shift, VALU/LDS flat | no large hidden overlap |
+| P6-A | KEEP analysis | overlap decomposition | low headroom (`~2-3%`) | overlap headroom exists but limited |
+| P6-B | KEEP analysis | SQ + extra PMCs | busy-cycles shift, VALU/LDS flat | no larger overlap |
 | P7 | REJECT | `s_setprio 2` | profile tiny up, benchmark down | non-robust |
 | P8 | REJECT config / KEEP infra | stage4 candidate + stage-index fix | correctness fixed, no speedup | keep fix, drop stage4 cfg |
 | P9 | KEEP baseline refinement | prepack output kept fp8 + wrapper dtype inference | correctness pass, `N=8192 ~43.77k` | cleaner API, no perf regression |
-| P10 | REJECT | stage2 split-phase software pipeline (winner path, A/B global->VGPR prefetch + wait + commit) | first version broke swizzle correctness; non-swizzle-restricted retry passed correctness but benchmark regressed (`N=8192 ~42.04k`) | overlap attempt cost exceeded gain on gfx1151; reverted |
+| P10 | REJECT | stage2 split-phase software pipeline (winner path, A/B global->VGPR prefetch + wait + commit) | first version broke swizzle correctness; non-swizzle-restricted retry passed correctness but benchmark regressed (`N=8192 ~42.04k`) | overlap attempt cost exceeded gain; reverted |
 | P11 | REJECT | stage2 interleaved refill (`compute stage0 -> refill0 -> compute stage1 -> refill1`) | correctness failed | unsafe stage reuse hazard in 2-stage path; reverted |
 | P12 | REJECT | stage2 B-only split-phase prefetch (`prefetch B -> compute -> wait -> load A + commit B`) | correctness failed | hazard-prone on current schedule; reverted |
 | P13 | REJECT | stage2 B-only split-phase retry with `volatile uint4` prefetch buffer | compile failed | invalid implementation direction; reverted |
-| P14 | KEEP baseline simplification | remove swizzle toggle and overlap profiling modes; enforce stages=2 only | correctness pass; baseline maintained | matches gfx1151 winner path and scope |
+| P14 | KEEP baseline simplification | remove swizzle toggle and overlap profiling modes; enforce stages=2 only | correctness pass; baseline maintained | matches winner path and scope |
 | PCS-1/2/3 | KEEP analysis | PC sampling (SQ_IND, Host-Trap, Stochastic) | Consistent 45% LDS, 23% Sync stall distribution | Uncovered `SQ_WAVE_INST` drift issue, confirmed accurate stall breakdown |
-| TT-1 | KEEP analysis | Thread Tracing (ATT) timeline | Found ~3,500 cycle gap between chunks | Proved kernel is global-memory bound on `vmcnt`, plus instruction fetch bottleneck on `v_perm_b32` |
+| TT-1 | KEEP analysis | thread tracing timeline | Found ~3,500 cycle gap between chunks | Proved wave is global-memory bound on `vmcnt`, plus instruction fetch bottleneck on `v_perm_b32` |
 | P15 | REJECT | hoist `v_perm_b32` literals to VGPRs | `N=8192` regressed ~42.62k | did not fix VOP3 issue latency (VGPR read ports), compiler barrier worsened global memory scheduling (`vmcnt` stalls up 18%) |
-| P16 | KEEP | Chunk Size Expansion (`unroll_k`=4,8) + `stages` cleanup | `N=8192` flat (~43.1k), but HUGE gains on `N=1024..4096` (+15-35%) | verified code has no A/B double buffering (synchronous wait); increasing chunk size drastically reduces frequency of hitting the 3,500-cycle `vmcnt` stall |
-| P17 | KEEP | Remove `kBPad` and `kCPad` LDS padding | `N=8192` flat (~44.6k) | `LDSBankConflict` PMC profiling proved bank conflicts are virtually zero (~0.3%), padding was wasting LDS capacity without providing performance benefits |
+| P16 | KEEP | chunk size expansion (`unroll_k`=4,8) + `stages` cleanup | `N=8192` flat (~43.1k), but HUGE gains on `N=1024..4096` (+15-35%) | verified code has no A/B double buffering (synchronous wait); increasing chunk size drastically reduces frequency of hitting the 3,500-cycle `vmcnt` stall |
+| P17 | KEEP | remove `kBPad` and `kCPad` LDS padding | `N=8192` flat (~44.6k) | `LDSBankConflict` PMC profiling proved bank conflicts are virtually zero (~0.3%), padding was wasting LDS capacity without providing performance benefits |
+
+## Durable Findings
+
+- The `v_perm_b32` e5m2 unpacking acts as a severe fetch/decode bottleneck due to 96-bit bloated instructions.
+- The winner path is not DRAM-bandwidth-limited; remaining headroom is dominated by on-chip issue/decode/scheduling and math-pipeline constraints.
+- Epilogue (scale/bias) is not the bottleneck (`~0.13%` delta).
+- Overlap decomposition showed limited headroom because the internal loop is already perfectly overlapping WMMA and LDS.
+- Removing `v_perm_b32` textually is not sufficient; replacement decode sequences can consume similar or worse front-end / VALU budget and fail to improve benchmark performance.
+- Moving fp8 decode into the load phase is a poor direction because it shifts work into a less-overlapped region and tends to increase payload / pressure.
+- Finer chunking tends to lose to control overhead on this kernel family; smaller chunks or more frequent refill schedules need a clearly new precondition to be viable.
+- Hot-loop address generation is a low-probability target; prior non-prepacked ASM analysis showed most address work was already hoisted into precomputed bases plus compile-time offsets.
+- `V_PK_*` / VOP3P packed-half instructions are not VOPD-eligible, so conversion rewrites that depend on packed 16-bit ops gaining dual-issue are unlikely to help.
+- `ds_permute_b32` only permutes within a wave32; it cannot be used for cross-wave fragment sharing or broadcast across the 8-wave workgroup.
+- Rigid inline ASM / manual instruction ordering can block compiler interleaving and worsen `vmcnt` hiding or register scheduling; use ASM only when it unlocks an otherwise impossible instruction form.
 
 ## Do-Not-Repeat (Unless New Preconditions)
 
 - P1 direct-write decode change (no new condition).
 - Any `__builtin_amdgcn_cvt_pk_f16_fp8` path on gfx1151.
 - Removing load-phase `s_setprio` or tweaking to `s_setprio 2`.
-- Stage2 split-phase, interleaved, or B-only overlapping schedules without restructuring the loop entirely.
-- Optimizing inner-loop LDS access patterns expecting massive gains (TT shows WMMA/LDS already overlap perfectly; inter-loop is the problem).
-- Stages > 2 (e.g. `stages=3` or `stages=4`). Platform prior definitively proves the occupancy loss hurts more than the latency hiding helps on gfx1151.
+- Stage2 split-phase, interleaved, or B-only overlapping schedules, or even `stages > 2`.
+- Optimizing inner-loop LDS access patterns (thread tracing shows WMMA/LDS already overlap perfectly).
+- Load-phase fp8->fp16 conversion / decode hoisting.
+- "Remove `v_perm_b32`" rewrites unless the full replacement sequence clearly reduces total issue/front-end cost.
+- Finer-grained chunking / extra-control schedules unless a new precondition reduces the control cost.
+- Any conversion rewrite whose thesis depends on `V_PK_*` / VOP3P dual-issue.
+- Cross-wave broadcast/shuffle ideas built on `ds_permute_b32`.
+- Hot-loop address-calc micro-optimizations unless new generated code shows materially higher address VALU than the prior kernels.
+
+## Reference
+
+- `~/amd-llvm-project/`, especially `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst` - hipcc source code
+- `~/rdna35-isa-markdown/`

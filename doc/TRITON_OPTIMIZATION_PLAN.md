@@ -1,4 +1,4 @@
-# Triton vs HIP Plan (gfx1151)
+# Triton Mixed-Precision Matmul Kernel Optimization Plan
 
 ## Goal
 
@@ -9,7 +9,7 @@
 ## Reference Source Code and ISA
 
 - `~/triton/`
-- `~/amd-llvm-project/`
+- `~/amd-llvm-project/`, especially `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst` - hipcc source code
 - `~/rdna35-isa-markdown/`
 
 ## Fixed Comparison Contract (do not drift)
