@@ -108,7 +108,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
     const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
-        return row_phys; // TODO: Check whether we need A swizzle
+        return row_phys; // Currently we do not need A swizzle
     };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
@@ -161,13 +161,13 @@ __global__ void mm_kernel_fp16_prepacked_b(
             const int n_phys = vec_idx % kBlockN;
 
             const int64_t ktile = kk / kWmmaK;
-            const int64_t n_col_phys = block_n + n_phys; // Use physical col directly since data is pre-swizzled
+            const int64_t n_col = block_n + n_phys;
 
             half* const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
 
-            // The python prepack permuted b to [K/16, 2, N, 8].
-            // This layout ensures adjacent n_col_phys access adjacent 8-element (uint4) chunks.
-            const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_col_phys * 8;
+            // The python prepack stores B in [K/16, 2, N, 8] with logical N order.
+            // Adjacent n_col values still access adjacent 8-element (uint4) chunks.
+            const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_col * 8;
             const half* const b_src = b_prepacked + gidx;
 
             *reinterpret_cast<uint4*>(sh_b_dst) = *reinterpret_cast<const uint4*>(b_src);
@@ -196,8 +196,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
             const int tile_n = warp_n + rn * kBlockWarpsN;
             const int n_logi = tile_n * kWmmaN + lane_in_subgroup;
 
-            // Map logical col back to the physical row where it was stored
-            const int n_phys = (n_logi & ~15) | c_row_logi_to_phys_16(n_logi & 15);
+            const int n_phys = n_logi;
 
             _Float16 reg_b_fp16[16];
             #pragma unroll
