@@ -19,11 +19,6 @@ __device__ __forceinline__ constexpr int c_row_logi_to_phys_16(const int x)
     return ((x & 7) << 1) | ((x >> 3) & 1);
 }
 
-__device__ __forceinline__ constexpr int a_row_phys_to_logi_16(const int x)
-{
-    return ((x & 1) << 3) | ((x >> 1) & 7);
-}
-
 template <int kBlockWarpsM,
           int kBlockWarpsN,
           int kUnrollK,
@@ -107,9 +102,6 @@ __global__ void mm_kernel_fp16_prepacked_b(
         kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
-    const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
-        return row_phys; // Currently we do not need A swizzle
-    };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
         const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
         return &sh.ab.a[idx];
@@ -132,9 +124,8 @@ __global__ void mm_kernel_fp16_prepacked_b(
             // Decode vec_idx to [k0][m_phys].
             const int k0 = vec_idx / kBlockM;
             const int m_phys = vec_idx % kBlockM;
-            const int m_logi = a_row_phys_to_logi(m_phys);
 
-            const int64_t a_row = block_m + m_logi;
+            const int64_t a_row = block_m + m_phys;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
             half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
 
@@ -194,9 +185,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
         #pragma unroll
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
-            const int n_logi = tile_n * kWmmaN + lane_in_subgroup;
-
-            const int n_phys = n_logi;
+            const int n_phys = tile_n * kWmmaN + lane_in_subgroup;
 
             _Float16 reg_b_fp16[16];
             #pragma unroll
