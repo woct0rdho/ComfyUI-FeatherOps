@@ -278,8 +278,6 @@ hipcc -save-temps [flags] -c kernel/hip/hip_kernel.hip -o /tmp/out.o
 # Config 2,4,2,2,4,4: Li2ELi4ELi2ELi2ELi4ELi4ELb0ELb1E (lines ~36919-38617)
 ```
 
-Can disable autotune with `HIP_FORCE_CONFIG=2,4,2,2,4,4` env var.
-
 ## ISA Notes
 
 - VOPD X-opcodes: FMAC, FMAAK, FMAMK, MUL_F32, ADD_F32, SUB_F32, SUBREV_F32, MUL_DX9_ZERO_F32, MOV_B32, CNDMASK_B32, MAX_F32, MIN_F32, DOT2ACC_F32_F16, DOT2ACC_F32_BF16
@@ -299,7 +297,7 @@ Can disable autotune with `HIP_FORCE_CONFIG=2,4,2,2,4,4` env var.
 ## File References
 
 - `kernel/hip/hip_kernel.cu` - Main kernel (**baseline, 36134 GFLOPS**)
-- `kernel/hip/hip_kernel.py` - Python wrapper, JIT, autotune, `HIP_FORCE_CONFIG`
+- `kernel/hip/hip_kernel.py` - Python wrapper, JIT, autotune
 - `test_scaled_mm_hip.py` - Correctness test (all configs x 5 sizes)
 - `benchmark_scaled_mm_hip.py` - Full benchmark (N=128..8192)
 - `profile_scaled_mm_hip.py` - Profiling script for rocprofv3

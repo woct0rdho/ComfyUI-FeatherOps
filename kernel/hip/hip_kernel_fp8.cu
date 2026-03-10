@@ -1,8 +1,13 @@
-#include <torch/extension.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/c/shim.h>
+#include <torch/csrc/stable/library.h>
+#include <torch/csrc/stable/tensor.h>
 
-#include <ATen/cuda/CUDAContext.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+
+#include <cstdint>
+#include <optional>
 
 namespace {
 
@@ -130,8 +135,8 @@ __global__ void scaled_mm_kernel_fp8(
             const int m_logi = a_row_phys_to_logi(m_phys);
 
             const int64_t a_row = block_m + m_logi;
-
             const uint8_t* const a_ptr = a + a_row * stride_am + kk;
+
             uint8_t* const sh_a_dst = &sh.ab.a[stage][m_phys][0];
             *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_ptr);
         }
@@ -153,6 +158,7 @@ __global__ void scaled_mm_kernel_fp8(
 
             const int64_t gidx = ((static_cast<int64_t>(ktile) * N + col) * kWmmaK);
             const uint8_t* const b_src = b_prepacked + gidx;
+
             uint8_t* const b_dst = &sh.ab.b[stage][col_local][0];
             *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
         }
@@ -323,7 +329,6 @@ __global__ void scaled_mm_kernel_fp8(
 
 } // namespace
 
-// Config tag for kernel (no vec_a/vec_b params - always uses vec16 A, vec16 B)
 template <int M, int N, int U, int RM, int RN>
 struct ConfigTag {
     static constexpr int kBlockWarpsM = M;
@@ -333,62 +338,84 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-torch::Tensor scaled_mm_fp8(
-    const torch::Tensor& a,
-    const torch::Tensor& b_prepacked,
-    const torch::Tensor& scale,
-    const torch::Tensor& bias,
+void scaled_mm_fp8(
+    const torch::stable::Tensor& a,
+    const torch::stable::Tensor& b_prepacked,
+    const std::optional<torch::stable::Tensor>& scale,
+    const std::optional<torch::stable::Tensor>& bias,
     const bool has_scale,
     const bool has_bias,
+    torch::stable::Tensor& c,
     const int64_t block_warps_m,
     const int64_t block_warps_n,
     const int64_t unroll_k,
     const int64_t repeat_m,
     const int64_t repeat_n)
 {
-    TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
-    TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
-    TORCH_CHECK(a.dim() == 2, "a must be 2D");
-    TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
+    STD_TORCH_CHECK(a.is_cuda(), "a must be a CUDA tensor");
+    STD_TORCH_CHECK(b_prepacked.is_cuda(), "b_prepacked must be a CUDA tensor");
+    STD_TORCH_CHECK(c.is_cuda(), "c must be a CUDA tensor");
+    const auto device_index = a.get_device_index();
+    STD_TORCH_CHECK(b_prepacked.get_device_index() == device_index, "b_prepacked must be on the same device as a");
+    STD_TORCH_CHECK(c.get_device_index() == device_index, "c must be on the same device as a");
+
+    STD_TORCH_CHECK(a.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "a must be float8_e5m2");
+    STD_TORCH_CHECK(b_prepacked.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "b_prepacked must be float8_e5m2");
+    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half, "c must be float16");
+
+    STD_TORCH_CHECK(a.dim() == 2, "a must be 2D");
+    STD_TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
+    STD_TORCH_CHECK(c.dim() == 2, "c must be 2D");
 
     const int64_t M = a.size(0);
     const int64_t K = a.size(1);
     const int64_t N = b_prepacked.size(1);
-    TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
-    TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK,
-        "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
-    TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
+    STD_TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
+    STD_TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK, "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
+    STD_TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
+    STD_TORCH_CHECK(c.size(0) == M, "c.shape[0] must equal M");
+    STD_TORCH_CHECK(c.size(1) == N, "c.shape[1] must equal N");
 
     // Contiguous fast path requirements
-    TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
-    TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
+    STD_TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
+    STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
+    STD_TORCH_CHECK(c.stride(1) == 1, "c must be row-contiguous (stride(1) == 1)");
 
     if (has_scale) {
-        TORCH_CHECK(scale.is_cuda(), "scale must be a CUDA tensor");
-        TORCH_CHECK(scale.numel() == 1, "scale must have one element");
-        TORCH_CHECK(scale.scalar_type() == at::kHalf, "scale must be float16");
+        STD_TORCH_CHECK(scale.has_value(), "scale must be provided when has_scale=True");
+        const auto& scale_t = *scale;
+        STD_TORCH_CHECK(scale_t.is_cuda(), "scale must be a CUDA tensor");
+        STD_TORCH_CHECK(scale_t.get_device_index() == device_index, "scale must be on the same device as a");
+        STD_TORCH_CHECK(scale_t.numel() == 1, "scale must have one element");
+        STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::Half, "scale must be float16");
     }
     if (has_bias) {
-        TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
-        TORCH_CHECK(bias.numel() == N, "bias must have N elements");
-        TORCH_CHECK(bias.scalar_type() == at::kHalf, "bias must be float16");
+        STD_TORCH_CHECK(bias.has_value(), "bias must be provided when has_bias=True");
+        const auto& bias_t = *bias;
+        STD_TORCH_CHECK(bias_t.is_cuda(), "bias must be a CUDA tensor");
+        STD_TORCH_CHECK(bias_t.get_device_index() == device_index, "bias must be on the same device as a");
+        STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
+        STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::Half, "bias must be float16");
     }
 
-    auto c = torch::empty({M, N}, a.options().dtype(at::kHalf));
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
 
-    const uint8_t* const a_ptr = reinterpret_cast<const uint8_t*>(a.data_ptr());
-    const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.data_ptr());
-    auto stream = at::cuda::getCurrentCUDAStream();
-    const half* const scale_ptr = has_scale ? reinterpret_cast<const half*>(scale.data_ptr<at::Half>()) : nullptr;
-    const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias.data_ptr<at::Half>()) : nullptr;
-    half* const c_ptr = reinterpret_cast<half*>(c.data_ptr<at::Half>());
+    void* raw_stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
+    auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+
+    const uint8_t* const a_ptr = reinterpret_cast<const uint8_t*>(a.const_data_ptr());
+    const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr());
+    const half* const scale_ptr = has_scale ? reinterpret_cast<const half*>(scale->const_data_ptr()) : nullptr;
+    const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias->const_data_ptr()) : nullptr;
+    half* const c_ptr = reinterpret_cast<half*>(c.mutable_data_ptr());
 
     const auto is_aligned_16 = [](const void* const p) {
         return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
     };
-    TORCH_CHECK(is_aligned_16(a_ptr), "a data pointer must be 16-byte aligned");
-    TORCH_CHECK(is_aligned_16(b_ptr), "b_prepacked data pointer must be 16-byte aligned");
-    TORCH_CHECK(is_aligned_16(c_ptr), "c data pointer must be 16-byte aligned");
+    STD_TORCH_CHECK(is_aligned_16(a_ptr), "a data pointer must be 16-byte aligned");
+    STD_TORCH_CHECK(is_aligned_16(b_ptr), "b_prepacked data pointer must be 16-byte aligned");
+    STD_TORCH_CHECK(is_aligned_16(c_ptr), "c data pointer must be 16-byte aligned");
 
     const auto launch = [&](const auto tag) -> void {
         constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
@@ -399,11 +426,11 @@ torch::Tensor scaled_mm_fp8(
         constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
         constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-        TORCH_CHECK(M % kBlockM == 0,
+        STD_TORCH_CHECK(M % kBlockM == 0,
             "M (", M, ") must be divisible by kBlockM (", kBlockM, ")");
-        TORCH_CHECK(N % kBlockN == 0,
+        STD_TORCH_CHECK(N % kBlockN == 0,
             "N (", N, ") must be divisible by kBlockN (", kBlockN, ")");
-        TORCH_CHECK(K % (kWmmaK * kUnrollK) == 0,
+        STD_TORCH_CHECK(K % (kWmmaK * kUnrollK) == 0,
             "K (", K, ") must be divisible by kChunkK (", kWmmaK * kUnrollK, ")");
 
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
@@ -415,7 +442,7 @@ torch::Tensor scaled_mm_fp8(
 
         hipLaunchKernelGGL(
             (scaled_mm_kernel_fp8<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN>),
-            grid, block, 0, stream.stream(),
+            grid, block, 0, stream,
             a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
             M, N, K,
             a.stride(0), c.stride(0),
@@ -444,26 +471,35 @@ torch::Tensor scaled_mm_fp8(
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         false;
 
-    TORCH_CHECK(launched, "Unsupported config");
-    return c;
+    STD_TORCH_CHECK(launched, "Unsupported config");
+
+    const hipError_t launch_err = hipGetLastError();
+    STD_TORCH_CHECK(
+        launch_err == hipSuccess,
+        "scaled_mm_fp8 kernel launch failed: ",
+        hipGetErrorString(launch_err));
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+STABLE_TORCH_LIBRARY(feather_ops, m)
 {
-    namespace py = pybind11;
     m.def(
-        "scaled_mm_fp8",
-        &scaled_mm_fp8,
-        py::arg("a"),
-        py::arg("b_prepacked"),
-        py::arg("scale"),
-        py::arg("bias"),
-        py::arg("has_scale"),
-        py::arg("has_bias"),
-        py::arg("block_warps_m"),
-        py::arg("block_warps_n"),
-        py::arg("unroll_k"),
-        py::arg("repeat_m"),
-        py::arg("repeat_n"),
-        "Scaled mixed-precision matmul (fp8e5m2 A, prepacked B fp8e5m2 [K/16,N,16]).");
+        "scaled_mm_fp8("
+        "Tensor a, "
+        "Tensor b_prepacked, "
+        "Tensor? scale, "
+        "Tensor? bias, "
+        "bool has_scale, "
+        "bool has_bias, "
+        "Tensor(a!) c, "
+        "int block_warps_m, "
+        "int block_warps_n, "
+        "int unroll_k, "
+        "int repeat_m, "
+        "int repeat_n"
+        ") -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(feather_ops, CUDA, m)
+{
+    m.impl("scaled_mm_fp8", TORCH_BOX(&scaled_mm_fp8));
 }

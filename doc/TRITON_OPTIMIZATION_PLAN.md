@@ -14,7 +14,7 @@
 
 ## Fixed Comparison Contract (do not drift)
 
-- HIP fixed config: `HIP_FORCE_CONFIG=2,4,2,2,4,4`
+- HIP fixed config: `2,4,2,4,4`
   - `BLOCK_M=128`, `BLOCK_N=256`, `BLOCK_K=32`, `WG=256`
 - Triton fixed config: `TRITON_SCALED_MM_FORCE_CONFIG=128,256,32,1,8,2`, `AUTOTUNE_DISABLE=1`
   - `BLOCK_M=128`, `BLOCK_N=256`, `BLOCK_K=32`, `num_warps=8`, `num_stages=2`
