@@ -195,9 +195,9 @@ __global__ void scaled_mm_kernel_prepacked_b(
             if (vec_idx >= kBVecs) continue;
 
             const int col_local = vec_idx;
-            const int col_logi = block_n + col_local;
+            const int col = block_n + col_local;
 
-            const int64_t gidx = ((static_cast<int64_t>(ktile) * N + col_logi) * kWmmaK);
+            const int64_t gidx = ((static_cast<int64_t>(ktile) * N + col) * kWmmaK);
             const uint8_t* const b_src = b_prepacked + gidx;
             uint8_t* const b_dst = &sh.ab.b[stage][col_local][0];
             *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
@@ -290,6 +290,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
         for (int u = 0; u < kUnrollK; ++u) {
             wmma_compute_stage(u);
         }
+        __syncthreads();
 
         if (iter_idx + 1 < total_chunks) {
             const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
@@ -305,8 +306,8 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 load_b_lds_prepacked(u, k);
             }
             asm volatile("s_setprio 0" ::: "memory");
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
