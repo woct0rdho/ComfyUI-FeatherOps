@@ -106,7 +106,8 @@ $ROCM_PATH/bin/rocprofv3 \
   --pc-sampling-method host_trap \
   --pc-sampling-unit time \
   --pc-sampling-interval 5000 \
-  -o <output_prefix> \
+  -d <out_dir> \
+  -o <prefix> \
   -- python <script>.py
 ```
 - `--pc-sampling-interval 5000`: scan interval in microseconds (5ms).
@@ -117,7 +118,8 @@ $ROCM_PATH/bin/rocprofv3 \
   --pc-sampling-method stochastic \
   --pc-sampling-unit cycles \
   --pc-sampling-interval 1048576 \
-  -o <output_prefix> \
+  -d <out_dir> \
+  -o <prefix> \
   -- python <script>.py
 ```
 - **Important:** GFX11.5 hardware stochastic sampling *only* supports `cycles` (not `time`), and the interval *must* be a power of 2 (e.g., `1048576` cycles). Using `time` or non-power-of-2 intervals will result in a "configuration is not supported" error.
@@ -201,7 +203,7 @@ Thread tracing captures per-wave instruction execution timelines. It is supporte
 
 **Running thread tracing:**
 ```bash
-$ROCM_PATH/bin/rocprofv3 --att -d <output_dir> -o <prefix> -- python <script>.py
+$ROCM_PATH/bin/rocprofv3 --att -d <out_dir> -o <prefix> -- python <script>.py
 ```
 
 Useful gfx1151-specific notes:
@@ -217,7 +219,7 @@ $ROCM_PATH/bin/rocprofv3 \
   --att-target-cu 1 \
   --att-simd-select 0x0 \
   --att-shader-engine-mask 0x1 \
-  -d <output_dir> -o <prefix> -- python <script>.py
+  -d <out_dir> -o <prefix> -- python <script>.py
 ```
 - For large or unstable kernels on gfx1151, prefer no-detail ATT first:
 ```bash
@@ -227,7 +229,7 @@ $ROCM_PATH/bin/rocprofv3 \
   --att-target-cu 1 \
   --att-simd-select 0x0 \
   --att-shader-engine-mask 0x1 \
-  -d <output_dir> -o <prefix> -- python <script>.py
+  -d <out_dir> -o <prefix> -- python <script>.py
 ```
 - Smaller `--att-buffer-size` values are valid (minimum 1 MB), but if you see `Thread trace buffer full!`, the trace is partial and you should increase the buffer or reduce trace scope/workload.
 - If you use `--att-consecutive-kernels`, rocprofv3 switches to device-mode ATT. In that mode, `--att-serialize-all` is invalid and setup fails with error 19 (`INVALID_ARGUMENT`).
