@@ -5,10 +5,10 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hip_kernel_prepacked import prepack_b_for_scaled_mm_hip, scaled_mm_hip_prepacked
+from kernel.hip.hip_kernel_prepacked import prepack_b_for_scaled_mm, scaled_mm_hip_prepacked
 from kernel.naive import scaled_mm_naive
 
-scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
 providers = {
     "torch": scaled_mm_naive,
@@ -48,7 +48,7 @@ def benchmark(N, provider):
     bias = torch.randn(N, device=device, dtype=out_dtype)
 
     # Prepacking is done once and excluded from do_bench
-    b_prepacked = prepack_b_for_scaled_mm_hip(b)
+    b_prepacked = prepack_b_for_scaled_mm(b)
 
     if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)

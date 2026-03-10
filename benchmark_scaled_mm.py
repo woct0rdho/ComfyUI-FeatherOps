@@ -8,8 +8,7 @@ import triton
 from kernel.kernel import scaled_mm_triton
 from kernel.naive import scaled_mm_naive
 
-scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
-# scaled_mm_triton_compiled = torch.compile(scaled_mm_triton, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
 providers = {
     "torch": scaled_mm_naive,

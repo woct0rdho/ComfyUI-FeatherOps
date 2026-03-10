@@ -5,15 +5,15 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hip_kernel_fp8 import prepack_b_for_scaled_mm_hip_fp8, scaled_mm_hip_fp8
+from kernel.hip.hip_kernel_fp8 import prepack_b_for_scaled_mm, scaled_mm_hip_fp8
 from kernel.naive import scaled_mm_naive
 
-scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
 providers = {
     "torch": scaled_mm_naive,
     "torch_compiled": scaled_mm_naive_compiled,
-    "hip_fp8": scaled_mm_hip_fp8,
+    "hip": scaled_mm_hip_fp8,
 }
 provider_names = list(providers)
 
@@ -48,11 +48,11 @@ def benchmark(N, provider):
     bias = torch.randn(N, device=device, dtype=out_dtype)
 
     # Prepacking is done once and excluded from do_bench
-    b_prepacked = prepack_b_for_scaled_mm_hip_fp8(b)
+    b_prepacked = prepack_b_for_scaled_mm(b)
 
     if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
-    elif provider == "hip_fp8":
+    elif provider == "hip":
         fn = lambda: providers[provider](a, b_prepacked, scale, bias, out_dtype)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")

@@ -5,15 +5,15 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hip_kernel_fp16 import mm_fp16_prepacked, prepack_b_for_mm_fp16
+from kernel.hip.hip_kernel_fp16 import mm_hip_fp16, prepack_b_for_mm_fp16
 from kernel.naive import scaled_mm_naive
 
-scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")
+scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
 providers = {
     "torch": scaled_mm_naive,
     "torch_compiled": scaled_mm_naive_compiled,
-    "hip_prepacked": mm_fp16_prepacked,
+    "hip": mm_hip_fp16,
 }
 provider_names = list(providers)
 
@@ -51,7 +51,7 @@ def benchmark(N, provider):
 
     if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, None, bias, out_dtype)
-    elif provider == "hip_prepacked":
+    elif provider == "hip":
         fn = lambda: providers[provider](a, b_prepacked, bias, out_dtype)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
