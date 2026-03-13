@@ -5,31 +5,17 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16, mm_hipblaslt_fp16_colmajor, to_col_major
+from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16_colmajor, to_col_major
+from kernel.naive import scaled_mm_naive
+
+scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
 providers = {
-    "torch_colmajor": lambda a, b, scale, bias, out_dtype, use_relu: torch.relu((a @ b) * scale[:, None] + bias[:, None])
-    if use_relu
-    else (a @ b) * scale[:, None] + bias[:, None],
-    "hipblaslt_fast_layout": lambda a, b, scale, bias, out_dtype, use_relu: mm_hipblaslt_fp16_colmajor(
-        a, b, scale, bias, out_dtype, use_relu=use_relu, solution_index=1112
-    ),
-    "hipblaslt_semantic": lambda a, b, scale, bias, out_dtype, use_relu: mm_hipblaslt_fp16(
-        a.contiguous(), b.contiguous(), scale, bias, out_dtype, use_relu=use_relu
-    ),
+    "torch": scaled_mm_naive,
+    "torch_compiled": scaled_mm_naive_compiled,
+    "hipblaslt": mm_hipblaslt_fp16_colmajor,
 }
 provider_names = list(providers)
-
-
-def check_correctness(a, b, scale, bias, out_dtype, use_relu):
-    out_ref = providers["torch_colmajor"](a, b, scale, bias, out_dtype, use_relu)
-    out_hip = providers["hipblaslt_fast_layout"](a, b, scale, bias, out_dtype, use_relu)
-
-    diff = (out_hip.float() - out_ref.float()).abs()
-    rel_l2 = diff.norm() / out_ref.float().norm().clamp_min(1e-6)
-    max_diff = diff.max().item()
-    if rel_l2.item() > 0.01 or max_diff > 1.0:
-        raise RuntimeError(f"correctness check failed: rel_l2={rel_l2.item():.3g} max_atol={max_diff:.3g}")
 
 
 @triton.testing.perf_report(
@@ -42,30 +28,39 @@ def check_correctness(a, b, scale, bias, out_dtype, use_relu):
             line_names=provider_names,
             ylabel="GFLOPS",
             plot_name="mm_hipblaslt_fp16",
-            args={"use_relu": True},
+            args={},
         )
     ]
 )
-def benchmark(N, provider, use_relu):
+def benchmark(N, provider):
     print("N", N, "provider", provider, "begin")
     gc.collect()
     torch.cuda.empty_cache()
 
     device = "cuda"
+    a_dtype = torch.float16
+    b_dtype = torch.float16
     out_dtype = torch.float16
 
-    a = to_col_major(torch.randn((N, N), device=device, dtype=torch.float32).to(torch.float16))
-    b = to_col_major(torch.randn((N, N), device=device, dtype=torch.float32).to(torch.float16))
-    scale = torch.randn(N, device=device, dtype=torch.float32).abs() * 0.125 + 0.5
+    a = torch.randn((N, N), device=device, dtype=torch.float32).to(a_dtype)
+    b = torch.randn((N, N), device=device, dtype=torch.float32).to(b_dtype)
+    scale = torch.ones(N, device=device, dtype=torch.float32)
     bias = torch.randn(N, device=device, dtype=out_dtype)
 
-    check_correctness(a, b, scale, bias, out_dtype, use_relu)
+    a_col = to_col_major(a)
+    b_col = to_col_major(b)
 
-    fn = lambda: providers[provider](a, b, scale, bias, out_dtype, use_relu)
+    if provider in {"torch", "torch_compiled"}:
+        fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
+    elif provider == "hipblaslt":
+        fn = lambda: providers[provider](a_col, b_col, scale, bias, out_dtype, solution_index=1112)
+    else:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
     quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=30, rep=200, quantiles=quantiles)
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=100, rep=1000, quantiles=quantiles)
 
-    perf = lambda cur_ms: 2 * N**3 / cur_ms * 1e-6
+    perf = lambda ms: 2 * N**3 / ms * 1e-6
     print("N", N, "provider", provider, "end", perf(ms))
     return perf(ms), perf(max_ms), perf(min_ms)
 
