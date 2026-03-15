@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 from torch._inductor.kernel.custom_op import register_custom_op_autotuning
 
-from .utils import _canonicalize_bias, generate_autotune_configs, get_compatible_config, load_hip_stable_extension, old_autotune
+from .utils import generate_autotune_configs, get_compatible_config, load_hip_stable_extension, old_autotune
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 load_hip_stable_extension("mm_hip_fp16_ext", cur_dir, "hip_kernel_fp16.cu")
@@ -15,13 +15,14 @@ def _configured_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
     bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
     block_warps_m: int,
     block_warps_n: int,
     unroll_k: int,
     repeat_m: int,
     repeat_n: int,
 ) -> torch.Tensor:
-    out = torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=torch.float16)
+    out = torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
     torch.ops.feather_ops.mm_fp16.default(
         a,
         b_prepacked,
@@ -41,13 +42,14 @@ def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
     bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
     block_warps_m: int,
     block_warps_n: int,
     unroll_k: int,
     repeat_m: int,
     repeat_n: int,
 ) -> torch.Tensor:
-    return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=torch.float16)
+    return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
 
 
 def mm_hip_fp16_configured(
@@ -57,8 +59,7 @@ def mm_hip_fp16_configured(
     out_dtype: torch.dtype,
     config: tuple[int, int, int, int, int],
 ) -> torch.Tensor:
-    bias_t = _canonicalize_bias(a, b_prepacked.shape[2], bias, out_dtype)
-    return _configured_op(a, b_prepacked, bias_t, *config)
+    return _configured_op(a, b_prepacked, bias, out_dtype, *config)
 
 
 _CONFIGS = [
@@ -98,6 +99,7 @@ def _autotuned_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
     bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
     block_warps_m: int = 0,
     block_warps_n: int = 0,
     unroll_k: int = 0,
@@ -106,7 +108,7 @@ def _autotuned_op(
 ) -> torch.Tensor:
     if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n) <= 0:
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = get_compatible_config(a, b_prepacked, 2, _CONFIGS)
-    return _configured_op(a, b_prepacked, bias, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    return _configured_op(a, b_prepacked, bias, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
 
 
 @_autotuned_op.register_fake
@@ -114,13 +116,14 @@ def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
     bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
     block_warps_m: int = 0,
     block_warps_n: int = 0,
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
 ) -> torch.Tensor:
-    return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=torch.float16)
+    return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
 
 
 register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS, 2))
@@ -132,12 +135,11 @@ def mm_hip_fp16(
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    bias_t = _canonicalize_bias(a, b_prepacked.shape[2], bias, out_dtype)
     if torch.compiler.is_compiling():
-        return _autotuned_op(a, b_prepacked, bias_t)
+        return _autotuned_op(a, b_prepacked, bias, out_dtype)
 
     def run_fn(cfg):
-        return _configured_op(a, b_prepacked, bias_t, *cfg)
+        return _configured_op(a, b_prepacked, bias, out_dtype, *cfg)
 
     best_cfg = old_autotune(
         a.shape[0],
@@ -147,7 +149,7 @@ def mm_hip_fp16(
         run_fn,
         "fp16",
     )
-    return _configured_op(a, b_prepacked, bias_t, *best_cfg)
+    return _configured_op(a, b_prepacked, bias, out_dtype, *best_cfg)
 
 
 def prepack_b_for_mm_fp16(b: torch.Tensor) -> torch.Tensor:

@@ -6,15 +6,20 @@ from torch.utils.cpp_extension import load
 
 from .utils import get_rocm_lib_dirs
 
-HIPBLASLT_INSTALLED_INCLUDE = os.path.join(os.environ.get("ROCM_PATH", ""), "include")
-HIPBLASLT_INCLUDES = [
-    HIPBLASLT_INSTALLED_INCLUDE,
-]
-
 
 def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: str):
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
+
+    includes = []
+    try:
+        import _rocm_sdk_core
+
+        rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
+        if os.path.exists(rocm_sdk_inc):
+            includes.append(rocm_sdk_inc)
+    except ImportError:
+        pass
 
     extra_cflags = [
         "-O3",
@@ -32,11 +37,6 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
     for lib_dir in dict.fromkeys(get_rocm_lib_dirs()):
         extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
 
-    include_paths = [path for path in HIPBLASLT_INCLUDES if os.path.isdir(path)]
-    missing_paths = [path for path in HIPBLASLT_INCLUDES if not os.path.isdir(path)]
-    if missing_paths:
-        raise RuntimeError(f"Missing hipBLASLt include paths: {missing_paths}")
-
     load(
         name=name,
         sources=[os.path.join(cur_dir, source_filename)],
@@ -48,7 +48,7 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
             "-U__HIP_NO_HALF2_OPERATORS__",
         ],
         extra_ldflags=extra_ldflags,
-        extra_include_paths=include_paths,
+        extra_include_paths=includes,
         build_directory=build_dir,
         with_cuda=True,
         verbose=False,
@@ -60,30 +60,7 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 load_hipblaslt_stable_extension("mm_hipblaslt_fp16_ext", cur_dir, "hipblaslt_kernel_fp16.cu")
 
 
-def _canonicalize_scale(scale: Optional[torch.Tensor], n: int, device: torch.device) -> tuple[Optional[torch.Tensor], float]:
-    if scale is None:
-        return None, 1.0
-
-    scale_t = scale.to(device=device)
-    if scale_t.numel() == 1:
-        return None, float(scale_t.item())
-
-    if scale_t.dim() != 1 or scale_t.numel() != n:
-        raise RuntimeError(f"scale must be None, a scalar, or a length-{n} vector")
-
-    return scale_t.to(torch.float32).contiguous(), 1.0
-
-
-def _canonicalize_bias(bias: Optional[torch.Tensor], n: int, device: torch.device, out_dtype: torch.dtype) -> Optional[torch.Tensor]:
-    if bias is None:
-        return None
-    bias_t = bias.to(device=device, dtype=out_dtype)
-    if bias_t.dim() != 1 or bias_t.numel() != n:
-        raise RuntimeError(f"bias must be None or a length-{n} vector")
-    return bias_t.contiguous()
-
-
-def _validate_colmajor_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
+def _validate_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
     if out_dtype != torch.float16:
         raise RuntimeError("hipBLASLt fp16 wrapper only supports out_dtype=torch.float16")
     if a.device.type != "cuda" or b.device.type != "cuda":
@@ -101,16 +78,17 @@ def _validate_colmajor_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch
 
 
 @torch.library.custom_op("feather_ops_internal::mm_hipblaslt_fp16_colmajor", mutates_args=())
-def _op_colmajor(
+def _op(
     a: torch.Tensor,
     b: torch.Tensor,
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
     alpha_scalar: float,
     use_relu: bool,
     solution_index: int,
 ) -> torch.Tensor:
-    out = torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=torch.float16)
+    out = torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=out_dtype)
     torch.ops.feather_ops.mm_hipblaslt_fp16_colmajor.default(
         a,
         b,
@@ -124,17 +102,18 @@ def _op_colmajor(
     return out
 
 
-@_op_colmajor.register_fake
+@_op.register_fake
 def _(
     a: torch.Tensor,
     b: torch.Tensor,
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
     alpha_scalar: float,
     use_relu: bool,
     solution_index: int,
 ) -> torch.Tensor:
-    return torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=torch.float16)
+    return torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=out_dtype)
 
 
 def to_col_major(x: torch.Tensor) -> torch.Tensor:
@@ -153,14 +132,18 @@ def mm_hipblaslt_fp16_colmajor(
     use_relu: bool = False,
     solution_index: int = -1,
 ) -> torch.Tensor:
-    _validate_colmajor_inputs(a, b, out_dtype)
-    scale_t, alpha_scalar = _canonicalize_scale(scale, a.shape[0], a.device)
-    bias_t = _canonicalize_bias(bias, a.shape[0], a.device, out_dtype)
-    return _op_colmajor(
+    _validate_inputs(a, b, out_dtype)
+    alpha_scalar = 1.0
+    if scale is not None and scale.numel() == 1:
+        alpha_scalar = float(scale.item())
+        scale = None
+
+    return _op(
         a,
         b,
-        scale_t,
-        bias_t,
+        scale,
+        bias,
+        out_dtype,
         alpha_scalar,
         use_relu,
         solution_index,
