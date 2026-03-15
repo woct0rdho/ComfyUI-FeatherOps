@@ -481,8 +481,6 @@ void scaled_mm_prepacked(
     const torch::stable::Tensor& b_prepacked,
     const std::optional<torch::stable::Tensor>& scale,
     const std::optional<torch::stable::Tensor>& bias,
-    const bool has_scale,
-    const bool has_bias,
     torch::stable::Tensor& c,
     const int64_t block_warps_m,
     const int64_t block_warps_n,
@@ -525,7 +523,7 @@ void scaled_mm_prepacked(
     STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
     STD_TORCH_CHECK(c.stride(1) == 1, "c must be row-contiguous (stride(1) == 1)");
 
-    if (has_scale) {
+    if (scale.has_value()) {
         STD_TORCH_CHECK(scale.has_value(), "scale must be provided when has_scale=True");
         const auto& scale_t = *scale;
         STD_TORCH_CHECK(scale_t.is_cuda(), "scale must be a CUDA tensor");
@@ -533,7 +531,7 @@ void scaled_mm_prepacked(
         STD_TORCH_CHECK(scale_t.numel() == 1, "scale must have one element");
         STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::Half, "scale must be float16");
     }
-    if (has_bias) {
+    if (bias.has_value()) {
         STD_TORCH_CHECK(bias.has_value(), "bias must be provided when has_bias=True");
         const auto& bias_t = *bias;
         STD_TORCH_CHECK(bias_t.is_cuda(), "bias must be a CUDA tensor");
@@ -550,8 +548,8 @@ void scaled_mm_prepacked(
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.const_data_ptr());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr());
-    const half* const scale_ptr = has_scale ? reinterpret_cast<const half*>(scale->const_data_ptr()) : nullptr;
-    const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias->const_data_ptr()) : nullptr;
+    const half* const scale_ptr = scale.has_value() ? reinterpret_cast<const half*>(scale->const_data_ptr()) : nullptr;
+    const half* const bias_ptr = bias.has_value() ? reinterpret_cast<const half*>(bias->const_data_ptr()) : nullptr;
     half* const c_ptr = reinterpret_cast<half*>(c.mutable_data_ptr());
 
     const auto is_aligned_16 = [](const void* const p) {
@@ -575,7 +573,7 @@ void scaled_mm_prepacked(
         a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
         M, N, K,
         a.stride(0), c.stride(0),
-        has_scale ? 1 : 0, has_bias ? 1 : 0,
+        scale.has_value() ? 1 : 0, bias.has_value() ? 1 : 0,
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
         b_dtype, stream);
     STD_TORCH_CHECK(launched, "Unsupported config");
@@ -592,8 +590,6 @@ STABLE_TORCH_LIBRARY(feather_ops, m)
         "Tensor b_prepacked, "
         "Tensor? scale, "
         "Tensor? bias, "
-        "bool has_scale, "
-        "bool has_bias, "
         "Tensor(a!) c, "
         "int block_warps_m, "
         "int block_warps_n, "
