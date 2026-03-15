@@ -34,7 +34,7 @@ def main():
     cfg = tuple(int(x.strip()) for x in args.config.split(","))
 
     def run_fn():
-        return scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.float16, cfg)
+        return scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
 
     print("Warming up...")
     for _ in range(3):

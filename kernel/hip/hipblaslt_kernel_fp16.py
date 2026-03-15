@@ -134,12 +134,6 @@ def _(
     return torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=out_dtype)
 
 
-def to_col_major(x: torch.Tensor) -> torch.Tensor:
-    out = torch.empty_strided(x.shape, (1, x.shape[0]), device=x.device, dtype=x.dtype)
-    out.copy_(x)
-    return out
-
-
 def mm_hipblaslt_fp16_colmajor(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -166,3 +160,9 @@ def mm_hipblaslt_fp16_colmajor(
         use_relu,
         solution_index,
     )
+
+
+def to_col_major(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_strided(x.shape, (1, x.shape[0]), device=x.device, dtype=x.dtype)
+    out.copy_(x)
+    return out

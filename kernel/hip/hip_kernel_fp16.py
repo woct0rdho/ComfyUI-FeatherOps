@@ -52,15 +52,7 @@ def _(
     return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
 
 
-def mm_hip_fp16_configured(
-    a: torch.Tensor,
-    b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    out_dtype: torch.dtype,
-    config: tuple[int, int, int, int, int],
-) -> torch.Tensor:
-    return _configured_op(a, b_prepacked, bias, out_dtype, *config)
-
+mm_hip_fp16_configured = _configured_op
 
 _CONFIGS = [
     (1, 1, 2, 2, 2),

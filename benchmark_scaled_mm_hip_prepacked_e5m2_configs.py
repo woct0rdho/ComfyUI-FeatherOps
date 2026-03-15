@@ -64,7 +64,7 @@ def _run_config(
     warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
 
     def run_kernel():
-        scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.float16, cfg)
+        scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(run_kernel, warmup=warmup, rep=rep, quantiles=quantiles)

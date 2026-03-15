@@ -56,16 +56,7 @@ def _(
     return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
-def scaled_mm_hip_prepacked_configured(
-    a: torch.Tensor,
-    b_prepacked: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
-    out_dtype: torch.dtype,
-    config: tuple[int, int, int, int, int],
-) -> torch.Tensor:
-    return _configured_op(a, b_prepacked, scale, bias, out_dtype, *config)
-
+scaled_mm_hip_prepacked_configured = _configured_op
 
 _CONFIGS = [
     (1, 1, 2, 2, 2),

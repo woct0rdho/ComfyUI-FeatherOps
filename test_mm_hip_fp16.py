@@ -15,13 +15,7 @@ def test_config(cfg, M, N, K, device):
     b_prepacked = prepack_b_for_mm_fp16(b)
 
     try:
-        out_hip = mm_hip_fp16_configured(
-            a,
-            b_prepacked,
-            bias,
-            torch.float16,
-            cfg,
-        )
+        out_hip = mm_hip_fp16_configured(a, b_prepacked, bias, torch.float16, *cfg)
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
 
