@@ -90,18 +90,6 @@ def _size_hint(value: int) -> int:
         return hint_int(value)
 
 
-def _canonicalize_scale_bias(
-    a: torch.Tensor, n: int, scale: Optional[torch.Tensor], bias: Optional[torch.Tensor], out_dtype: torch.dtype
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    scale_t = None if scale is None else scale.to(out_dtype)
-    bias_t = None if bias is None else bias.to(out_dtype)
-    return scale_t, bias_t
-
-
-def _canonicalize_bias(a: torch.Tensor, n: int, bias: Optional[torch.Tensor], out_dtype: torch.dtype) -> Optional[torch.Tensor]:
-    return None if bias is None else bias.to(out_dtype)
-
-
 def generate_autotune_configs(
     fake_tensors: Dict[str, torch.Tensor],
     configs: List[Tuple[int, int, int, int, int]],
