@@ -119,8 +119,6 @@ void mm_hipblaslt_fp16_colmajor(
     const torch::stable::Tensor& b,
     const std::optional<torch::stable::Tensor>& scale,
     const std::optional<torch::stable::Tensor>& bias,
-    const bool has_scale,
-    const bool has_bias,
     torch::stable::Tensor& d,
     const double alpha_scalar,
     const bool use_relu,
@@ -157,7 +155,7 @@ void mm_hipblaslt_fp16_colmajor(
     STD_TORCH_CHECK(b.stride(1) == K, "b must be column-major contiguous");
     STD_TORCH_CHECK(d.stride(1) == M, "d must be column-major contiguous");
 
-    if(has_scale)
+    if(scale.has_value())
     {
         STD_TORCH_CHECK(scale.has_value(), "scale must be provided when has_scale=True");
         const auto& scale_t = *scale;
@@ -169,7 +167,7 @@ void mm_hipblaslt_fp16_colmajor(
         STD_TORCH_CHECK(scale_t.stride(0) == 1, "scale vector must be contiguous");
     }
 
-    if(has_bias)
+    if(bias.has_value())
     {
         STD_TORCH_CHECK(bias.has_value(), "bias must be provided when has_bias=True");
         const auto& bias_t = *bias;
@@ -188,17 +186,17 @@ void mm_hipblaslt_fp16_colmajor(
     const half* const a_ptr = reinterpret_cast<const half*>(a.const_data_ptr());
     const half* const b_ptr = reinterpret_cast<const half*>(b.const_data_ptr());
     half* const d_ptr = reinterpret_cast<half*>(d.mutable_data_ptr());
-    const float* const scale_ptr = has_scale ? reinterpret_cast<const float*>(scale->const_data_ptr()) : nullptr;
-    const half* const bias_ptr = has_bias ? reinterpret_cast<const half*>(bias->const_data_ptr()) : nullptr;
+    const float* const scale_ptr = scale.has_value() ? reinterpret_cast<const float*>(scale->const_data_ptr()) : nullptr;
+    const half* const bias_ptr = bias.has_value() ? reinterpret_cast<const half*>(bias->const_data_ptr()) : nullptr;
 
     STD_TORCH_CHECK(is_aligned_16(a_ptr), "a data pointer must be 16-byte aligned");
     STD_TORCH_CHECK(is_aligned_16(b_ptr), "b data pointer must be 16-byte aligned");
     STD_TORCH_CHECK(is_aligned_16(d_ptr), "d data pointer must be 16-byte aligned");
-    if(has_scale)
+    if(scale.has_value())
     {
         STD_TORCH_CHECK(is_aligned_16(scale_ptr), "scale data pointer must be 16-byte aligned");
     }
-    if(has_bias)
+    if(bias.has_value())
     {
         STD_TORCH_CHECK(is_aligned_16(bias_ptr), "bias data pointer must be 16-byte aligned");
     }
@@ -230,8 +228,8 @@ void mm_hipblaslt_fp16_colmajor(
     gemm.setMaxWorkspaceBytes(ctx.workspace_bytes);
 
     hipblaslt_ext::GemmEpilogue epilogue;
-    epilogue.setMode(get_epilogue(has_bias, use_relu));
-    if(has_bias)
+    epilogue.setMode(get_epilogue(bias.has_value(), use_relu));
+    if(bias.has_value())
     {
         epilogue.setBiasDataType(HIP_R_16F);
     }
@@ -243,11 +241,11 @@ void mm_hipblaslt_fp16_colmajor(
     inputs.setD(d_ptr);
     inputs.setAlpha(&alpha);
     inputs.setBeta(&beta);
-    if(has_scale)
+    if(scale.has_value())
     {
         inputs.setScaleAlphaVec(scale_ptr);
     }
-    if(has_bias)
+    if(bias.has_value())
     {
         inputs.setBias(bias_ptr);
     }
@@ -259,8 +257,8 @@ void mm_hipblaslt_fp16_colmajor(
         M,
         N,
         K,
-        has_scale,
-        has_bias,
+        scale.has_value(),
+        bias.has_value(),
         use_relu,
         1,
         static_cast<int>(solution_index),
@@ -358,8 +356,6 @@ STABLE_TORCH_LIBRARY(feather_ops, m)
         "Tensor b, "
         "Tensor? scale, "
         "Tensor? bias, "
-        "bool has_scale, "
-        "bool has_bias, "
         "Tensor(a!) d, "
         "float alpha_scalar, "
         "bool use_relu, "

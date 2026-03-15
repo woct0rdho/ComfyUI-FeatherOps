@@ -14,7 +14,7 @@ load_hip_stable_extension("mm_hip_fp16_ext", cur_dir, "hip_kernel_fp16.cu")
 def _configured_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     block_warps_m: int,
     block_warps_n: int,
     unroll_k: int,
@@ -26,7 +26,6 @@ def _configured_op(
         a,
         b_prepacked,
         bias,
-        bias.numel() != 0,
         out,
         block_warps_m,
         block_warps_n,
@@ -41,7 +40,7 @@ def _configured_op(
 def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     block_warps_m: int,
     block_warps_n: int,
     unroll_k: int,
@@ -98,7 +97,7 @@ _CONFIGS = [
 def _autotuned_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     block_warps_m: int = 0,
     block_warps_n: int = 0,
     unroll_k: int = 0,
@@ -114,7 +113,7 @@ def _autotuned_op(
 def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: torch.Tensor,
+    bias: Optional[torch.Tensor],
     block_warps_m: int = 0,
     block_warps_n: int = 0,
     unroll_k: int = 0,
