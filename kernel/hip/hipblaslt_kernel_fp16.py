@@ -1,8 +1,9 @@
 import os
+from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import _import_module_from_library, load
 
 from .utils import get_rocm_lib_dirs
 
@@ -10,6 +11,22 @@ from .utils import get_rocm_lib_dirs
 def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: str):
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
+
+    source_file = os.path.join(cur_dir, source_filename)
+    ninja_log = os.path.join(build_dir, ".ninja_log")
+    should_rebuild = False
+
+    if os.path.exists(source_file) and os.path.exists(ninja_log):
+        if os.path.getmtime(source_file) > os.path.getmtime(ninja_log):
+            should_rebuild = True
+    else:
+        should_rebuild = True
+
+    if not should_rebuild:
+        try:
+            return _import_module_from_library(name, build_dir, is_python_module=False)
+        except ImportError:
+            pass
 
     includes = []
     try:
@@ -54,6 +71,7 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
         verbose=False,
         is_python_module=False,
     )
+    Path(ninja_log).touch(exist_ok=True)
 
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))

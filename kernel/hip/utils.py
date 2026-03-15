@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig
 from torch.fx.experimental.symbolic_shapes import hint_int
-from torch.utils.cpp_extension import load
+from torch.utils.cpp_extension import _import_module_from_library, load
 
 
 def get_rocm_lib_dirs() -> list[str]:
@@ -30,6 +30,22 @@ def get_rocm_lib_dirs() -> list[str]:
 def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
+
+    source_file = os.path.join(cur_dir, source_filename)
+    ninja_log = os.path.join(build_dir, ".ninja_log")
+    should_rebuild = False
+
+    if os.path.exists(source_file) and os.path.exists(ninja_log):
+        if os.path.getmtime(source_file) > os.path.getmtime(ninja_log):
+            should_rebuild = True
+    else:
+        should_rebuild = True
+
+    if not should_rebuild:
+        try:
+            return _import_module_from_library(name, build_dir, is_python_module=False)
+        except ImportError:
+            pass
 
     includes = []
     try:
@@ -73,6 +89,7 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
         verbose=False,
         is_python_module=False,
     )
+    Path(ninja_log).touch(exist_ok=True)
 
 
 def _config_compatible(cfg, M, N, K):
