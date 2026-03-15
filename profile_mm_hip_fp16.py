@@ -32,7 +32,7 @@ def main():
     cfg = tuple(int(x.strip()) for x in args.config.split(","))
 
     def run_fn():
-        return mm_hip_fp16_configured(a, b_prepacked, bias, torch.float16, cfg)
+        return mm_hip_fp16_configured(a, b_prepacked, bias, torch.float16, *cfg)
 
     print("Warming up...")
     for _ in range(3):

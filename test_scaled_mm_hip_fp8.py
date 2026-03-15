@@ -17,14 +17,7 @@ def test_config(cfg, M, N, K, device, with_scale=True, with_bias=True):
     b_prepacked = prepack_b_for_scaled_mm(b)
 
     try:
-        out_hip = scaled_mm_hip_fp8_configured(
-            a,
-            b_prepacked,
-            scale if with_scale else None,
-            bias if with_bias else None,
-            torch.float16,
-            cfg,
-        )
+        out_hip = scaled_mm_hip_fp8_configured(a, b_prepacked, scale if with_scale else None, bias if with_bias else None, torch.float16, *cfg)
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
 
