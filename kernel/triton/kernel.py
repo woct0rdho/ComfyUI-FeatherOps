@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 
 from .autotune import exceeds_smem_capacity, get_autotune_configs, prune_configs
-from .naive import scaled_mm_naive
 
 
 # Flush denormalized values to signed zero, and ignore nan
@@ -186,17 +185,3 @@ def scaled_mm_triton(
         HAS_BIAS=(bias is not None),
     )
     return c
-
-
-def scaled_mm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    native_dtypes = {torch.float16, torch.bfloat16, torch.float32}
-    if a.dtype in native_dtypes and b.dtype in native_dtypes:
-        return scaled_mm_naive(a, b, scale, bias, out_dtype)
-    else:
-        return scaled_mm_triton(a, b, scale, bias, out_dtype)
