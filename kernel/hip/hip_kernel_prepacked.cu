@@ -336,6 +336,12 @@ __global__ void scaled_mm_kernel_prepacked_b(
                     const int row_logi = subgroup * 8 + acc_idx;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
                     half val = __float2half_rn(acc[repeat_idx][acc_idx]);
+                    int is_inf = __hisinf(val);
+                    if (is_inf == 1) {
+                        val = __float2half_rn(65504.0f);
+                    } else if (is_inf == -1) {
+                        val = __float2half_rn(-65504.0f);
+                    }
                     val = __hmul(val, scale_h);
                     sh_c[row_phys * kCStride + col] = val;
                 }
