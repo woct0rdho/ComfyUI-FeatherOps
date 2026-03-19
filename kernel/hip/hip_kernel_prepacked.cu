@@ -452,6 +452,14 @@ extern "C" bool launch_scaled_mm_prepacked(
     // Autotune configs
     // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     return
+        try_launch(ConfigTag<1, 1, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 4, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 4, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 4, 1, 2>{}) ||
         try_launch(ConfigTag<1, 1, 2, 2, 2>{}) ||
         try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
         try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
