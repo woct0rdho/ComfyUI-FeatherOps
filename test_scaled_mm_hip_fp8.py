@@ -57,7 +57,7 @@ def main():
     failed_configs = []
     passed_configs = []
 
-    for cfg in sorted(_CONFIGS):
+    for cfg in _CONFIGS:
         warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
         block_m = 16 * warps_m * repeat_m
         block_n = 16 * warps_n * repeat_n

@@ -59,6 +59,14 @@ def _(
 scaled_mm_hip_prepacked_configured = _configured_op
 
 _CONFIGS = [
+    (1, 1, 2, 1, 2),
+    (1, 1, 4, 1, 2),
+    (1, 2, 2, 1, 2),
+    (1, 2, 4, 1, 2),
+    (1, 4, 2, 1, 2),
+    (1, 4, 4, 1, 2),
+    (1, 8, 2, 1, 2),
+    (1, 8, 4, 1, 2),
     (1, 1, 2, 2, 2),
     (1, 1, 4, 2, 2),
     (1, 1, 2, 4, 4),
@@ -80,6 +88,8 @@ _CONFIGS = [
     (4, 2, 2, 2, 4),
     (4, 2, 4, 2, 4),
 ]
+# TODO: Sort configs with a better heuristic to find the fastest one
+_CONFIGS = sorted(_CONFIGS, key=lambda x: (x[0], x[1], x[3], x[4], x[2]))
 
 
 @torch.library.custom_op("feather_ops_internal::scaled_mm_prepacked_autotuned", mutates_args=())
