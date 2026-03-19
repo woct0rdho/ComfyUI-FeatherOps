@@ -20,7 +20,8 @@ def test_config(cfg, M, N, K, device, with_scale=True, with_bias=True):
     except Exception as e:
         return False, f"LAUNCH ERROR: {e}"
 
-    out_ref = scaled_mm_naive(a, b, scale if with_scale else None, bias if with_bias else None, torch.float16)
+    # out_ref = scaled_mm_naive(a, b, scale if with_scale else None, bias if with_bias else None, torch.float16)
+    out_ref = scaled_mm_naive(a, b_prepacked, scale if with_scale else None, bias if with_bias else None, torch.float16, b_prepacked=True)
 
     diff = (out_hip.float() - out_ref.float()).abs()
     ref_abs = out_ref.float().abs()

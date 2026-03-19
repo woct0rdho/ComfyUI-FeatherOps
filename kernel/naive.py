@@ -9,7 +9,13 @@ def scaled_mm_naive(
     scale: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     out_dtype: torch.dtype,
+    b_prepacked: bool = False,
 ) -> torch.Tensor:
+    if b_prepacked:
+        # (K/16, N, 16) -> (K, N)
+        k, N, _ = b.shape
+        b = b.permute(0, 2, 1).reshape(k * 16, N)
+
     mm_dtype = torch.float16
     a = a.to(mm_dtype)
     b = b.to(mm_dtype)
