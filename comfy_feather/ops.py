@@ -14,7 +14,7 @@ def prepack_transpose(x):
 
 # (K/16, N, 16) -> (N, K)
 def unprepack_transpose(x):
-    k, N = x.shape
+    k, N, _ = x.shape
     return x.permute(1, 0, 2).reshape(N, k * 16)
 
 
