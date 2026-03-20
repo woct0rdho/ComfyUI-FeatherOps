@@ -5,8 +5,8 @@ import gc
 import torch
 import triton
 
-from kernel.kernel import scaled_mm_triton
 from kernel.naive import scaled_mm_naive
+from kernel.triton.kernel import scaled_mm_triton
 
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
