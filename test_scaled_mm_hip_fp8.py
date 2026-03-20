@@ -6,31 +6,29 @@ from kernel.hip.hip_kernel_fp8 import _CONFIGS, prepack_b_for_scaled_mm, scaled_
 from kernel.naive import scaled_mm_naive
 
 
-def test_config(cfg, M, N, K, device, with_scale=True, with_bias=True):
-    """Test a specific config and return (pass, error_msg)."""
+def test_config(cfg, M, N, K, device):
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float8_e5m2)
     b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e5m2)
-
     scale = torch.tensor(2.34, device=device, dtype=torch.float16)
     bias = torch.randn(N, device=device, dtype=torch.float16)
+    out_dtype = torch.float16
 
     b_prepacked = prepack_b_for_scaled_mm(b)
+    out_hip = scaled_mm_hip_fp8_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
 
-    try:
-        out_hip = scaled_mm_hip_fp8_configured(a, b_prepacked, scale if with_scale else None, bias if with_bias else None, torch.float16, *cfg)
-    except Exception as e:
-        return False, f"LAUNCH ERROR: {e}"
+    out_ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
 
-    out_ref = scaled_mm_naive(a, b, scale if with_scale else None, bias if with_bias else None, torch.float16)
+    out_hip = out_hip.float()
+    out_ref = out_ref.float()
+    diff = (out_hip - out_ref).abs()
+    l2_rel_err = diff.norm() / out_ref.abs().norm().clamp_min(1e-6)
+    l2_rel_err = l2_rel_err.item()
+    max_abs_err = diff.max().item()
 
-    diff = (out_hip.float() - out_ref.float()).abs()
-    ref_abs = out_ref.float().abs()
-    l2_rel = diff.norm() / ref_abs.norm().clamp_min(1e-6)
-    max_diff = diff.max().item()
-
-    if l2_rel.item() > 0.01 or max_diff > 1.0:
-        return False, f"rel_l2={l2_rel.item():.3g} max_atol={max_diff:.3g}"
-    return True, f"rel_l2={l2_rel.item():.3g} max_atol={max_diff:.3g}"
+    atol_threshold = 8 if out_dtype == torch.bfloat16 else 1
+    if l2_rel_err > 0.01 or max_abs_err > atol_threshold:
+        return False, f"l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
+    return True, f"l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
 
 
 def main():
@@ -71,7 +69,7 @@ def main():
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
 
-            passed, msg = test_config(cfg, M, N, K, device, with_scale=True, with_bias=True)
+            passed, msg = test_config(cfg, M, N, K, device)
             if not passed:
                 config_passed = False
                 config_errors.append(f"  M={M} N={N} K={K}: {msg}")
