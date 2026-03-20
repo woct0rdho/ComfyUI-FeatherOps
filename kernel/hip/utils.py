@@ -78,9 +78,12 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cflags
         + [
-            "-U__HIP_NO_HALF_OPERATORS__",
             "-U__HIP_NO_HALF_CONVERSIONS__",
+            "-U__HIP_NO_HALF_OPERATORS__",
             "-U__HIP_NO_HALF2_OPERATORS__",
+            "-U__HIP_NO_BFLOAT16_CONVERSIONS__",
+            "-U__HIP_NO_BFLOAT16_OPERATORS__",
+            "-U__HIP_NO_BFLOAT162_OPERATORS__",
         ],
         extra_ldflags=extra_ldflags,
         extra_include_paths=includes,

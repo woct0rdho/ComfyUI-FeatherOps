@@ -13,6 +13,30 @@
 
 namespace {
 
+struct bfloat16_t {
+    unsigned short data;
+
+    __device__ __forceinline__ bfloat16_t() = default;
+
+    __device__ __forceinline__ bfloat16_t(const float f) {
+        const unsigned int u = *reinterpret_cast<const unsigned int*>(&f);
+        data = static_cast<unsigned short>(u >> 16);
+    }
+
+    __device__ __forceinline__ operator float() const {
+        const unsigned int u = static_cast<unsigned int>(data) << 16;
+        return *reinterpret_cast<const float*>(&u);
+    }
+};
+
+// __device__ __forceinline__ bfloat16_t operator*(const bfloat16_t a, const bfloat16_t b) {
+//     return bfloat16_t(static_cast<float>(a) * static_cast<float>(b));
+// }
+//
+// __device__ __forceinline__ bfloat16_t operator+(const bfloat16_t a, const bfloat16_t b) {
+//     return bfloat16_t(static_cast<float>(a) + static_cast<float>(b));
+// }
+
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
@@ -71,9 +95,9 @@ template <int kBlockWarpsM,
 __global__ void scaled_mm_kernel_prepacked_b(
     const half* const a,
     const uint8_t* const b_prepacked,
-    const half* const scale,
-    const half* const bias,
-    half* const c,
+    const bfloat16_t* const scale,
+    const bfloat16_t* const bias,
+    bfloat16_t* const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -104,7 +128,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
             half a[kShASize];
             uint8_t b[kUnrollK][kBlockN][kWmmaK];
         } ab;
-        half c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
+        float c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
     __shared__ __align__(16) SharedStorage sh;
 
@@ -312,9 +336,9 @@ __global__ void scaled_mm_kernel_prepacked_b(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        half* const sh_c = sh.c[wave_id][0];
+        float* const sh_c = sh.c[wave_id][0];
 
-        const half scale_h = has_scale ? scale[0] : __float2half_rn(1.0f);
+        const float scale_f = has_scale ? static_cast<float>(scale[0]) : 1.0f;
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
 
@@ -335,15 +359,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logi = subgroup * 8 + acc_idx;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    half val = __float2half_rn(acc[repeat_idx][acc_idx]);
-                    int is_inf = __hisinf(val);
-                    if (is_inf == 1) {
-                        val = __float2half_rn(65504.0f);
-                    } else if (is_inf == -1) {
-                        val = __float2half_rn(-65504.0f);
-                    }
-                    val = __hmul(val, scale_h);
-                    sh_c[row_phys * kCStride + col] = val;
+                    sh_c[row_phys * kCStride + col] = acc[repeat_idx][acc_idx] * scale_f;
                 }
 
                 // Wave executes in lockstep (SIMT), so all writes complete before reads
@@ -359,17 +375,24 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                half* const out_ptr = c + out_row * stride_cm + out_col;
-                half* const h = sh_c + read_row_phys * kCStride + read_col_base;
+                bfloat16_t* const out_ptr = c + out_row * stride_cm + out_col;
+                float* const h = sh_c + read_row_phys * kCStride + read_col_base;
+
+                bfloat16_t out_buf[8];
 
                 if (has_bias) {
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        h[i] = __hadd(h[i], bias[out_col + i]);
+                        out_buf[i] = bfloat16_t(h[i] + static_cast<float>(bias[out_col + i]));
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        out_buf[i] = bfloat16_t(h[i]);
                     }
                 }
 
-                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
+                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(out_buf);
             }
         }
     }
@@ -389,9 +412,9 @@ struct ConfigTag {
 extern "C" bool launch_scaled_mm_prepacked(
     const half* a,
     const uint8_t* b_prepacked,
-    const half* scale,
-    const half* bias,
-    half* c,
+    const bfloat16_t* scale,
+    const bfloat16_t* bias,
+    bfloat16_t* c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -511,7 +534,7 @@ void scaled_mm_prepacked(
     STD_TORCH_CHECK(c.get_device_index() == device_index, "c must be on the same device as a");
 
     STD_TORCH_CHECK(a.scalar_type() == torch::stable::ScalarType::Half, "a must be float16");
-    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half, "c must be float16");
+    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::BFloat16, "c must be bfloat16");
     STD_TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
     if (b_dtype == 0) {
         STD_TORCH_CHECK(b_prepacked.scalar_type() == torch::stable::ScalarType::Float8_e4m3fn, "b_prepacked must be float8_e4m3fn when b_dtype=0");
@@ -543,7 +566,7 @@ void scaled_mm_prepacked(
         STD_TORCH_CHECK(scale_t.is_cuda(), "scale must be a CUDA tensor");
         STD_TORCH_CHECK(scale_t.get_device_index() == device_index, "scale must be on the same device as a");
         STD_TORCH_CHECK(scale_t.numel() == 1, "scale must have one element");
-        STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::Half, "scale must be float16");
+        STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::BFloat16, "scale must be bfloat16");
     }
     if (bias.has_value()) {
         STD_TORCH_CHECK(bias.has_value(), "bias must be provided when has_bias=True");
@@ -551,7 +574,7 @@ void scaled_mm_prepacked(
         STD_TORCH_CHECK(bias_t.is_cuda(), "bias must be a CUDA tensor");
         STD_TORCH_CHECK(bias_t.get_device_index() == device_index, "bias must be on the same device as a");
         STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
-        STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::Half, "bias must be float16");
+        STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::BFloat16, "bias must be bfloat16");
     }
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
@@ -562,9 +585,9 @@ void scaled_mm_prepacked(
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.const_data_ptr());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr());
-    const half* const scale_ptr = scale.has_value() ? reinterpret_cast<const half*>(scale->const_data_ptr()) : nullptr;
-    const half* const bias_ptr = bias.has_value() ? reinterpret_cast<const half*>(bias->const_data_ptr()) : nullptr;
-    half* const c_ptr = reinterpret_cast<half*>(c.mutable_data_ptr());
+    const bfloat16_t* const scale_ptr = scale.has_value() ? reinterpret_cast<const bfloat16_t*>(scale->const_data_ptr()) : nullptr;
+    const bfloat16_t* const bias_ptr = bias.has_value() ? reinterpret_cast<const bfloat16_t*>(bias->const_data_ptr()) : nullptr;
+    bfloat16_t* const c_ptr = reinterpret_cast<bfloat16_t*>(c.mutable_data_ptr());
 
     const auto is_aligned_16 = [](const void* const p) {
         return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;

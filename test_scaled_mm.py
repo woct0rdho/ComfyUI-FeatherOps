@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import torch
-
 from kernel.kernel import scaled_mm_triton
+
 from kernel.naive import scaled_mm_naive
 
 # scaled_mm_naive = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
@@ -29,8 +29,10 @@ def main():
     out_triton = out_triton.float()
     out_ref = out_ref.float()
     diff = (out_triton - out_ref).abs()
-    rdiff = diff / out_ref.abs()
-    print(f"mean_rtol={rdiff.mean().item():.3g} max_rtol={rdiff.max().item():.3g} mean_atol={diff.max().item():.3g} max_atol={diff.max().item():.3g}")
+    l2_rel_err = diff.norm() / out_ref.abs().norm().clamp_min(1e-6)
+    l2_rel_err = l2_rel_err.item()
+    max_abs_err = diff.max().item()
+    print(f"l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
 
 
 if __name__ == "__main__":
