@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 import torch
-from kernel.kernel import scaled_mm_triton
 
 from kernel.naive import scaled_mm_naive
+from kernel.triton.kernel import scaled_mm_triton
 
 # scaled_mm_naive = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 # scaled_mm_triton = torch.compile(scaled_mm_triton, fullgraph=True, dynamic=False, mode="max-autotune")

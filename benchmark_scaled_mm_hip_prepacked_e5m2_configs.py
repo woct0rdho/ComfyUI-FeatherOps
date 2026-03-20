@@ -64,7 +64,7 @@ def _run_config(
     warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
 
     def run_kernel():
-        scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
+        scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.bfloat16, *cfg)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(run_kernel, warmup=warmup, rep=rep, quantiles=quantiles)
@@ -107,8 +107,8 @@ def main() -> None:
         b = torch.randn(k, n, device=device, dtype=torch.float32).to(torch.float8_e5m2)
         b_prepacked = prepack_b_for_scaled_mm(b)
 
-        scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.float16)
-        bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.float16)
+        scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.bfloat16)
+        bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.bfloat16)
 
         for cfg in configs:
             seconds = _run_config(
