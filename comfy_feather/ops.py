@@ -45,9 +45,6 @@ class FeatherOps(manual_cast):
             super().__init__(*args, **kwargs)
             self.is_quantized = False
             self.weight_scale = None
-            self.lora_A = None
-            self.lora_B = None
-            self.lora_alpha = None
             self.prefix = None
 
         def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -76,7 +73,7 @@ class FeatherOps(manual_cast):
                 else:
                     self.is_quantized = True
 
-                    # For now we only support fp8e5m2 weight
+                    # Currently the kernel only supports fp8e5m2 weight
                     weight = weight.to(torch.float8_e5m2)
                     check_tensor(weight, weight_key)
                     weight = prepack_transpose(weight)
@@ -101,7 +98,7 @@ class FeatherOps(manual_cast):
             if not self.is_quantized:
                 weight = weight.to(self.weight.dtype)
             else:
-                # For now we only support fp8e5m2 weight
+                # Currently the kernel only supports fp8e5m2 weight
                 weight = weight.to(torch.float8_e5m2)
                 check_tensor(weight, self.prefix + "weight")
                 weight = prepack_transpose(weight)
@@ -116,47 +113,69 @@ class FeatherOps(manual_cast):
             run_every_op()
 
             if not self.is_quantized:
-                check_tensor(x, self.prefix + "x in forward")
+                check_tensor(x, self.prefix + "x")
                 stat_tensor(x, self.prefix + "x")
                 weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
                 y = F.linear(x, weight, bias)
                 uncast_bias_weight(self, weight, bias, offload_stream)
-                # TODO: Check whether we need to implement lora here
-                # We should not use the quantized linear op for lora
-                check_tensor(y, self.prefix + "y in forward")
+                check_tensor(y, self.prefix + "y")
                 stat_tensor(y, self.prefix + "y")
                 return y
 
-            # For now we only support fp16 x, bf16 scale/bias/y
-            check_tensor(x, self.prefix + "x in forward before conversion to fp16")
-            x_dtype_orig = x.dtype
-            x = x.to(torch.float16)
-            check_tensor(x, self.prefix + "x in forward after conversion to fp16")
-            stat_tensor(x, self.prefix + "x")
+            check_tensor(x, self.prefix + "x")
+
+            x_shape_orig = x.shape
+            x = x.reshape(-1, x_shape_orig[-1])
+
+            # Currently the kernel only supports fp16 x, bf16 scale/bias/out
+            x_fp16 = x.to(torch.float16)
+            check_tensor(x_fp16, self.prefix + "x_fp16")
+            stat_tensor(x_fp16, self.prefix + "x_fp16")
+
+            # Temporarily clear weight_function so cast_bias_weight does not apply patches to prepacked weight
+            saved_weight_function = self.weight_function
+            self.weight_function = []
 
             weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=torch.bfloat16, offloadable=True)
             scale = self.weight_scale.to(device=x.device, dtype=torch.bfloat16) if self.weight_scale is not None else None
 
-            x_shape_orig = x.shape
-            x = x.view(-1, x_shape_orig[-1])
-
-            y = scaled_mm_hip_prepacked(x, weight, scale, bias, out_dtype=torch.bfloat16)
-
-            check_tensor(y, self.prefix + "y in forward")
+            y = scaled_mm_hip_prepacked(x_fp16, weight, scale, bias, out_dtype=torch.bfloat16)
+            check_tensor(y, self.prefix + "y")
             stat_tensor(y, self.prefix + "y")
 
             uncast_bias_weight(self, weight, bias, offload_stream)
 
-            y = y.to(x_dtype_orig)
+            y = y.to(x.dtype)
 
-            if self.lora_A is not None and self.lora_B is not None:
-                lora_A = self.lora_A.to(x.device)
-                lora_B = self.lora_B.to(x.device)
-                lora_x = F.linear(x.to(lora_A.dtype), lora_A)
-                lora_y = F.linear(lora_x, lora_B)
-                if self.lora_alpha is not None:
-                    lora_alpha = self.lora_alpha.to(x.device)
-                    lora_y = lora_y * lora_alpha
-                y = y + lora_y.to(y.dtype)
+            # Apply LoRA
+            self.weight_function = saved_weight_function
+            for patch_fn in self.weight_function:
+                if not (hasattr(patch_fn, "patches") and hasattr(patch_fn, "key")):
+                    raise NotImplementedError("FeatherOps currently only supports basic LoRA")
+
+                patches = patch_fn.patches.get(patch_fn.key, [])
+                for patch_data in patches:
+                    # patch_data: (strength_patch, adapter, strength_model, offset, function)
+                    strength_patch = patch_data[0]
+                    adapter = patch_data[1]
+                    strength_model = patch_data[2]
+
+                    if not hasattr(adapter, "weights") or adapter.weights is None:
+                        raise NotImplementedError("FeatherOps currently only supports basic LoRA")
+
+                    weights = adapter.weights
+                    lora_B = weights[0]
+                    lora_A = weights[1]
+                    alpha = weights[2] if weights[2] is not None else 1
+
+                    rank = lora_A.shape[0]
+                    lora_scale = strength_patch * strength_model * (alpha / rank)
+
+                    lora_A = lora_A.to(device=x.device, dtype=x.dtype)
+                    lora_B = lora_B.to(device=x.device, dtype=x.dtype)
+
+                    temp = F.linear(x, lora_A)
+                    temp = F.linear(temp, lora_B)
+                    y += temp * lora_scale
 
             return y.view(*x_shape_orig[:-1], y.shape[-1])
