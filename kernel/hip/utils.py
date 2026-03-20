@@ -5,7 +5,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch._inductor.kernel.custom_op as inductor_custom_op
 from torch._inductor.kernel.custom_op import CustomOpConfig
+from torch._inductor.select_algorithm import realize_inputs
 from torch.fx.experimental.symbolic_shapes import hint_int
 from torch.utils.cpp_extension import _import_module_from_library, load
 
@@ -93,6 +95,36 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
         is_python_module=False,
     )
     Path(ninja_log).touch(exist_ok=True)
+
+
+def patch_inductor_custom_op_autotune_realize_inputs():
+    if getattr(inductor_custom_op.autotune_custom_op, "_featherops_realize_inputs_patch", False):
+        return
+
+    original_autotune_custom_op = inductor_custom_op.autotune_custom_op
+
+    @functools.wraps(original_autotune_custom_op)
+    def wrapped_autotune_custom_op(
+        *,
+        name: str,
+        decompositions: list[Callable[..., Any]],
+        inputs: list[Any],
+        non_tensor_args: list[dict[str, Any]],
+        op_overload: torch._ops.OpOverload,
+        user_input_gen_fns: Optional[dict[str, Callable[[torch.Tensor], torch.Tensor]]] = None,
+    ):
+        realized_inputs = realize_inputs(*inputs)
+        return original_autotune_custom_op(
+            name=name,
+            decompositions=decompositions,
+            inputs=realized_inputs,
+            non_tensor_args=non_tensor_args,
+            op_overload=op_overload,
+            user_input_gen_fns=user_input_gen_fns,
+        )
+
+    wrapped_autotune_custom_op._featherops_realize_inputs_patch = True
+    inductor_custom_op.autotune_custom_op = wrapped_autotune_custom_op
 
 
 def _config_compatible(cfg, M, N, K):

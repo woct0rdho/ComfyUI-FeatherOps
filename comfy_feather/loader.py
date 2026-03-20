@@ -27,11 +27,13 @@ class FeatherUNetLoader:
 
         if model_type == "qwen":
             FeatherOps.excluded_names = [
+                # Non-repeating modules
                 "time_text_embed",
                 "img_in",
                 "norm_out",
                 "proj_out",
                 "txt_in",
+                # Modules with time embedding vector as input
                 "img_mod",
                 "txt_mod",
             ]
@@ -75,7 +77,7 @@ class FeatherCLIPTextEncodePadded:
             for i in range(len(tokens[k])):
                 current_len = len(tokens[k][i])
 
-                # Account for Qwen template slicing which cuts off the prefix
+                # Fix for Qwen system prompt
                 template_end = 0
                 if k == "qwen25_7b":
                     count_im_start = 0

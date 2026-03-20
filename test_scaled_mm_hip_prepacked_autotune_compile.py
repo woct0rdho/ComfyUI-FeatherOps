@@ -72,12 +72,45 @@ def test_torch_compile_autotuned(device):
     _check_close(out, ref, "torch.compile autotuned", out_dtype)
 
 
+def test_torch_compile_autotuned_no_scale(device):
+    a, b, b_prepacked, _, bias, out_dtype = _make_inputs(512, 512, 512, device)
+    scale = None
+
+    @torch.compile(fullgraph=True, mode="max-autotune")
+    def compiled_fn(a, b_prepacked, bias):
+        return scaled_mm_hip_prepacked(a, b_prepacked, scale, bias, out_dtype)
+
+    out = compiled_fn(a, b_prepacked, bias)
+    ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
+    _check_close(out, ref, "torch.compile autotuned no scale", out_dtype)
+
+
+def test_torch_compile_view_input_no_scale(device):
+    x = torch.randn((2, 16, 3072), device=device, dtype=torch.bfloat16)
+    b = torch.randn((3072, 3072), device=device, dtype=torch.float32).to(torch.float8_e5m2)
+    b_prepacked = prepack_b_for_scaled_mm(b)
+    bias = torch.randn(3072, device=device, dtype=torch.bfloat16)
+    out_dtype = torch.bfloat16
+
+    @torch.compile(fullgraph=True, mode="max-autotune")
+    def compiled_fn(x, b_prepacked, bias):
+        x = x.to(torch.float16)
+        x = x.view(-1, x.shape[-1])
+        return scaled_mm_hip_prepacked(x, b_prepacked, None, bias, out_dtype)
+
+    out = compiled_fn(x, b_prepacked, bias)
+    ref = scaled_mm_naive(x.to(torch.float16).view(-1, 3072), b, None, bias, out_dtype)
+    _check_close(out, ref, "torch.compile view input no scale", out_dtype)
+
+
 def main():
     device = "cuda"
     test_eager_configured(device)
     test_torch_compile_configured(device)
     test_eager_autotuned(device)
     test_torch_compile_autotuned(device)
+    test_torch_compile_autotuned_no_scale(device)
+    test_torch_compile_view_input_no_scale(device)
     print("Configured and autotuned torch.compile tests passed")
 
 
