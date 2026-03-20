@@ -64,7 +64,7 @@ class FeatherOps(manual_cast):
             if weight is not None:
                 is_excluded = any(x in prefix for x in FeatherOps.excluded_names)
                 is_dim1 = self.in_features == 1 or self.out_features == 1 or weight.ndim == 1
-                # The kernel requires the inner dimension (which is in_features) to be a multiple of 16
+                # The kernel requires in_features to be a multiple of 16
                 if is_excluded or is_dim1 or self.in_features % 16 != 0:
                     if self.in_features % 16 != 0:
                         print(f"Warning: Not prepacked {weight_key} {tuple(weight.shape)}")
@@ -124,29 +124,20 @@ class FeatherOps(manual_cast):
                 stat_tensor(y, self.prefix + "y")
                 return y
 
-            # For now we only support fp16 x
+            # For now we only support fp16 x, bf16 scale/bias/y
             check_tensor(x, self.prefix + "x in forward before conversion to fp16")
             x_dtype_orig = x.dtype
             x = x.to(torch.float16)
             check_tensor(x, self.prefix + "x in forward after conversion to fp16")
             stat_tensor(x, self.prefix + "x")
 
-            weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=torch.bfloat16, offloadable=True)
+            weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=torch.bfloat16, offloadable=True)
             scale = self.weight_scale.to(device=x.device, dtype=torch.bfloat16) if self.weight_scale is not None else None
 
             x_shape_orig = x.shape
             x = x.view(-1, x_shape_orig[-1])
 
-            M = x.shape[0]
-            pad_len = (16 - (M % 16)) % 16
-            if pad_len > 0:
-                x = F.pad(x, (0, 0, 0, pad_len))
-
             y = scaled_mm_hip_prepacked(x, weight, scale, bias, out_dtype=torch.bfloat16)
-
-            if pad_len > 0:
-                x = x[:M, :]
-                y = y[:M, :]
 
             check_tensor(y, self.prefix + "y in forward")
             stat_tensor(y, self.prefix + "y")
