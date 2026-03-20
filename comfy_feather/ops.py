@@ -56,10 +56,13 @@ class FeatherOps(manual_cast):
             weight_key = prefix + "weight"
             bias_key = prefix + "bias"
             scale_key = prefix + "weight_scale"
+            scale_key_legacy = prefix + "scale_weight"
 
             weight = state_dict.pop(weight_key, None)
             bias = state_dict.pop(bias_key, None)
             weight_scale = state_dict.pop(scale_key, None)
+            if weight_scale is None:
+                weight_scale = state_dict.pop(scale_key_legacy, None)
 
             if weight is not None:
                 is_excluded = any(x in prefix for x in FeatherOps.excluded_names)
