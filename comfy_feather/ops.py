@@ -5,25 +5,6 @@ from torch import nn
 
 from ..kernel.hip.hip_kernel_prepacked import scaled_mm_hip_prepacked
 
-DEBUG = False
-
-
-def check_tensor(x, name):
-    if not DEBUG:
-        return
-    if torch.isnan(x).any():
-        raise RuntimeError(f"nan {name}")
-    if torch.isinf(x).any():
-        raise RuntimeError(f"inf {name}")
-
-
-def stat_tensor(x, name):
-    if not DEBUG:
-        return
-    dtype = x.dtype
-    x = x.float()
-    print(f"{name} {tuple(x.shape)} {dtype} {x.mean():.3g} {x.std():.3g} {x.abs().max():.3g}")
-
 
 # (N, K) -> (K/16, N, 16)
 def prepack_transpose(x):
@@ -45,11 +26,8 @@ class FeatherOps(manual_cast):
             super().__init__(*args, **kwargs)
             self.is_quantized = False
             self.weight_scale = None
-            self.prefix = None
 
         def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-            self.prefix = prefix
-
             weight_key = prefix + "weight"
             bias_key = prefix + "bias"
             scale_key = prefix + "weight_scale"
@@ -75,7 +53,6 @@ class FeatherOps(manual_cast):
 
                     # Currently the kernel only supports fp8e5m2 weight
                     weight = weight.to(torch.float8_e5m2)
-                    check_tensor(weight, weight_key)
                     weight = prepack_transpose(weight)
                     self.weight = nn.Parameter(weight, requires_grad=False)
 
@@ -100,7 +77,6 @@ class FeatherOps(manual_cast):
             else:
                 # Currently the kernel only supports fp8e5m2 weight
                 weight = weight.to(torch.float8_e5m2)
-                check_tensor(weight, self.prefix + "weight")
                 weight = prepack_transpose(weight)
 
             if return_weight:
@@ -113,24 +89,16 @@ class FeatherOps(manual_cast):
             run_every_op()
 
             if not self.is_quantized:
-                check_tensor(x, self.prefix + "x")
-                stat_tensor(x, self.prefix + "x")
                 weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
                 y = F.linear(x, weight, bias)
                 uncast_bias_weight(self, weight, bias, offload_stream)
-                check_tensor(y, self.prefix + "y")
-                stat_tensor(y, self.prefix + "y")
                 return y
-
-            check_tensor(x, self.prefix + "x")
 
             x_shape_orig = x.shape
             x = x.reshape(-1, x_shape_orig[-1])
 
             # Currently the kernel only supports fp16 x, bf16 scale/bias/out
             x_fp16 = x.to(torch.float16)
-            check_tensor(x_fp16, self.prefix + "x_fp16")
-            stat_tensor(x_fp16, self.prefix + "x_fp16")
 
             # Temporarily clear weight_function so cast_bias_weight does not apply patches to prepacked weight
             saved_weight_function = self.weight_function
@@ -140,8 +108,6 @@ class FeatherOps(manual_cast):
             scale = self.weight_scale.to(device=x.device, dtype=torch.bfloat16) if self.weight_scale is not None else None
 
             y = scaled_mm_hip_prepacked(x_fp16, weight, scale, bias, out_dtype=torch.bfloat16)
-            check_tensor(y, self.prefix + "y")
-            stat_tensor(y, self.prefix + "y")
 
             uncast_bias_weight(self, weight, bias, offload_stream)
 
