@@ -58,7 +58,7 @@ def main():
     passed_configs = []
 
     for cfg in _CONFIGS:
-        warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
+        warps_m, warps_n, unroll_k, repeat_m, repeat_n, split_k = cfg
         block_m = 16 * warps_m * repeat_m
         block_n = 16 * warps_n * repeat_n
         chunk_k = 16 * unroll_k
@@ -68,7 +68,7 @@ def main():
 
         for M, N, K in test_sizes:
             # Skip sizes that don't satisfy divisibility for this config
-            if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
+            if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0 or (K // chunk_k) % split_k != 0:
                 continue
 
             passed, msg = test_config(cfg, M, N, K, device)

@@ -29,6 +29,8 @@ extern "C" bool launch_scaled_mm(
     const half* scale,
     const half* bias,
     half* c,
+    float* workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -56,13 +58,14 @@ struct Options
     int unroll_k = 4;
     int repeat_m = 8;
     int repeat_n = 2;
+    int split_k_factor = 1;
 };
 
 void print_usage(const char* argv0)
 {
     std::cout << "Usage: " << argv0
-              << " [--m M] [--n N] [--k K] [--warmup W] [--iters I] [--warps_m M] [--warps_n N] [--unroll U] [--repeat_m RM] [--repeat_n RN]\n"
-              << "Defaults: --m 8192 --n 8192 --k 8192 --warmup 10 --iters 50 --warps_m 1 --warps_n 8 --unroll 4 --repeat_m 8 --repeat_n 2\n";
+              << " [--m M] [--n N] [--k K] [--warmup W] [--iters I] [--warps_m M] [--warps_n N] [--unroll U] [--repeat_m RM] [--repeat_n RN] [--split_k SK]\n"
+              << "Defaults: --m 8192 --n 8192 --k 8192 --warmup 10 --iters 50 --warps_m 1 --warps_n 8 --unroll 4 --repeat_m 8 --repeat_n 2 --split_k 1\n";
 }
 
 Options parse_args(int argc, char** argv)
@@ -90,6 +93,7 @@ Options parse_args(int argc, char** argv)
         else if (arg == "--unroll") { need_value("--unroll"); opts.unroll_k = std::stoi(argv[++i]); }
         else if (arg == "--repeat_m") { need_value("--repeat_m"); opts.repeat_m = std::stoi(argv[++i]); }
         else if (arg == "--repeat_n") { need_value("--repeat_n"); opts.repeat_n = std::stoi(argv[++i]); }
+        else if (arg == "--split_k") { need_value("--split_k"); opts.split_k_factor = std::stoi(argv[++i]); }
         else if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
@@ -103,9 +107,9 @@ Options parse_args(int argc, char** argv)
         }
     }
 
-    if (opts.m <= 0 || opts.n <= 0 || opts.k <= 0 || opts.warmup_iters < 0 || opts.iters <= 0)
+    if (opts.m <= 0 || opts.n <= 0 || opts.k <= 0 || opts.warmup_iters < 0 || opts.iters <= 0 || opts.split_k_factor <= 0)
     {
-        std::cerr << "All sizes must be positive, warmup must be non-negative, and iters must be positive."
+        std::cerr << "All sizes and split_k must be positive, warmup must be non-negative, and iters must be positive."
                   << std::endl;
         std::exit(EXIT_FAILURE);
     }
@@ -120,6 +124,10 @@ int main(int argc, char** argv)
     const int64_t chunk_k = 16 * opts.unroll_k;
     if (opts.k % chunk_k != 0) {
         std::cerr << "K must be divisible by 16 * unroll_k (" << chunk_k << ")" << std::endl;
+        return 1;
+    }
+    if ((opts.k / chunk_k) % opts.split_k_factor != 0) {
+        std::cerr << "Total chunks (" << (opts.k / chunk_k) << ") must be divisible by split_k_factor (" << opts.split_k_factor << ")" << std::endl;
         return 1;
     }
 
@@ -138,11 +146,16 @@ int main(int argc, char** argv)
     auto options_fp16 = at::TensorOptions().dtype(at::kHalf).device(device);
     // Use Byte for FP8 E5M2 for simpler storage and access mapping
     auto options_fp8 = at::TensorOptions().dtype(at::kByte).device(device);
+    auto options_f32 = at::TensorOptions().dtype(at::kFloat).device(device);
 
     at::Tensor d_a = at::empty({opts.m, opts.k}, options_fp16);
     // b_prepacked has shape [K/16, N, 16]
     at::Tensor d_b_prepacked = at::empty({opts.k / 16, opts.n, 16}, options_fp8);
     at::Tensor d_c = at::empty({opts.m, opts.n}, options_fp16);
+    at::Tensor d_workspace = at::empty({0}, options_f32);
+    if (opts.split_k_factor > 1) {
+        d_workspace = at::empty({opts.split_k_factor, opts.m, opts.n}, options_f32);
+    }
 
     d_a.zero_();
     d_b_prepacked.zero_();
@@ -164,6 +177,8 @@ int main(int argc, char** argv)
             reinterpret_cast<const uint8_t*>(d_b_prepacked.data_ptr()),
             nullptr, nullptr,
             reinterpret_cast<half*>(d_c.data_ptr()),
+            opts.split_k_factor > 1 ? reinterpret_cast<float*>(d_workspace.data_ptr()) : nullptr,
+            opts.split_k_factor,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
             0, 0,
@@ -188,6 +203,8 @@ int main(int argc, char** argv)
             reinterpret_cast<const uint8_t*>(d_b_prepacked.data_ptr()),
             nullptr, nullptr,
             reinterpret_cast<half*>(d_c.data_ptr()),
+            opts.split_k_factor > 1 ? reinterpret_cast<float*>(d_workspace.data_ptr()) : nullptr,
+            opts.split_k_factor,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
             0, 0,

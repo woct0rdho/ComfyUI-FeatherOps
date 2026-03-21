@@ -86,6 +86,37 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logi_16(const int x)
     return ((x & 1) << 3) | ((x >> 1) & 7);
 }
 
+__global__ void scaled_mm_splitk_reduce_kernel(
+    const float* const workspace,
+    const bfloat16_t* const scale,
+    const bfloat16_t* const bias,
+    bfloat16_t* const c,
+    const int split_k_factor,
+    const int64_t M,
+    const int64_t N,
+    const int64_t stride_cm,
+    const int has_scale,
+    const int has_bias)
+{
+    const int64_t out_col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t out_row = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+
+    if (out_row < M && out_col < N) {
+        float sum = 0.0f;
+        for (int s = 0; s < split_k_factor; ++s) {
+            sum += workspace[(s * M + out_row) * N + out_col];
+        }
+
+        if (has_scale) {
+            sum *= static_cast<float>(scale[0]);
+        }
+        if (has_bias) {
+            sum += static_cast<float>(bias[out_col]);
+        }
+        c[out_row * stride_cm + out_col] = bfloat16_t(sum);
+    }
+}
+
 template <int kBlockWarpsM,
           int kBlockWarpsN,
           int kUnrollK,
@@ -98,6 +129,8 @@ __global__ void scaled_mm_kernel(
     const bfloat16_t* const scale,
     const bfloat16_t* const bias,
     bfloat16_t* const c,
+    float* const workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -230,6 +263,10 @@ __global__ void scaled_mm_kernel(
     // Pipeline setup
     constexpr int kChunkK = kWmmaK * kUnrollK;
     const int total_chunks = static_cast<int>(K / kChunkK);
+    const int chunks_per_split = total_chunks / split_k_factor;
+    const int split_idx = static_cast<int>(blockIdx.z);
+    const int start_chunk = split_idx * chunks_per_split;
+    const int end_chunk = start_chunk + chunks_per_split;
 
     // WMMA compute lambda for one sub-iteration (one stage).
     // Register-tiling: load all B fragments once, then iterate rm with A loads.
@@ -295,27 +332,29 @@ __global__ void scaled_mm_kernel(
     };
 
     // Prologue: load first chunk into LDS using monolithic loads
-    #pragma unroll
-    for (int u = 0; u < kUnrollK; ++u) {
-        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
-        load_a_lds_k0mk1(u, k);
-    }
-    #pragma unroll
-    for (int u = 0; u < kUnrollK; ++u) {
-        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
-        load_b_lds_prepacked(u, k);
+    if (start_chunk < end_chunk) {
+        #pragma unroll
+        for (int u = 0; u < kUnrollK; ++u) {
+            const int64_t k = static_cast<int64_t>(start_chunk) * kChunkK + static_cast<int64_t>(u) * kWmmaK;
+            load_a_lds_k0mk1(u, k);
+        }
+        #pragma unroll
+        for (int u = 0; u < kUnrollK; ++u) {
+            const int64_t k = static_cast<int64_t>(start_chunk) * kChunkK + static_cast<int64_t>(u) * kWmmaK;
+            load_b_lds_prepacked(u, k);
+        }
     }
     __syncthreads();
 
     // Main loop
-    for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+    for (int iter_idx = start_chunk; iter_idx < end_chunk; ++iter_idx) {
         #pragma unroll
         for (int u = 0; u < kUnrollK; ++u) {
             wmma_compute_stage(u);
         }
         __syncthreads();
 
-        if (iter_idx + 1 < total_chunks) {
+        if (iter_idx + 1 < end_chunk) {
             const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
             asm volatile("s_setprio 1" ::: "memory");
             #pragma unroll
@@ -333,59 +372,82 @@ __global__ void scaled_mm_kernel(
         }
     }
 
-    // Epilogue: C-Shuffle - write output with coalesced vec8 stores
-    // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        bfloat16_t* const sh_c = sh.c[wave_id][0];
-
         const float scale_f = has_scale ? static_cast<float>(scale[0]) : 1.0f;
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
 
-        #pragma unroll
-        for (int rm = 0; rm < kRepeatM; ++rm) {
+        if (split_k_factor == 1) {
+            // Epilogue: C-Shuffle - write output with coalesced vec8 stores
+            // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
+            bfloat16_t* const sh_c = sh.c[wave_id][0];
+
             #pragma unroll
-            for (int rn = 0; rn < kRepeatN; ++rn) {
-                const int repeat_idx = rm * kRepeatN + rn;
-                const int tile_m = warp_m + rm * kBlockWarpsM;
-                const int tile_n = warp_n + rn * kBlockWarpsN;
-                const int64_t tile_m_base = block_m + tile_m * kWmmaM;
-                const int64_t tile_n_base = block_n + tile_n * kWmmaN;
-
-                // Step 1: Write acc to LDS in column-major order (WMMA layout)
-                // Each thread writes 8 values to one column
-                const int col = lane_in_subgroup;
+            for (int rm = 0; rm < kRepeatM; ++rm) {
                 #pragma unroll
-                for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                    const int row_logi = subgroup * 8 + acc_idx;
-                    const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    sh_c[row_phys * kCStride + col] = bfloat16_t(acc[repeat_idx][acc_idx] * scale_f);
-                }
+                for (int rn = 0; rn < kRepeatN; ++rn) {
+                    const int repeat_idx = rm * kRepeatN + rn;
+                    const int tile_m = warp_m + rm * kBlockWarpsM;
+                    const int tile_n = warp_n + rn * kBlockWarpsN;
+                    const int64_t tile_m_base = block_m + tile_m * kWmmaM;
+                    const int64_t tile_n_base = block_n + tile_n * kWmmaN;
 
-                // Wave executes in lockstep (SIMT), so all writes complete before reads
-                // No explicit barrier needed within a wave
-
-                // Step 2: Read from LDS in row-major order for coalesced global write
-                // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
-                const int read_row = lane / 2;
-                const int read_row_phys = c_row_logi_to_phys_16(read_row);
-                const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
-                const int read_col_base = col_half * 8;
-
-                const int64_t out_row = tile_m_base + read_row;
-                const int64_t out_col = tile_n_base + read_col_base;
-
-                bfloat16_t* const out_ptr = c + out_row * stride_cm + out_col;
-                bfloat16_t* const h = sh_c + read_row_phys * kCStride + read_col_base;
-
-                if (has_bias) {
+                    // Step 1: Write acc to LDS in column-major order (WMMA layout)
+                    // Each thread writes 8 values to one column
+                    const int col = lane_in_subgroup;
                     #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        h[i] = h[i] + bias[out_col + i];
+                    for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
+                        const int row_logi = subgroup * 8 + acc_idx;
+                        const int row_phys = c_row_logi_to_phys_16(row_logi);
+                        sh_c[row_phys * kCStride + col] = bfloat16_t(acc[repeat_idx][acc_idx] * scale_f);
+                    }
+
+                    // Wave executes in lockstep (SIMT), so all writes complete before reads
+                    // No explicit barrier needed within a wave
+
+                    // Step 2: Read from LDS in row-major order for coalesced global write
+                    // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
+                    const int read_row = lane / 2;
+                    const int read_row_phys = c_row_logi_to_phys_16(read_row);
+                    const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
+                    const int read_col_base = col_half * 8;
+
+                    const int64_t out_row = tile_m_base + read_row;
+                    const int64_t out_col = tile_n_base + read_col_base;
+
+                    bfloat16_t* const out_ptr = c + out_row * stride_cm + out_col;
+                    bfloat16_t* const h = sh_c + read_row_phys * kCStride + read_col_base;
+
+                    if (has_bias) {
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            h[i] = h[i] + bias[out_col + i];
+                        }
+                    }
+
+                    *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
+                }
+            }
+        } else {
+            // Write to float workspace
+            #pragma unroll
+            for (int rm = 0; rm < kRepeatM; ++rm) {
+                #pragma unroll
+                for (int rn = 0; rn < kRepeatN; ++rn) {
+                    const int repeat_idx = rm * kRepeatN + rn;
+                    const int tile_m = warp_m + rm * kBlockWarpsM;
+                    const int tile_n = warp_n + rn * kBlockWarpsN;
+
+                    const int col = lane_in_subgroup;
+                    #pragma unroll
+                    for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
+                        const int row = subgroup * 8 + acc_idx;
+                        const int64_t out_row = block_m + tile_m * kWmmaM + row;
+                        const int64_t out_col = block_n + tile_n * kWmmaN + col;
+
+                        workspace[(split_idx * M + out_row) * N + out_col] = acc[repeat_idx][acc_idx];
                     }
                 }
-
-                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
             }
         }
     }
@@ -408,6 +470,8 @@ extern "C" bool launch_scaled_mm(
     const bfloat16_t* scale,
     const bfloat16_t* bias,
     bfloat16_t* c,
+    float* workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -436,7 +500,8 @@ extern "C" bool launch_scaled_mm(
         const dim3 block(kThreadsPerBlock, 1, 1);
         const dim3 grid(
             static_cast<uint32_t>(N) / kBlockN,
-            static_cast<uint32_t>(M) / kBlockM);
+            static_cast<uint32_t>(M) / kBlockM,
+            static_cast<uint32_t>(split_k_factor));
 
         const bool use_fp8_e5m2 = (b_dtype == 1);
 
@@ -444,7 +509,7 @@ extern "C" bool launch_scaled_mm(
             hipLaunchKernelGGL(
                 (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
                 grid, block, 0, stream,
-                a, b_prepacked, scale, bias, c,
+                a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                 M, N, K,
                 stride_am, stride_cm,
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
@@ -452,10 +517,22 @@ extern "C" bool launch_scaled_mm(
             hipLaunchKernelGGL(
                 (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
                 grid, block, 0, stream,
-                a, b_prepacked, scale, bias, c,
+                a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                 M, N, K,
                 stride_am, stride_cm,
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
+        }
+
+        if (split_k_factor > 1) {
+            const dim3 reduce_block(16, 16, 1);
+            const dim3 reduce_grid(
+                (static_cast<uint32_t>(N) + 15) / 16,
+                (static_cast<uint32_t>(M) + 15) / 16);
+            hipLaunchKernelGGL(
+                scaled_mm_splitk_reduce_kernel,
+                reduce_grid, reduce_block, 0, stream,
+                workspace, scale, bias, c, split_k_factor,
+                M, N, stride_cm, has_scale ? 1 : 0, has_bias ? 1 : 0);
         }
     };
 
@@ -512,6 +589,8 @@ void scaled_mm(
     const std::optional<torch::stable::Tensor>& scale,
     const std::optional<torch::stable::Tensor>& bias,
     torch::stable::Tensor& c,
+    const std::optional<torch::stable::Tensor>& workspace,
+    const int64_t split_k_factor,
     const int64_t block_warps_m,
     const int64_t block_warps_n,
     const int64_t unroll_k,
@@ -525,6 +604,12 @@ void scaled_mm(
     const auto device_index = a.get_device_index();
     STD_TORCH_CHECK(b_prepacked.get_device_index() == device_index, "b_prepacked must be on the same device as a");
     STD_TORCH_CHECK(c.get_device_index() == device_index, "c must be on the same device as a");
+
+    if (workspace.has_value()) {
+        STD_TORCH_CHECK(workspace->is_cuda(), "workspace must be a CUDA tensor");
+        STD_TORCH_CHECK(workspace->get_device_index() == device_index, "workspace must be on the same device as a");
+        STD_TORCH_CHECK(workspace->scalar_type() == torch::stable::ScalarType::Float, "workspace must be float32");
+    }
 
     STD_TORCH_CHECK(a.scalar_type() == torch::stable::ScalarType::Half, "a must be float16");
     STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::BFloat16, "c must be bfloat16");
@@ -547,6 +632,13 @@ void scaled_mm(
     STD_TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
     STD_TORCH_CHECK(c.size(0) == M, "c.shape[0] must equal M");
     STD_TORCH_CHECK(c.size(1) == N, "c.shape[1] must equal N");
+
+    if (workspace.has_value()) {
+        STD_TORCH_CHECK(workspace->dim() == 3, "workspace must be 3D");
+        STD_TORCH_CHECK(workspace->size(0) == split_k_factor, "workspace.shape[0] must equal split_k_factor");
+        STD_TORCH_CHECK(workspace->size(1) == M, "workspace.shape[1] must equal M");
+        STD_TORCH_CHECK(workspace->size(2) == N, "workspace.shape[2] must equal N");
+    }
 
     // Contiguous fast path requirements
     STD_TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
@@ -581,6 +673,7 @@ void scaled_mm(
     const bfloat16_t* const scale_ptr = scale.has_value() ? reinterpret_cast<const bfloat16_t*>(scale->const_data_ptr()) : nullptr;
     const bfloat16_t* const bias_ptr = bias.has_value() ? reinterpret_cast<const bfloat16_t*>(bias->const_data_ptr()) : nullptr;
     bfloat16_t* const c_ptr = reinterpret_cast<bfloat16_t*>(c.mutable_data_ptr());
+    float* const workspace_ptr = workspace.has_value() ? reinterpret_cast<float*>(workspace->mutable_data_ptr()) : nullptr;
 
     const auto is_aligned_16 = [](const void* const p) {
         return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
@@ -595,12 +688,15 @@ void scaled_mm(
     STD_TORCH_CHECK(M % block_m == 0, "M (", M, ") must be divisible by block_m (", block_m, ")");
     STD_TORCH_CHECK(N % block_n == 0, "N (", N, ") must be divisible by block_n (", block_n, ")");
     STD_TORCH_CHECK(K % chunk_k == 0, "K (", K, ") must be divisible by chunk_k (", chunk_k, ")");
+    if (split_k_factor > 1) {
+        STD_TORCH_CHECK((K / chunk_k) % split_k_factor == 0, "total_chunks (", K / chunk_k, ") must be divisible by split_k_factor (", split_k_factor, ")");
+    }
 
     const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
 
     const bool launched = launch_scaled_mm(
-        a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+        a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr, workspace_ptr, split_k_factor,
         M, N, K,
         a.stride(0), c.stride(0),
         scale.has_value() ? 1 : 0, bias.has_value() ? 1 : 0,
@@ -621,6 +717,8 @@ STABLE_TORCH_LIBRARY(feather_ops, m)
         "Tensor? scale, "
         "Tensor? bias, "
         "Tensor(a!) c, "
+        "Tensor? workspace, "
+        "int split_k_factor, "
         "int block_warps_m, "
         "int block_warps_n, "
         "int unroll_k, "

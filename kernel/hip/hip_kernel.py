@@ -24,14 +24,18 @@ def _configured_op(
     unroll_k: int,
     repeat_m: int,
     repeat_n: int,
+    split_k_factor: int = 1,
 ) -> torch.Tensor:
     out = torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
+    workspace = torch.empty((split_k_factor, a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=torch.float32) if split_k_factor > 1 else None
     torch.ops.feather_ops.scaled_mm.default(
         a,
         b_prepacked,
         scale,
         bias,
         out,
+        workspace,
+        split_k_factor,
         block_warps_m,
         block_warps_n,
         unroll_k,
@@ -54,13 +58,14 @@ def _(
     unroll_k: int,
     repeat_m: int,
     repeat_n: int,
+    split_k_factor: int = 1,
 ) -> torch.Tensor:
     return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
 scaled_mm_hip_configured = _configured_op
 
-_CONFIGS = [
+_BASE_CONFIGS = [
     (1, 1, 2, 1, 2),
     (1, 1, 4, 1, 2),
     (1, 2, 2, 1, 2),
@@ -90,8 +95,13 @@ _CONFIGS = [
     (4, 2, 2, 2, 4),
     (4, 2, 4, 2, 4),
 ]
+_CONFIGS = []
+for _split_k in [1, 2, 4, 8, 16]:
+    for _cfg in _BASE_CONFIGS:
+        _CONFIGS.append((*_cfg, _split_k))
+
 # TODO: Sort configs with a better heuristic to find the fastest one
-_CONFIGS = sorted(_CONFIGS, key=lambda x: (x[0], x[1], x[3], x[4], x[2]))
+_CONFIGS = sorted(_CONFIGS, key=lambda x: (x[5], x[0], x[1], x[3], x[4], x[2]))
 
 
 def _run_autotuned(
@@ -105,10 +115,11 @@ def _run_autotuned(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
-    if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n) <= 0:
-        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = get_compatible_config(a, b_prepacked, 1, _CONFIGS)
-    return _configured_op(a, b_prepacked, scale, bias, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor) <= 0:
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor = get_compatible_config(a, b_prepacked, 1, _CONFIGS)
+    return _configured_op(a, b_prepacked, scale, bias, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor)
 
 
 def _fake_output(a: torch.Tensor, b_prepacked: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
@@ -127,8 +138,9 @@ def _autotuned_op(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
-    return _run_autotuned(a, b_prepacked, scale, bias, arg_4, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    return _run_autotuned(a, b_prepacked, scale, bias, arg_4, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor)
 
 
 @_autotuned_op.register_fake
@@ -143,6 +155,7 @@ def _(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
     return _fake_output(a, b_prepacked, arg_4)
 
@@ -158,8 +171,9 @@ def _autotuned_op_no_scale(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
-    return _run_autotuned(a, b_prepacked, None, bias, arg_3, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    return _run_autotuned(a, b_prepacked, None, bias, arg_3, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor)
 
 
 @_autotuned_op_no_scale.register_fake
@@ -173,6 +187,7 @@ def _(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
     return _fake_output(a, b_prepacked, arg_3)
 
@@ -188,8 +203,9 @@ def _autotuned_op_no_bias(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
-    return _run_autotuned(a, b_prepacked, scale, None, arg_3, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    return _run_autotuned(a, b_prepacked, scale, None, arg_3, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor)
 
 
 @_autotuned_op_no_bias.register_fake
@@ -203,6 +219,7 @@ def _(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
     return _fake_output(a, b_prepacked, arg_3)
 
@@ -217,8 +234,9 @@ def _autotuned_op_no_scale_bias(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
-    return _run_autotuned(a, b_prepacked, None, None, arg_2, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    return _run_autotuned(a, b_prepacked, None, None, arg_2, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor)
 
 
 @_autotuned_op_no_scale_bias.register_fake
@@ -231,6 +249,7 @@ def _(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
     return _fake_output(a, b_prepacked, arg_2)
 

@@ -128,11 +128,11 @@ def patch_inductor_custom_op_autotune_realize_inputs():
 
 
 def _config_compatible(cfg, M, N, K):
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n, split_k_factor = cfg
     block_m = 16 * warps_m * repeat_m
     block_n = 16 * warps_n * repeat_n
     chunk_k = 16 * unroll_k
-    return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
+    return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0 and (K // chunk_k) % split_k_factor == 0
 
 
 def _size_hint(value: int) -> int:
@@ -144,7 +144,7 @@ def _size_hint(value: int) -> int:
 
 def generate_autotune_configs(
     fake_tensors: Dict[str, torch.Tensor],
-    configs: List[Tuple[int, int, int, int, int]],
+    configs: List[Tuple[int, int, int, int, int, int]],
     b_dim: int,
 ) -> List[CustomOpConfig]:
     a = fake_tensors["a"]
@@ -163,12 +163,13 @@ def generate_autotune_configs(
             unroll_k=cfg[2],
             repeat_m=cfg[3],
             repeat_n=cfg[4],
+            split_k_factor=cfg[5],
         )
         for cfg in compatible
     ]
 
 
-def get_compatible_config(a: torch.Tensor, b_prepacked: torch.Tensor, b_dim: int, configs: List[Tuple[int, int, int, int, int]]) -> Tuple[int, int, int, int, int]:
+def get_compatible_config(a: torch.Tensor, b_prepacked: torch.Tensor, b_dim: int, configs: List[Tuple[int, int, int, int, int, int]]) -> Tuple[int, int, int, int, int, int]:
     M = _size_hint(a.shape[0])
     N = _size_hint(b_prepacked.shape[b_dim])
     K = _size_hint(a.shape[1])
@@ -186,10 +187,10 @@ def old_autotune(
     M: int,
     N: int,
     K: int,
-    configs: List[Tuple[int, int, int, int, int]],
-    run_fn: Callable[[Tuple[int, int, int, int, int]], Any],
+    configs: List[Tuple[int, int, int, int, int, int]],
+    run_fn: Callable[[Tuple[int, int, int, int, int, int]], Any],
     *extra_keys: Any,
-) -> Tuple[int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int]:
     key = (M, N, K, *extra_keys)
     cached = _AUTOTUNE_CACHE.get(key)
     if cached is not None:

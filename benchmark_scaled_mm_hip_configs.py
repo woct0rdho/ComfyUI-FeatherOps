@@ -28,21 +28,23 @@ def _parse_shapes(text: str) -> List[Tuple[int, int, int]]:
     return shapes
 
 
-def _parse_configs(text: str) -> List[Tuple[int, int, int, int, int]]:
+def _parse_configs(text: str) -> List[Tuple[int, int, int, int, int, int]]:
     configs = []
     for chunk in text.split(";"):
         chunk = chunk.strip()
         if not chunk:
             continue
         parts = [p.strip() for p in chunk.split(",")]
-        if len(parts) != 5:
-            raise ValueError(f"Invalid config '{chunk}', expected 5 comma-separated ints")
+        if len(parts) == 5:
+            parts.append("1")
+        if len(parts) != 6:
+            raise ValueError(f"Invalid config '{chunk}', expected 5 or 6 comma-separated ints")
         configs.append(tuple(int(p) for p in parts))
     return configs
 
 
-def _get_configs(args: argparse.Namespace) -> List[Tuple[int, int, int, int, int]]:
-    configs: List[Tuple[int, int, int, int, int]] = []
+def _get_configs(args: argparse.Namespace) -> List[Tuple[int, int, int, int, int, int]]:
+    configs: List[Tuple[int, int, int, int, int, int]] = []
     if args.use_default_configs:
         configs.extend(_CONFIGS)
     if args.configs:
@@ -57,11 +59,11 @@ def _run_config(
     b_prepacked: torch.Tensor,
     scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    cfg: Tuple[int, int, int, int, int],
+    cfg: Tuple[int, int, int, int, int, int],
     rep: int,
     warmup: int,
 ) -> float:
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n, split_k = cfg
 
     def run_kernel():
         scaled_mm_hip_configured(a, b_prepacked, scale, bias, torch.bfloat16, *cfg)
@@ -71,8 +73,8 @@ def _run_config(
     return ms / 1000.0
 
 
-def _format_cfg(cfg: Tuple[int, int, int, int, int]) -> str:
-    return f"({cfg[0]},{cfg[1]},{cfg[2]},{cfg[3]},{cfg[4]})"
+def _format_cfg(cfg: Tuple[int, int, int, int, int, int]) -> str:
+    return f"({cfg[0]},{cfg[1]},{cfg[2]},{cfg[3]},{cfg[4]},{cfg[5]})"
 
 
 def _iter_gflops(m: int, n: int, k: int, seconds: float) -> float:
