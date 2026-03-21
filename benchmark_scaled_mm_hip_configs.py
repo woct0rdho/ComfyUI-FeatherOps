@@ -23,17 +23,19 @@ def _parse_shapes(text: str) -> list[tuple[int, int, int]]:
     return shapes
 
 
-def _parse_configs(text: str) -> list[tuple[int, int, int, int, int]]:
-    configs: list[tuple[int, int, int, int, int]] = []
+def _parse_configs(text: str) -> list[tuple[int, int, int, int, int, int]]:
+    configs: list[tuple[int, int, int, int, int, int]] = []
     for chunk in text.split(";"):
         chunk = chunk.strip()
         if not chunk:
             continue
         parts = [p.strip() for p in chunk.split(",")]
-        if len(parts) != 5:
-            raise ValueError(f"Invalid config '{chunk}', expected 5 comma-separated ints")
-        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = (int(p) for p in parts)
-        configs.append((block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n))
+        if len(parts) == 5:
+            parts.append("1")
+        if len(parts) != 6:
+            raise ValueError(f"Invalid config '{chunk}', expected 5 or 6 comma-separated ints")
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k = (int(p) for p in parts)
+        configs.append((block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k))
     return configs
 
 
@@ -42,7 +44,7 @@ def _run_config(
     b_prepacked: torch.Tensor,
     scale: torch.Tensor | None,
     bias: torch.Tensor | None,
-    cfg: tuple[int, int, int, int, int],
+    cfg: tuple[int, int, int, int, int, int],
     rep: int,
     warmup: int,
 ) -> tuple[float, float]:
@@ -55,8 +57,8 @@ def _run_config(
     return avg_ms, std_ms
 
 
-def _format_cfg(cfg: tuple[int, int, int, int, int]) -> str:
-    return f"({cfg[0]},{cfg[1]},{cfg[2]},{cfg[3]},{cfg[4]})"
+def _format_cfg(cfg: tuple[int, int, int, int, int, int]) -> str:
+    return f"({cfg[0]},{cfg[1]},{cfg[2]},{cfg[3]},{cfg[4]},{cfg[5]})"
 
 
 def _iter_tflops(m: int, n: int, k: int, avg_ms: float) -> float:

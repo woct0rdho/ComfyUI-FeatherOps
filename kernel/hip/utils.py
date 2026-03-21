@@ -2,6 +2,7 @@ import os
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, TypeVar
 
 import _rocm_sdk_core
 import torch
@@ -132,13 +133,19 @@ def load_hip_stable_extension(
         )
 
 
-def _config_compatible(cfg: tuple[int, int, int, int, int], M: int, N: int, K: int) -> bool:
-    warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
+ConfigT = TypeVar("ConfigT", bound=tuple[int, ...])
+
+
+def _config_compatible(cfg: tuple[int, ...], M: int, N: int, K: int) -> bool:
+    warps_m, warps_n, unroll_k, repeat_m, repeat_n, *rest = cfg
+    split_k_factor = rest[0] if rest else 1
     block_m = 16 * warps_m * repeat_m
     block_n = 16 * warps_n * repeat_n
     chunk_k = 16 * unroll_k
 
     if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
+        return False
+    if (K // chunk_k) % split_k_factor != 0:
         return False
 
     is_large = K >= 3072 and min(M, N) >= 3072 and max(M, N) >= 4096
@@ -154,7 +161,7 @@ def _size_hint(value: int) -> int:
 
 def generate_autotune_configs(
     fake_tensors: dict[str, torch.Tensor],
-    configs: list[tuple[int, int, int, int, int]],
+    configs: list[ConfigT],
     b_dim: int,
 ) -> list[CustomOpConfig]:
     a = fake_tensors["a"]
@@ -166,19 +173,23 @@ def generate_autotune_configs(
     if not compatible:
         raise RuntimeError(f"No compatible config for M={M} N={N} K={K}.")
 
-    return [
-        CustomOpConfig(
-            block_warps_m=cfg[0],
-            block_warps_n=cfg[1],
-            unroll_k=cfg[2],
-            repeat_m=cfg[3],
-            repeat_n=cfg[4],
-        )
-        for cfg in compatible
-    ]
+    custom_op_configs = []
+    for cfg in compatible:
+        params: dict[str, Any] = {
+            "block_warps_m": cfg[0],
+            "block_warps_n": cfg[1],
+            "unroll_k": cfg[2],
+            "repeat_m": cfg[3],
+            "repeat_n": cfg[4],
+        }
+        # Scaled-MM configs carry a trailing split-K factor; the fp16 kernel's do not.
+        if len(cfg) > 5:
+            params["split_k_factor"] = cfg[5]
+        custom_op_configs.append(CustomOpConfig(**params))
+    return custom_op_configs
 
 
-def get_compatible_config(a: torch.Tensor, b_prepacked: torch.Tensor, b_dim: int, configs: list[tuple[int, int, int, int, int]]) -> tuple[int, int, int, int, int]:
+def get_compatible_config(a: torch.Tensor, b_prepacked: torch.Tensor, b_dim: int, configs: list[ConfigT]) -> ConfigT:
     M = _size_hint(a.shape[0])
     N = _size_hint(b_prepacked.shape[b_dim])
     K = _size_hint(a.shape[1])
@@ -196,10 +207,10 @@ def old_autotune(
     M: int,
     N: int,
     K: int,
-    configs: list[tuple[int, int, int, int, int]],
-    run_fn: Callable[[tuple[int, int, int, int, int]], object],
+    configs: list[ConfigT],
+    run_fn: Callable[[ConfigT], object],
     *extra_keys: object,
-) -> tuple[int, int, int, int, int]:
+) -> ConfigT:
     key = (M, N, K, *extra_keys)
     cached = _AUTOTUNE_CACHE.get(key)
     if cached is not None:

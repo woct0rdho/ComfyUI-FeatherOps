@@ -21,14 +21,18 @@ def _configured_op(
     unroll_k: int,
     repeat_m: int,
     repeat_n: int,
+    split_k_factor: int = 1,
 ) -> torch.Tensor:
     out = torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
+    workspace = torch.empty((split_k_factor, a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=torch.float32) if split_k_factor > 1 else None
     torch.ops.feather_ops.scaled_mm.default(
         a,
         b_prepacked,
         scale,
         bias,
         out,
+        workspace,
+        split_k_factor,
         block_warps_m,
         block_warps_n,
         unroll_k,
@@ -51,13 +55,14 @@ def _(
     unroll_k: int,
     repeat_m: int,
     repeat_n: int,
+    split_k_factor: int = 1,
 ) -> torch.Tensor:
     return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
 scaled_mm_hip_configured = _configured_op
 
-_CONFIGS = [
+_BASE_CONFIGS = [
     (1, 1, 2, 1, 2),
     (1, 1, 4, 1, 2),
     (1, 2, 2, 1, 2),
@@ -87,8 +92,13 @@ _CONFIGS = [
     (4, 2, 2, 2, 4),
     (4, 2, 4, 2, 4),
 ]
+_CONFIGS = []
+for _split_k in [1, 2, 4, 8, 16]:
+    for _cfg in _BASE_CONFIGS:
+        _CONFIGS.append((*_cfg, _split_k))
+
 # TODO: Sort configs with a better heuristic to find the fastest one
-_CONFIGS = sorted(_CONFIGS, key=lambda x: (x[0], x[1], x[3], x[4], x[2]))
+_CONFIGS = sorted(_CONFIGS, key=lambda x: (x[5], x[0], x[1], x[3], x[4], x[2]))
 
 
 # TODO: When torch custom op can handle multiple optional inputs, we should pass scale and bias as Optional[Tensor]
@@ -106,10 +116,13 @@ def _autotuned_op(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
-    if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n) <= 0:
-        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = get_compatible_config(a, b_prepacked, 1, _CONFIGS)
-    return _configured_op(a, b_prepacked, scale if has_scale else None, bias if has_bias else None, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
+    if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor) <= 0:
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor = get_compatible_config(a, b_prepacked, 1, _CONFIGS)
+    return _configured_op(
+        a, b_prepacked, scale if has_scale else None, bias if has_bias else None, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n, split_k_factor
+    )
 
 
 @_autotuned_op.register_fake
@@ -126,6 +139,7 @@ def _(
     unroll_k: int = 0,
     repeat_m: int = 0,
     repeat_n: int = 0,
+    split_k_factor: int = 0,
 ) -> torch.Tensor:
     return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
@@ -151,7 +165,7 @@ def scaled_mm_hip(
             bias is not None,
         )
 
-    def run_fn(cfg: tuple[int, int, int, int, int]) -> torch.Tensor:
+    def run_fn(cfg: tuple[int, int, int, int, int, int]) -> torch.Tensor:
         return _configured_op(a, b_prepacked, scale, bias, out_dtype, *cfg)
 
     best_cfg = old_autotune(

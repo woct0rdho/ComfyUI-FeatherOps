@@ -122,6 +122,43 @@ __device__ __forceinline__ constexpr int a_row_phys_to_logi_16(const int x)
     return ((x & 1) << 3) | ((x >> 1) & 7);
 }
 
+template <bool kOutputFp16>
+__global__ void scaled_mm_splitk_reduce_kernel(
+    const float* __restrict__ const workspace,
+    const float* __restrict__ const scale,
+    const uint16_t* __restrict__ const bias,
+    uint16_t* __restrict__ const c,
+    const int split_k_factor,
+    const int64_t M,
+    const int64_t N,
+    const int has_scale,
+    const int has_bias)
+{
+    const int64_t out_col = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t out_row = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+
+    if (out_row < M && out_col < N) {
+        float sum = 0.0f;
+        for (int s = 0; s < split_k_factor; ++s) {
+            sum += workspace[(static_cast<int64_t>(s) * M + out_row) * N + out_col];
+        }
+
+        if (has_scale) {
+            sum *= scale[0];
+        }
+        if (has_bias) {
+            if constexpr (kOutputFp16) {
+                sum += __half2float(bits_to_half(bias[out_col]));
+            } else {
+                bfloat16_t bias_bf16;
+                bias_bf16.data = bias[out_col];
+                sum += static_cast<float>(bias_bf16);
+            }
+        }
+        c[out_row * N + out_col] = float_to_output_bits<kOutputFp16>(sum);
+    }
+}
+
 template <int kBlockWarpsM,
           int kBlockWarpsN,
           int kUnrollK,
@@ -136,6 +173,8 @@ __global__ void scaled_mm_kernel(
     const float* __restrict__ const scale,
     const uint16_t* __restrict__ const bias,
     uint16_t* __restrict__ const c,
+    float* __restrict__ const workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -257,6 +296,10 @@ __global__ void scaled_mm_kernel(
     // Pipeline setup
     constexpr int kChunkK = kWmmaK * kUnrollK;
     const int total_chunks = static_cast<int>(K / kChunkK);
+    const int chunks_per_split = total_chunks / split_k_factor;
+    const int split_idx = static_cast<int>(blockIdx.z);
+    const int start_chunk = split_idx * chunks_per_split;
+    const int end_chunk = start_chunk + chunks_per_split;
 
     // WMMA compute lambda for one sub-iteration (one stage).
     // Register-tiling: load all B fragments once, then iterate rm with A loads.
@@ -323,27 +366,29 @@ __global__ void scaled_mm_kernel(
     };
 
     // Prologue: load first chunk into LDS
-    #pragma unroll
-    for (int u = 0; u < kUnrollK; ++u) {
-        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
-        load_a_lds_k0mk1(u, k);
-    }
-    #pragma unroll
-    for (int u = 0; u < kUnrollK; ++u) {
-        const int64_t k = static_cast<int64_t>(u) * kWmmaK;
-        load_b_lds_prepacked(u, k);
+    if (start_chunk < end_chunk) {
+        #pragma unroll
+        for (int u = 0; u < kUnrollK; ++u) {
+            const int64_t k = static_cast<int64_t>(start_chunk) * kChunkK + static_cast<int64_t>(u) * kWmmaK;
+            load_a_lds_k0mk1(u, k);
+        }
+        #pragma unroll
+        for (int u = 0; u < kUnrollK; ++u) {
+            const int64_t k = static_cast<int64_t>(start_chunk) * kChunkK + static_cast<int64_t>(u) * kWmmaK;
+            load_b_lds_prepacked(u, k);
+        }
     }
     __syncthreads();
 
     // Main loop
-    for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
+    for (int iter_idx = start_chunk; iter_idx < end_chunk; ++iter_idx) {
         #pragma unroll
         for (int u = 0; u < kUnrollK; ++u) {
             wmma_compute_stage(u);
         }
         __syncthreads();
 
-        if (iter_idx + 1 < total_chunks) {
+        if (iter_idx + 1 < end_chunk) {
             const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
             asm volatile("s_setprio 1" ::: "memory");
             #pragma unroll
@@ -364,56 +409,80 @@ __global__ void scaled_mm_kernel(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        uint16_t* __restrict__ const sh_c = sh.c[wave_id][0];
-
         const float scale_f = has_scale ? scale[0] : 1.0f;
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
 
-        #pragma unroll
-        for (int rm = 0; rm < kRepeatM; ++rm) {
+        if (split_k_factor == 1) {
+            uint16_t* __restrict__ const sh_c = sh.c[wave_id][0];
+
             #pragma unroll
-            for (int rn = 0; rn < kRepeatN; ++rn) {
-                const int repeat_idx = rm * kRepeatN + rn;
-                const int tile_m = warp_m + rm * kBlockWarpsM;
-                const int tile_n = warp_n + rn * kBlockWarpsN;
-                const int64_t tile_m_base = block_m + tile_m * kWmmaM;
-                const int64_t tile_n_base = block_n + tile_n * kWmmaN;
-
-                // Step 1: Write acc to LDS in column-major order (WMMA layout)
-                // Each thread writes 8 values to one column
-                const int col = lane_in_subgroup;
+            for (int rm = 0; rm < kRepeatM; ++rm) {
                 #pragma unroll
-                for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
-                    const int row_logi = subgroup * 8 + acc_idx;
-                    const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    sh_c[row_phys * kCStride + col] = float_to_output_bits<kOutputFp16>(acc[repeat_idx][acc_idx] * scale_f);
-                }
+                for (int rn = 0; rn < kRepeatN; ++rn) {
+                    const int repeat_idx = rm * kRepeatN + rn;
+                    const int tile_m = warp_m + rm * kBlockWarpsM;
+                    const int tile_n = warp_n + rn * kBlockWarpsN;
+                    const int64_t tile_m_base = block_m + tile_m * kWmmaM;
+                    const int64_t tile_n_base = block_n + tile_n * kWmmaN;
 
-                // Wave executes in lockstep (SIMT), so all writes complete before reads
-                // No explicit barrier needed within a wave
-
-                // Step 2: Read from LDS in row-major order for coalesced global write
-                // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
-                const int read_row = lane / 2;
-                const int read_row_phys = c_row_logi_to_phys_16(read_row);
-                const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
-                const int read_col_base = col_half * 8;
-
-                const int64_t out_row = tile_m_base + read_row;
-                const int64_t out_col = tile_n_base + read_col_base;
-
-                uint16_t* __restrict__ const out_ptr = c + out_row * N + out_col;
-                uint16_t* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
-
-                if (has_bias) {
+                    // Step 1: Write acc to LDS in column-major order (WMMA layout)
+                    // Each thread writes 8 values to one column
+                    const int col = lane_in_subgroup;
                     #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        h[i] = add_output_bits<kOutputFp16>(h[i], bias[out_col + i]);
+                    for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
+                        const int row_logi = subgroup * 8 + acc_idx;
+                        const int row_phys = c_row_logi_to_phys_16(row_logi);
+                        sh_c[row_phys * kCStride + col] = float_to_output_bits<kOutputFp16>(acc[repeat_idx][acc_idx] * scale_f);
+                    }
+
+                    // Wave executes in lockstep (SIMT), so all writes complete before reads
+                    // No explicit barrier needed within a wave
+
+                    // Step 2: Read from LDS in row-major order for coalesced global write
+                    // 32 threads -> 16 rows, 2 threads per row, each handles 8 columns
+                    const int read_row = lane / 2;
+                    const int read_row_phys = c_row_logi_to_phys_16(read_row);
+                    const int col_half = lane % 2;  // 0 = cols 0-7, 1 = cols 8-15
+                    const int read_col_base = col_half * 8;
+
+                    const int64_t out_row = tile_m_base + read_row;
+                    const int64_t out_col = tile_n_base + read_col_base;
+
+                    uint16_t* __restrict__ const out_ptr = c + out_row * N + out_col;
+                    uint16_t* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
+
+                    if (has_bias) {
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            h[i] = add_output_bits<kOutputFp16>(h[i], bias[out_col + i]);
+                        }
+                    }
+
+                    *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
+                }
+            }
+        } else {
+            // Write the partial sum to the float workspace; scale and bias are
+            // applied by scaled_mm_splitk_reduce_kernel after all splits finish.
+            #pragma unroll
+            for (int rm = 0; rm < kRepeatM; ++rm) {
+                #pragma unroll
+                for (int rn = 0; rn < kRepeatN; ++rn) {
+                    const int repeat_idx = rm * kRepeatN + rn;
+                    const int tile_m = warp_m + rm * kBlockWarpsM;
+                    const int tile_n = warp_n + rn * kBlockWarpsN;
+
+                    const int col = lane_in_subgroup;
+                    #pragma unroll
+                    for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
+                        const int row = subgroup * 8 + acc_idx;
+                        const int64_t out_row = block_m + tile_m * kWmmaM + row;
+                        const int64_t out_col = block_n + tile_n * kWmmaN + col;
+
+                        workspace[(static_cast<int64_t>(split_idx) * M + out_row) * N + out_col] = acc[repeat_idx][acc_idx];
                     }
                 }
-
-                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
             }
         }
     }
@@ -465,6 +534,8 @@ void launch_scaled_mm_configured(
     const float* const scale,
     const uint16_t* const bias,
     uint16_t* const c,
+    float* const workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -486,7 +557,7 @@ void launch_scaled_mm_configured(
 
     constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
     const dim3 block(kThreadsPerBlock, 1, 1);
-    const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
+    const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), static_cast<uint32_t>(split_k_factor));
 
     const bool use_fp8_e5m2 = (b_dtype == 1);
     const bool use_fp16_output = (output_dtype == 0);
@@ -496,14 +567,14 @@ void launch_scaled_mm_configured(
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true, true>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             } else {
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true, false>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             }
@@ -512,14 +583,14 @@ void launch_scaled_mm_configured(
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false, true>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             } else {
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false, false>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             }
@@ -530,14 +601,14 @@ void launch_scaled_mm_configured(
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true, true>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             } else {
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true, false>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             }
@@ -546,17 +617,37 @@ void launch_scaled_mm_configured(
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false, true>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             } else {
                 hipLaunchKernelGGL(
                     (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false, false>),
                     grid, block, 0, stream,
-                    a, b_prepacked, scale, bias, c,
+                    a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                     M, N, K,
                     has_scale, has_bias);
             }
+        }
+    }
+
+    if (split_k_factor > 1) {
+        const dim3 reduce_block(16, 16, 1);
+        const dim3 reduce_grid(
+            static_cast<uint32_t>((N + 15) / 16),
+            static_cast<uint32_t>((M + 15) / 16));
+        if (use_fp16_output) {
+            hipLaunchKernelGGL(
+                (scaled_mm_splitk_reduce_kernel<true>),
+                reduce_grid, reduce_block, 0, stream,
+                workspace, scale, bias, c, split_k_factor,
+                M, N, has_scale, has_bias);
+        } else {
+            hipLaunchKernelGGL(
+                (scaled_mm_splitk_reduce_kernel<false>),
+                reduce_grid, reduce_block, 0, stream,
+                workspace, scale, bias, c, split_k_factor,
+                M, N, has_scale, has_bias);
         }
     }
 }
@@ -567,6 +658,8 @@ extern "C" bool launch_scaled_mm(
     const float* const scale,
     const uint16_t* const bias,
     uint16_t* const c,
+    float* const workspace,
+    const int split_k_factor,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -588,7 +681,7 @@ extern "C" bool launch_scaled_mm(
             repeat_m == decltype(tag)::kRepeatM &&
             repeat_n == decltype(tag)::kRepeatN) {
             launch_scaled_mm_configured<decltype(tag)>(
-                a, b_prepacked, scale, bias, c,
+                a, b_prepacked, scale, bias, c, workspace, split_k_factor,
                 M, N, K,
                 has_scale, has_bias,
                 b_dtype, output_dtype, stream);
@@ -638,6 +731,8 @@ void scaled_mm(
     const std::optional<torch::stable::Tensor>& scale,
     const std::optional<torch::stable::Tensor>& bias,
     torch::stable::Tensor& c,
+    const std::optional<torch::stable::Tensor>& workspace,
+    const int64_t split_k_factor,
     const int64_t block_warps_m,
     const int64_t block_warps_n,
     const int64_t unroll_k,
@@ -651,6 +746,15 @@ void scaled_mm(
     const auto device_index = a.get_device_index();
     STD_TORCH_CHECK(b_prepacked.get_device_index() == device_index, "b_prepacked must be on the same device as a");
     STD_TORCH_CHECK(c.get_device_index() == device_index, "c must be on the same device as a");
+
+    STD_TORCH_CHECK(split_k_factor >= 1, "split_k_factor must be positive");
+    if (workspace.has_value()) {
+        STD_TORCH_CHECK(workspace->is_cuda(), "workspace must be a CUDA tensor");
+        STD_TORCH_CHECK(workspace->get_device_index() == device_index, "workspace must be on the same device as a");
+        STD_TORCH_CHECK(workspace->scalar_type() == torch::stable::ScalarType::Float, "workspace must be float32");
+    } else {
+        STD_TORCH_CHECK(split_k_factor == 1, "workspace must be provided when split_k_factor > 1");
+    }
 
     STD_TORCH_CHECK(a.scalar_type() == torch::stable::ScalarType::Half, "a must be float16");
     STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half || c.scalar_type() == torch::stable::ScalarType::BFloat16, "c must be float16 or bfloat16");
@@ -673,6 +777,16 @@ void scaled_mm(
     STD_TORCH_CHECK(b_prepacked.size(2) == 16, "b_prepacked.shape[2] must be 16");
     STD_TORCH_CHECK(c.size(0) == M, "c.shape[0] must equal M");
     STD_TORCH_CHECK(c.size(1) == N, "c.shape[1] must equal N");
+
+    if (workspace.has_value()) {
+        STD_TORCH_CHECK(workspace->dim() == 3, "workspace must be 3D");
+        STD_TORCH_CHECK(workspace->size(0) == split_k_factor, "workspace.shape[0] must equal split_k_factor");
+        STD_TORCH_CHECK(workspace->size(1) == M, "workspace.shape[1] must equal M");
+        STD_TORCH_CHECK(workspace->size(2) == N, "workspace.shape[2] must equal N");
+        STD_TORCH_CHECK(workspace->stride(0) == M * N, "workspace.stride(0) must equal M*N");
+        STD_TORCH_CHECK(workspace->stride(1) == N, "workspace.stride(1) must equal N");
+        STD_TORCH_CHECK(workspace->stride(2) == 1, "workspace.stride(2) must be 1");
+    }
 
     // Contiguous fast path requirements
     STD_TORCH_CHECK(a.stride(0) == K, "a.stride(0) must equal K (", K, ")");
@@ -711,6 +825,7 @@ void scaled_mm(
     const float* const scale_ptr = scale.has_value() ? reinterpret_cast<const float*>(scale->const_data_ptr()) : nullptr;
     const uint16_t* const bias_ptr = bias.has_value() ? reinterpret_cast<const uint16_t*>(bias->const_data_ptr()) : nullptr;
     uint16_t* const c_ptr = reinterpret_cast<uint16_t*>(c.mutable_data_ptr());
+    float* const workspace_ptr = workspace.has_value() ? reinterpret_cast<float*>(workspace->mutable_data_ptr()) : nullptr;
 
     const auto is_aligned_16 = [](const void* const p) {
         return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
@@ -725,6 +840,9 @@ void scaled_mm(
     STD_TORCH_CHECK(M % block_m == 0, "M (", M, ") must be divisible by kBlockM (", block_m, ")");
     STD_TORCH_CHECK(N % block_n == 0, "N (", N, ") must be divisible by kBlockN (", block_n, ")");
     STD_TORCH_CHECK(K % chunk_k == 0, "K (", K, ") must be divisible by kChunkK (", chunk_k, ")");
+    if (split_k_factor > 1) {
+        STD_TORCH_CHECK((K / chunk_k) % split_k_factor == 0, "total_chunks (", K / chunk_k, ") must be divisible by split_k_factor (", split_k_factor, ")");
+    }
 
     const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
@@ -732,7 +850,7 @@ void scaled_mm(
     const int output_dtype = c.scalar_type() == torch::stable::ScalarType::Half ? 0 : 1;
 
     const bool launched = launch_scaled_mm(
-        a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
+        a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr, workspace_ptr, split_k_factor,
         M, N, K,
         scale.has_value() ? 1 : 0, bias.has_value() ? 1 : 0,
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
@@ -752,6 +870,8 @@ STABLE_TORCH_LIBRARY(feather_ops, m)
         "Tensor? scale, "
         "Tensor? bias, "
         "Tensor(a!) c, "
+        "Tensor? workspace, "
+        "int split_k_factor, "
         "int block_warps_m, "
         "int block_warps_n, "
         "int unroll_k, "
