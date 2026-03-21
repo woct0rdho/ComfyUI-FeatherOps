@@ -29,13 +29,13 @@ struct bfloat16_t {
     }
 };
 
-// __device__ __forceinline__ bfloat16_t operator*(const bfloat16_t a, const bfloat16_t b) {
-//     return bfloat16_t(static_cast<float>(a) * static_cast<float>(b));
-// }
-//
-// __device__ __forceinline__ bfloat16_t operator+(const bfloat16_t a, const bfloat16_t b) {
-//     return bfloat16_t(static_cast<float>(a) + static_cast<float>(b));
-// }
+__device__ __forceinline__ bfloat16_t operator+(const bfloat16_t a, const bfloat16_t b) {
+    return bfloat16_t(static_cast<float>(a) + static_cast<float>(b));
+}
+
+__device__ __forceinline__ bfloat16_t operator*(const bfloat16_t a, const bfloat16_t b) {
+    return bfloat16_t(static_cast<float>(a) * static_cast<float>(b));
+}
 
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
@@ -128,7 +128,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
             half a[kShASize];
             uint8_t b[kUnrollK][kBlockN][kWmmaK];
         } ab;
-        float c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
+        bfloat16_t c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
     __shared__ __align__(16) SharedStorage sh;
 
@@ -336,7 +336,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        float* const sh_c = sh.c[wave_id][0];
+        bfloat16_t* const sh_c = sh.c[wave_id][0];
 
         const float scale_f = has_scale ? static_cast<float>(scale[0]) : 1.0f;
         const int subgroup = lane / 16;
@@ -359,7 +359,7 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logi = subgroup * 8 + acc_idx;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    sh_c[row_phys * kCStride + col] = acc[repeat_idx][acc_idx] * scale_f;
+                    sh_c[row_phys * kCStride + col] = bfloat16_t(acc[repeat_idx][acc_idx] * scale_f);
                 }
 
                 // Wave executes in lockstep (SIMT), so all writes complete before reads
@@ -376,23 +376,16 @@ __global__ void scaled_mm_kernel_prepacked_b(
                 const int64_t out_col = tile_n_base + read_col_base;
 
                 bfloat16_t* const out_ptr = c + out_row * stride_cm + out_col;
-                float* const h = sh_c + read_row_phys * kCStride + read_col_base;
-
-                bfloat16_t out_buf[8];
+                bfloat16_t* const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        out_buf[i] = bfloat16_t(h[i] + static_cast<float>(bias[out_col + i]));
-                    }
-                } else {
-                    #pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        out_buf[i] = bfloat16_t(h[i]);
+                        h[i] = h[i] + bias[out_col + i];
                     }
                 }
 
-                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(out_buf);
+                *reinterpret_cast<uint4*>(out_ptr) = *reinterpret_cast<uint4*>(h);
             }
         }
     }
