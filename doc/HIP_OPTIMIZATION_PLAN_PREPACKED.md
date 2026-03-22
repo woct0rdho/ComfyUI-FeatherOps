@@ -14,7 +14,7 @@
 
 - Data path kept: prepacked B as fp8 bytes in `[K/16, N, 16]`.
 - Best autotune config: `1,8,2,2,8,2` (no-swizzle).
-- Latest full benchmark (`benchmark_scaled_mm_hip_prepacked.py`):
+- Latest full benchmark (`benchmark_scaled_mm_hip.py`):
   - `N=8192`: `hip_prepacked ~40.5k`, `hip ~36.2k`, `torch_compiled ~32.4k` GFLOPS.
 - Thermal note: gains under ~2% are treated as noise unless repeated.
 
@@ -41,8 +41,8 @@ Interpretation:
 
 1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
 2. Per-step order:
-   - `python test_scaled_mm_hip_prepacked.py`
-   - `python benchmark_scaled_mm_hip_prepacked.py`
+   - `python test_scaled_mm_hip.py`
+   - `python benchmark_scaled_mm_hip.py`
    - If it regresses, explain the reason by inspecting the generated code and/or profiling.
 3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 4. If a new baseline is kept, commit the kernel immediately.

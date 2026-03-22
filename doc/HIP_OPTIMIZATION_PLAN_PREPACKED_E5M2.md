@@ -8,7 +8,7 @@
 - Python wrapper contract:
   - infer `b_dtype` from fp8 prepacked tensor dtype.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Performance metric: `benchmark_scaled_mm_hip_prepacked_e5m2.py` GFLOPS (prepack excluded from timed region).
+- Performance metric: `benchmark_scaled_mm_hip.py` GFLOPS (prepack excluded from timed region).
 - Keep rule:
   - correctness passes,
   - `N=8192` does not regress,
@@ -16,7 +16,7 @@
 
 ## Current Baseline
 
-- Latest full benchmark (`python benchmark_scaled_mm_hip_prepacked_e5m2.py`):
+- Latest full benchmark (`python benchmark_scaled_mm_hip.py`):
   - `N=8192`: ~44.0 TFLOPS
 
 ## Profiling Insights
@@ -52,8 +52,8 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 
 1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
 2. Per-step order:
-   - `python test_scaled_mm_hip_prepacked_e5m2.py`
-   - `python benchmark_scaled_mm_hip_prepacked_e5m2.py`
+   - `python test_scaled_mm_hip.py`
+   - `python benchmark_scaled_mm_hip.py`
    - If it regresses, explain the reason by inspecting the generated code and/or profiling.
 3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 4. If a new baseline is kept, commit the kernel immediately.

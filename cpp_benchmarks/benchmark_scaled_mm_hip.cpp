@@ -1,12 +1,11 @@
-#include <chrono>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <string>
 #include <vector>
-
-#include <ATen/ATen.h>
-#include <c10/hip/HIPFunctions.h>
-#include <c10/hip/HIPStream.h>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -23,7 +22,7 @@
         }                                                                                                     \
     } while (false)
 
-extern "C" bool launch_scaled_mm_prepacked(
+extern "C" bool launch_scaled_mm(
     const half* a,
     const uint8_t* b_prepacked,
     const half* scale,
@@ -133,37 +132,32 @@ int main(int argc, char** argv)
                                       static_cast<double>(c_elems) * 2.0;
     const double gemm_flops = 2.0 * static_cast<double>(opts.m) * opts.n * opts.k;
 
-    at::Device device(at::kCUDA, 0);
+    half* d_a = nullptr;
+    uint8_t* d_b_prepacked = nullptr;
+    half* d_c = nullptr;
 
-    auto options_fp16 = at::TensorOptions().dtype(at::kHalf).device(device);
-    // Use Byte for FP8 E5M2 for simpler storage and access mapping
-    auto options_fp8 = at::TensorOptions().dtype(at::kByte).device(device);
+    CHECK_HIP(hipMalloc(&d_a, a_elems * sizeof(half)));
+    CHECK_HIP(hipMalloc(&d_b_prepacked, b_elems * sizeof(uint8_t)));
+    CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(half)));
 
-    at::Tensor d_a = at::empty({opts.m, opts.k}, options_fp16);
-    // b_prepacked has shape [K/16, N, 16]
-    at::Tensor d_b_prepacked = at::empty({opts.k / 16, opts.n, 16}, options_fp8);
-    at::Tensor d_c = at::empty({opts.m, opts.n}, options_fp16);
+    CHECK_HIP(hipMemset(d_a, 0, a_elems * sizeof(half)));
+    CHECK_HIP(hipMemset(d_b_prepacked, 0, b_elems * sizeof(uint8_t)));
+    CHECK_HIP(hipMemset(d_c, 0, c_elems * sizeof(half)));
 
-    d_a.zero_();
-    d_b_prepacked.zero_();
-    d_c.zero_();
-
-    hipStream_t stream = c10::hip::getCurrentHIPStream(device.index()).stream();
-
+    hipStream_t stream = nullptr;
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
+
+    CHECK_HIP(hipStreamCreate(&stream));
     CHECK_HIP(hipEventCreate(&start));
     CHECK_HIP(hipEventCreate(&stop));
 
-    c10::StreamGuard guard(c10::hip::getCurrentHIPStream(device.index()));
+    CHECK_HIP(hipStreamSynchronize(stream));
 
     for (int i = 0; i < opts.warmup_iters; ++i)
     {
-        const bool launched = launch_scaled_mm_prepacked(
-            reinterpret_cast<const half*>(d_a.data_ptr()),
-            reinterpret_cast<const uint8_t*>(d_b_prepacked.data_ptr()),
-            nullptr, nullptr,
-            reinterpret_cast<half*>(d_c.data_ptr()),
+        const bool launched = launch_scaled_mm(
+            d_a, d_b_prepacked, nullptr, nullptr, d_c,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
             0, 0,
@@ -183,11 +177,8 @@ int main(int argc, char** argv)
     for (int i = 0; i < opts.iters; ++i)
     {
         CHECK_HIP(hipEventRecord(start, stream));
-        launch_scaled_mm_prepacked(
-            reinterpret_cast<const half*>(d_a.data_ptr()),
-            reinterpret_cast<const uint8_t*>(d_b_prepacked.data_ptr()),
-            nullptr, nullptr,
-            reinterpret_cast<half*>(d_c.data_ptr()),
+        launch_scaled_mm(
+            d_a, d_b_prepacked, nullptr, nullptr, d_c,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
             0, 0,
@@ -212,7 +203,7 @@ int main(int argc, char** argv)
     const double avg_gbps = matrix_bytes_total / static_cast<double>(avg_ms) / 1.0e6;
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "scaled_mm_prepacked libtorch benchmark\n";
+    std::cout << "scaled_mm benchmark\n";
     std::cout << "  problem: m=" << opts.m << " n=" << opts.n << " k=" << opts.k << "\n";
     std::cout << "  config: warps_m=" << opts.block_warps_m << " warps_n=" << opts.block_warps_n
               << " unroll_k=" << opts.unroll_k << " repeat_m=" << opts.repeat_m << " repeat_n=" << opts.repeat_n << "\n";
@@ -225,6 +216,10 @@ int main(int argc, char** argv)
 
     CHECK_HIP(hipEventDestroy(stop));
     CHECK_HIP(hipEventDestroy(start));
+    CHECK_HIP(hipStreamDestroy(stream));
+    CHECK_HIP(hipFree(d_c));
+    CHECK_HIP(hipFree(d_b_prepacked));
+    CHECK_HIP(hipFree(d_a));
 
     return EXIT_SUCCESS;
 }

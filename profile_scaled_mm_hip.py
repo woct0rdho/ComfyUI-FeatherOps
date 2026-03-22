@@ -5,7 +5,7 @@ import argparse
 import torch
 from torch._inductor import config
 
-from kernel.hip.hip_kernel_prepacked import prepack_b_for_scaled_mm, scaled_mm_hip_prepacked_configured
+from kernel.hip.hip_kernel import prepack_b_for_scaled_mm, scaled_mm_hip_configured
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
     cfg = tuple(int(x.strip()) for x in args.config.split(","))
 
     def run_fn():
-        return scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
+        return scaled_mm_hip_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
 
     print("Warming up...")
     for _ in range(3):

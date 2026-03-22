@@ -5,7 +5,7 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hip_kernel_prepacked import prepack_b_for_scaled_mm, scaled_mm_hip_prepacked
+from kernel.hip.hip_kernel import prepack_b_for_scaled_mm, scaled_mm_hip
 from kernel.naive import scaled_mm_naive
 
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
@@ -13,7 +13,7 @@ scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynami
 providers = {
     "torch": scaled_mm_naive,
     "torch_compiled": scaled_mm_naive_compiled,
-    "hip_prepacked": scaled_mm_hip_prepacked,
+    "hip": scaled_mm_hip,
 }
 provider_names = list(providers)
 
@@ -27,7 +27,7 @@ provider_names = list(providers)
             line_vals=provider_names,
             line_names=provider_names,
             ylabel="GFLOPS",
-            plot_name="scaled_mm_hip_prepacked_e5m2",
+            plot_name="scaled_mm_hip",
             args={},
         )
     ]
@@ -50,7 +50,7 @@ def benchmark(N, provider):
 
     if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
-    elif provider == "hip_prepacked":
+    elif provider == "hip":
         fn = lambda: providers[provider](a, b_prepacked, scale, bias, out_dtype)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")

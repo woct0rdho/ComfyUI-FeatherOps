@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_weight
 from torch import nn
 
-from ..kernel.hip.hip_kernel_prepacked import scaled_mm_hip_prepacked
+from ..kernel.hip.hip_kernel import scaled_mm_hip
 
 
 # (N, K) -> (K/16, N, 16)
@@ -107,7 +107,7 @@ class FeatherOps(manual_cast):
             weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=torch.bfloat16, offloadable=True)
             scale = self.weight_scale.to(device=x.device, dtype=torch.bfloat16) if self.weight_scale is not None else None
 
-            y = scaled_mm_hip_prepacked(x_fp16, weight, scale, bias, out_dtype=torch.bfloat16)
+            y = scaled_mm_hip(x_fp16, weight, scale, bias, out_dtype=torch.bfloat16)
 
             uncast_bias_weight(self, weight, bias, offload_stream)
 
