@@ -23,7 +23,7 @@
 
 ### The FP16 vs FP8 Gap
 
-We have established a highly optimized FP8 kernel (`scaled_mm_hip_prepacked`) that achieves ~44 TFLOPS. The primary difference between our optimized FP8 kernel and this baseline FP16 kernel is the memory footprint and LDS layout:
+We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieves ~44 TFLOPS. The primary difference between our optimized FP8 kernel and this baseline FP16 kernel is the memory footprint and LDS layout:
 1. **LDS Footprint:** FP16 data is 2 bytes per element, whereas FP8 is 1 byte. To load an equivalent `128x256` chunk, the FP16 kernel requires exactly twice as much LDS memory (`32 KB` vs `16 KB`).
 2. **VGPR Footprint:** Loading and holding FP16 data requires twice as many vector registers (`uint4` loads 8 `fp16` elements instead of 16 `fp8` elements).
 3. **LDS Banking:** The old swizzled-B baseline had a substantial LDS bank-conflict rate (`~14.8%`), but the current identity-order B path reduces that to `0.0%` without increasing LDS usage.

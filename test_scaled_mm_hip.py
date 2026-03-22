@@ -2,7 +2,7 @@
 
 import torch
 
-from kernel.hip.hip_kernel_prepacked import _CONFIGS, prepack_b_for_scaled_mm, scaled_mm_hip_prepacked_configured
+from kernel.hip.hip_kernel import _CONFIGS, prepack_b_for_scaled_mm, scaled_mm_hip_configured
 from kernel.naive import scaled_mm_naive
 
 
@@ -14,7 +14,7 @@ def test_config(cfg, M, N, K, device):
     out_dtype = torch.bfloat16
 
     b_prepacked = prepack_b_for_scaled_mm(b)
-    out_hip = scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
+    out_hip = scaled_mm_hip_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
 
     # out_ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
     out_ref = scaled_mm_naive(a, b_prepacked, scale, bias, out_dtype, b_prepacked=True)

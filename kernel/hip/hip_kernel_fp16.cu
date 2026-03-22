@@ -492,7 +492,7 @@ void mm_fp16(
     const hipError_t launch_err = hipGetLastError();
     STD_TORCH_CHECK(
         launch_err == hipSuccess,
-        "scaled_mm_prepacked kernel launch failed: ",
+        "scaled_mm kernel launch failed: ",
         hipGetErrorString(launch_err));
 }
 

@@ -3,7 +3,7 @@
 import torch
 from torch._inductor import config
 
-from kernel.hip.hip_kernel_prepacked import _CONFIGS, prepack_b_for_scaled_mm, scaled_mm_hip_prepacked, scaled_mm_hip_prepacked_configured
+from kernel.hip.hip_kernel import _CONFIGS, prepack_b_for_scaled_mm, scaled_mm_hip, scaled_mm_hip_configured
 from kernel.naive import scaled_mm_naive
 
 
@@ -35,7 +35,7 @@ def _check_close(out, ref, label, out_dtype=torch.bfloat16):
 def test_eager_configured(device):
     a, b, b_prepacked, scale, bias, out_dtype = _make_inputs(512, 512, 512, device)
     cfg = _CONFIGS[0]
-    out = scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
+    out = scaled_mm_hip_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
     ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
     _check_close(out, ref, f"eager configured {cfg}", out_dtype)
 
@@ -46,7 +46,7 @@ def test_torch_compile_configured(device):
 
     @torch.compile(fullgraph=True, mode="max-autotune")
     def compiled_fn(a, b_prepacked, scale, bias):
-        return scaled_mm_hip_prepacked_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
+        return scaled_mm_hip_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
 
     out = compiled_fn(a, b_prepacked, scale, bias)
     ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
@@ -55,7 +55,7 @@ def test_torch_compile_configured(device):
 
 def test_eager_autotuned(device):
     a, b, b_prepacked, scale, bias, out_dtype = _make_inputs(512, 512, 512, device)
-    out = scaled_mm_hip_prepacked(a, b_prepacked, scale, bias, out_dtype)
+    out = scaled_mm_hip(a, b_prepacked, scale, bias, out_dtype)
     ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
     _check_close(out, ref, "eager autotuned", out_dtype)
 
@@ -65,7 +65,7 @@ def test_torch_compile_autotuned(device):
 
     @torch.compile(fullgraph=True, mode="max-autotune")
     def compiled_fn(a, b_prepacked, scale, bias):
-        return scaled_mm_hip_prepacked(a, b_prepacked, scale, bias, out_dtype)
+        return scaled_mm_hip(a, b_prepacked, scale, bias, out_dtype)
 
     out = compiled_fn(a, b_prepacked, scale, bias)
     ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
@@ -78,7 +78,7 @@ def test_torch_compile_autotuned_no_scale(device):
 
     @torch.compile(fullgraph=True, mode="max-autotune")
     def compiled_fn(a, b_prepacked, bias):
-        return scaled_mm_hip_prepacked(a, b_prepacked, scale, bias, out_dtype)
+        return scaled_mm_hip(a, b_prepacked, scale, bias, out_dtype)
 
     out = compiled_fn(a, b_prepacked, bias)
     ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
@@ -96,7 +96,7 @@ def test_torch_compile_view_input_no_scale(device):
     def compiled_fn(x, b_prepacked, bias):
         x = x.to(torch.float16)
         x = x.view(-1, x.shape[-1])
-        return scaled_mm_hip_prepacked(x, b_prepacked, None, bias, out_dtype)
+        return scaled_mm_hip(x, b_prepacked, None, bias, out_dtype)
 
     out = compiled_fn(x, b_prepacked, bias)
     ref = scaled_mm_naive(x.to(torch.float16).view(-1, 3072), b, None, bias, out_dtype)

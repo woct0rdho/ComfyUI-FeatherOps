@@ -7,12 +7,12 @@ from torch._inductor.kernel.custom_op import register_custom_op_autotuning
 from .utils import generate_autotune_configs, get_compatible_config, load_hip_stable_extension, old_autotune, patch_inductor_custom_op_autotune_realize_inputs
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
-load_hip_stable_extension("scaled_mm_hip_prepacked_ext", cur_dir, "hip_kernel_prepacked.cu")
+load_hip_stable_extension("scaled_mm_hip_ext", cur_dir, "hip_kernel.cu")
 
 patch_inductor_custom_op_autotune_realize_inputs()
 
 
-@torch.library.custom_op("feather_ops_internal::scaled_mm_prepacked_configured", mutates_args=())
+@torch.library.custom_op("feather_ops_internal::scaled_mm_configured", mutates_args=())
 def _configured_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
@@ -26,7 +26,7 @@ def _configured_op(
     repeat_n: int,
 ) -> torch.Tensor:
     out = torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
-    torch.ops.feather_ops.scaled_mm_prepacked.default(
+    torch.ops.feather_ops.scaled_mm.default(
         a,
         b_prepacked,
         scale,
@@ -58,7 +58,7 @@ def _(
     return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
-scaled_mm_hip_prepacked_configured = _configured_op
+scaled_mm_hip_configured = _configured_op
 
 _CONFIGS = [
     (1, 1, 2, 1, 2),
@@ -115,7 +115,7 @@ def _fake_output(a: torch.Tensor, b_prepacked: torch.Tensor, out_dtype: torch.dt
     return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
-@torch.library.custom_op("feather_ops_internal::scaled_mm_prepacked_autotuned", mutates_args=())
+@torch.library.custom_op("feather_ops_internal::scaled_mm_autotuned", mutates_args=())
 def _autotuned_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
@@ -147,7 +147,7 @@ def _(
     return _fake_output(a, b_prepacked, arg_4)
 
 
-@torch.library.custom_op("feather_ops_internal::scaled_mm_prepacked_autotuned_no_scale", mutates_args=())
+@torch.library.custom_op("feather_ops_internal::scaled_mm_autotuned_no_scale", mutates_args=())
 def _autotuned_op_no_scale(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
@@ -177,7 +177,7 @@ def _(
     return _fake_output(a, b_prepacked, arg_3)
 
 
-@torch.library.custom_op("feather_ops_internal::scaled_mm_prepacked_autotuned_no_bias", mutates_args=())
+@torch.library.custom_op("feather_ops_internal::scaled_mm_autotuned_no_bias", mutates_args=())
 def _autotuned_op_no_bias(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
@@ -207,7 +207,7 @@ def _(
     return _fake_output(a, b_prepacked, arg_3)
 
 
-@torch.library.custom_op("feather_ops_internal::scaled_mm_prepacked_autotuned_no_scale_bias", mutates_args=())
+@torch.library.custom_op("feather_ops_internal::scaled_mm_autotuned_no_scale_bias", mutates_args=())
 def _autotuned_op_no_scale_bias(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
@@ -241,7 +241,7 @@ register_custom_op_autotuning(_autotuned_op_no_bias, config_generator=lambda fak
 register_custom_op_autotuning(_autotuned_op_no_scale_bias, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS, 1))
 
 
-def scaled_mm_hip_prepacked(
+def scaled_mm_hip(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
     scale: Optional[torch.Tensor],

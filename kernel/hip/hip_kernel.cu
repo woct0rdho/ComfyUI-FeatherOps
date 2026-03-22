@@ -92,7 +92,7 @@ template <int kBlockWarpsM,
           int kRepeatM,
           int kRepeatN,
           bool kUseFp8E5M2>
-__global__ void scaled_mm_kernel_prepacked_b(
+__global__ void scaled_mm_kernel(
     const half* const a,
     const uint8_t* const b_prepacked,
     const bfloat16_t* const scale,
@@ -402,7 +402,7 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-extern "C" bool launch_scaled_mm_prepacked(
+extern "C" bool launch_scaled_mm(
     const half* a,
     const uint8_t* b_prepacked,
     const bfloat16_t* scale,
@@ -442,7 +442,7 @@ extern "C" bool launch_scaled_mm_prepacked(
 
         if (use_fp8_e5m2) {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
@@ -450,7 +450,7 @@ extern "C" bool launch_scaled_mm_prepacked(
                 has_scale ? 1 : 0, has_bias ? 1 : 0);
         } else {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
@@ -506,7 +506,7 @@ extern "C" bool launch_scaled_mm_prepacked(
 }
 
 #ifndef NO_PYTORCH
-void scaled_mm_prepacked(
+void scaled_mm(
     const torch::stable::Tensor& a,
     const torch::stable::Tensor& b_prepacked,
     const std::optional<torch::stable::Tensor>& scale,
@@ -599,7 +599,7 @@ void scaled_mm_prepacked(
     const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
 
-    const bool launched = launch_scaled_mm_prepacked(
+    const bool launched = launch_scaled_mm(
         a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
         M, N, K,
         a.stride(0), c.stride(0),
@@ -609,13 +609,13 @@ void scaled_mm_prepacked(
     STD_TORCH_CHECK(launched, "Unsupported config");
 
     const hipError_t launch_err = hipGetLastError();
-    STD_TORCH_CHECK(launch_err == hipSuccess, "scaled_mm_prepacked kernel launch failed: ", hipGetErrorString(launch_err));
+    STD_TORCH_CHECK(launch_err == hipSuccess, "scaled_mm kernel launch failed: ", hipGetErrorString(launch_err));
 }
 
 STABLE_TORCH_LIBRARY(feather_ops, m)
 {
     m.def(
-        "scaled_mm_prepacked("
+        "scaled_mm("
         "Tensor a, "
         "Tensor b_prepacked, "
         "Tensor? scale, "
@@ -632,6 +632,6 @@ STABLE_TORCH_LIBRARY(feather_ops, m)
 
 STABLE_TORCH_LIBRARY_IMPL(feather_ops, CUDA, m)
 {
-    m.impl("scaled_mm_prepacked", TORCH_BOX(&scaled_mm_prepacked));
+    m.impl("scaled_mm", TORCH_BOX(&scaled_mm));
 }
 #endif

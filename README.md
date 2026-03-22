@@ -14,8 +14,8 @@ It's a pity that AMD RDNA3/3.5 GPUs do not have faster int8 matmul than fp16, bu
 
 ## Implementation details
 
-* `kernel/hip/hip_kernel_prepacked.cu` is the kernel used in ComfyUI. Other kernels are for experiments and not used in ComfyUI
-* `kernel/hip/hip_kernel_prepacked.py` contains a lot of boilerplate to support torch.compile in torch 2.10, which can be reduced in torch 2.11
+* `kernel/hip/hip_kernel.cu` is the kernel used in ComfyUI. Other kernels are for experiments and not used in ComfyUI
+* `kernel/hip/hip_kernel.py` contains a lot of boilerplate to support torch.compile in torch 2.10, which can be reduced in torch 2.11
 * `comfy_feather/` contains all ComfyUI-related code
 
 The kernel is written in HIP, with intrinsics and asm when needed, without abstraction levels like CK, Tensile, or Triton.
@@ -44,7 +44,7 @@ Benchmarks on Strix Halo, when the matrices are large: (The results may change w
 
 1. Install the rocm-sdk-devel wheel from TheRock, and set the paths
 2. git clone this repo to `ComfyUI/custom_nodes/`
-3. Run `python test_scaled_mm_hip_prepacked_e5m2.py` to test the correctness
+3. Run `python test_scaled_mm_hip.py` to test the correctness
 4. In ComfyUI, use `FeatherUNetLoader` node to load the model, which converts fp16/bf16 model to fp8e5m2 with the prepacked layout
 5. Replace the text encode node with `FeatherCLIPTextEncodePadded`, which pads the tokens to a multiple of 16
 

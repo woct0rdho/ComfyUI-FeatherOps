@@ -2,9 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/benchmark_scaled_mm_hip_prepacked_e5m2"
-KERNEL_SRC="$SCRIPT_DIR/../kernel/hip/hip_kernel_prepacked.cu"
-BENCH_SRC="$SCRIPT_DIR/benchmark_scaled_mm_hip_prepacked_e5m2.cpp"
+BIN="$SCRIPT_DIR/benchmark_scaled_mm_hip"
+KERNEL_SRC="$SCRIPT_DIR/../kernel/hip/hip_kernel.cu"
+BENCH_SRC="$SCRIPT_DIR/benchmark_scaled_mm_hip.cpp"
 
 CLANGXX="$ROCM_PATH/lib/llvm/bin/clang++"
 
