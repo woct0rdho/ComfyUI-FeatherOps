@@ -94,7 +94,7 @@ Known pitfalls:
 
 ## PC Sampling
 
-PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, and ROCProfiler.
+PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, and ROCProfiler, see https://github.com/woct0rdho/linux-amdgpu-driver
 
 ### Running PC Sampling
 
