@@ -175,7 +175,7 @@ __global__ void scaled_mm_kernel_fp8(
         if (wave_id >= kBlockWarpsM * kBlockWarpsN) return;
 
         using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
-        using float8_t = float __attribute__((ext_vector_type(8)));
+        using fp32x8_t = float __attribute__((ext_vector_type(8)));
 
         const int lane_in_subgroup = lane % 16;
 
@@ -219,11 +219,11 @@ __global__ void scaled_mm_kernel_fp8(
             for (int rn = 0; rn < kRepeatN; ++rn) {
                 const int repeat_idx = rm * kRepeatN + rn;
                 const fp16x16_t b_frag = *reinterpret_cast<const fp16x16_t*>(all_reg_b[rn]);
-                float8_t c_frag = *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]);
+                fp32x8_t c_frag = *reinterpret_cast<fp32x8_t*>(&acc[repeat_idx][0]);
 
                 c_frag = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag);
 
-                *reinterpret_cast<float8_t*>(&acc[repeat_idx][0]) = c_frag;
+                *reinterpret_cast<fp32x8_t*>(&acc[repeat_idx][0]) = c_frag;
             }
         }
     };
