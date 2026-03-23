@@ -14,17 +14,17 @@
 namespace {
 
 struct bfloat16_t {
-    unsigned short data;
+    uint16_t data;
 
     __device__ __forceinline__ bfloat16_t() = default;
 
     __device__ __forceinline__ bfloat16_t(const float f) {
-        const unsigned int u = *reinterpret_cast<const unsigned int*>(&f);
-        data = static_cast<unsigned short>(u >> 16);
+        const uint32_t u = *reinterpret_cast<const uint32_t*>(&f);
+        data = static_cast<uint16_t>(u >> 16);
     }
 
     __device__ __forceinline__ operator float() const {
-        const unsigned int u = static_cast<unsigned int>(data) << 16;
+        const uint32_t u = static_cast<uint32_t>(data) << 16;
         return *reinterpret_cast<const float*>(&u);
     }
 };
