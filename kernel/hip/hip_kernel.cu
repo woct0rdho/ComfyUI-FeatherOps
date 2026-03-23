@@ -93,11 +93,11 @@ template <int kBlockWarpsM,
           int kRepeatN,
           bool kUseFp8E5M2>
 __global__ void scaled_mm_kernel(
-    const half* const a,
-    const uint8_t* const b_prepacked,
-    const bfloat16_t* const scale,
-    const bfloat16_t* const bias,
-    bfloat16_t* const c,
+    const half* __restrict__ const a,
+    const uint8_t* __restrict__ const b_prepacked,
+    const bfloat16_t* __restrict__ const scale,
+    const bfloat16_t* __restrict__ const bias,
+    bfloat16_t* __restrict__ const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -198,10 +198,10 @@ __global__ void scaled_mm_kernel(
 
             const int64_t a_row = block_m + m_logi;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
-            const half* const a_ptr = a + a_row * stride_am + a_k;
+            const half* __restrict__ const a_src = a + a_row * stride_am + a_k;
 
-            half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
-            *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_ptr);
+            half* __restrict__ const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
+            *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_src);
         }
     };
 
@@ -220,9 +220,9 @@ __global__ void scaled_mm_kernel(
             const int col = block_n + col_local;
 
             const int64_t gidx = ((static_cast<int64_t>(ktile) * N + col) * kWmmaK);
-            const uint8_t* const b_src = b_prepacked + gidx;
+            const uint8_t* __restrict__ const b_src = b_prepacked + gidx;
 
-            uint8_t* const b_dst = &sh.ab.b[stage][col_local][0];
+            uint8_t* __restrict__ const b_dst = &sh.ab.b[stage][col_local][0];
             *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
         }
     };
@@ -272,7 +272,7 @@ __global__ void scaled_mm_kernel(
             _Float16 reg_a_fp16[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
-                const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
+                const half* __restrict__ const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
                     reg_a_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_a_src[k1]);
@@ -336,7 +336,7 @@ __global__ void scaled_mm_kernel(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        bfloat16_t* const sh_c = sh.c[wave_id][0];
+        bfloat16_t* __restrict__ const sh_c = sh.c[wave_id][0];
 
         const float scale_f = has_scale ? static_cast<float>(scale[0]) : 1.0f;
         const int subgroup = lane / 16;
@@ -375,8 +375,8 @@ __global__ void scaled_mm_kernel(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                bfloat16_t* const out_ptr = c + out_row * stride_cm + out_col;
-                bfloat16_t* const h = sh_c + read_row_phys * kCStride + read_col_base;
+                bfloat16_t* __restrict__ const out_ptr = c + out_row * stride_cm + out_col;
+                bfloat16_t* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
                     #pragma unroll
