@@ -435,8 +435,8 @@ extern "C" bool launch_scaled_mm(
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
         const dim3 block(kThreadsPerBlock, 1, 1);
         const dim3 grid(
-            static_cast<uint32_t>(N) / kBlockN,
-            static_cast<uint32_t>(M) / kBlockM);
+            static_cast<uint32_t>(N / kBlockN),
+            static_cast<uint32_t>(M / kBlockM));
 
         const bool use_fp8_e5m2 = (b_dtype == 1);
 
