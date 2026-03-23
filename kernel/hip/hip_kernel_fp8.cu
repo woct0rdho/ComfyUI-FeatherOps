@@ -434,8 +434,8 @@ void scaled_mm_fp8(
         static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
         const dim3 block(kThreadsPerBlock, 1, 1);
         const dim3 grid(
-            static_cast<uint32_t>(N) / kBlockN,
-            static_cast<uint32_t>(M) / kBlockM);
+            static_cast<uint32_t>(N / kBlockN),
+            static_cast<uint32_t>(M / kBlockM));
 
         hipLaunchKernelGGL(
             (scaled_mm_kernel_fp8<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN>),
