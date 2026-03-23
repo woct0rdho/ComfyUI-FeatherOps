@@ -205,13 +205,13 @@ void mm_hipblaslt_fp16_colmajor(
 
     void* raw_stream = nullptr;
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
-    auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
 
     auto& ctx = get_device_context(device_index);
     ensure_c_buffer(ctx, static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(half));
 
-    float beta = 0.0f;
-    float alpha = static_cast<float>(alpha_scalar);
+    const float beta = 0.0f;
+    const float alpha = static_cast<float>(alpha_scalar);
 
     hipblaslt_ext::Gemm gemm(
         ctx.handle,
@@ -266,7 +266,7 @@ void mm_hipblaslt_fp16_colmajor(
 
     {
         std::lock_guard<std::mutex> lock(g_context_mutex);
-        auto it = g_algo_cache.find(cache_key);
+        const auto it = g_algo_cache.find(cache_key);
         if(it != g_algo_cache.end())
         {
             if(gemm.initialize(it->second, ctx.workspace, true, stream) == HIPBLAS_STATUS_SUCCESS)
@@ -300,7 +300,7 @@ void mm_hipblaslt_fp16_colmajor(
 
         for(const auto& candidate : all_algos)
         {
-            auto algo = candidate.algo;
+            const auto algo = candidate.algo;
             if(hipblaslt_ext::getIndexFromAlgo(algo) != static_cast<int>(solution_index))
             {
                 continue;

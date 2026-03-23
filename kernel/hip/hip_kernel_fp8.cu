@@ -293,8 +293,7 @@ __global__ void scaled_mm_kernel_fp8(
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logi = subgroup * 8 + acc_idx;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    half val = __float2half_rn(acc[repeat_idx][acc_idx]);
-                    val = __hmul(val, scale_h);
+                    const half val = __hmul(__float2half_rn(acc[repeat_idx][acc_idx]), scale_h);
                     sh_c[row_phys * kCStride + col] = val;
                 }
 
@@ -400,7 +399,7 @@ void scaled_mm_fp8(
 
     void* raw_stream = nullptr;
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
-    auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
 
     const uint8_t* const a_ptr = reinterpret_cast<const uint8_t*>(a.const_data_ptr());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr());

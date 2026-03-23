@@ -403,11 +403,11 @@ struct ConfigTag {
 };
 
 extern "C" bool launch_scaled_mm(
-    const half* a,
-    const uint8_t* b_prepacked,
-    const bfloat16_t* scale,
-    const bfloat16_t* bias,
-    bfloat16_t* c,
+    const half* const a,
+    const uint8_t* const b_prepacked,
+    const bfloat16_t* const scale,
+    const bfloat16_t* const bias,
+    bfloat16_t* const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -574,7 +574,7 @@ void scaled_mm(
 
     void* raw_stream = nullptr;
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
-    auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.const_data_ptr());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr());
