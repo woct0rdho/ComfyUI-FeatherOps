@@ -298,7 +298,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
                     // subgroup 1 (lanes 16-31) holds odd rows: 1, 3, 5, 7, 9, 11, 13, 15
                     const int row_logi = acc_idx * 2 + subgroup;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    half val = __float2half_rn(acc[repeat_idx][acc_idx]);
+                    const half val = __float2half_rn(acc[repeat_idx][acc_idx]);
                     sh_c[row_phys * kCStride + col] = val;
                 }
 
@@ -396,7 +396,7 @@ void mm_fp16(
 
     void* raw_stream = nullptr;
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
-    auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.const_data_ptr());
     const half* const b_ptr = reinterpret_cast<const half*>(b_prepacked.const_data_ptr());
