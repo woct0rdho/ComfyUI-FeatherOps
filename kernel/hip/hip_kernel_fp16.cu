@@ -1,7 +1,9 @@
+#ifndef NO_PYTORCH
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/c/shim.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
+#endif
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -29,11 +31,11 @@ template <int kBlockWarpsM,
           int kUnrollK,
           int kRepeatM,
           int kRepeatN>
-__global__ void mm_kernel_fp16_prepacked_b(
-    const half* const a,
-    const half* const b_prepacked,
-    const half* const bias,
-    half* const c,
+__global__ void mm_fp16_kernel(
+    const half* __restrict__ const a,
+    const half* __restrict__ const b_prepacked,
+    const half* __restrict__ const bias,
+    half* __restrict__ const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -130,10 +132,10 @@ __global__ void mm_kernel_fp16_prepacked_b(
 
             const int64_t a_row = block_m + m_phys;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
-            const half* const a_ptr = a + a_row * stride_am + a_k;
+            const half* __restrict__ const a_src = a + a_row * stride_am + a_k;
 
-            half* const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
-            *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_ptr);
+            half* __restrict__ const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
+            *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_src);
         }
     };
 
@@ -155,14 +157,14 @@ __global__ void mm_kernel_fp16_prepacked_b(
             const int n_phys = vec_idx % kBlockN;
 
             const int64_t ktile = kk / kWmmaK;
-            const int64_t n_col = block_n + n_phys;
+            const int64_t n_row = block_n + n_phys;
 
             // The python prepack stores B in [K/16, 2, N, 8] with logical N order.
-            // Adjacent n_col values still access adjacent 8-element (uint4) chunks.
-            const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_col * 8;
-            const half* const b_src = b_prepacked + gidx;
+            // Adjacent n_row values still access adjacent 8-element (uint4) chunks.
+            const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_row * 8;
+            const half* __restrict__ const b_src = b_prepacked + gidx;
 
-            half* const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
+            half* __restrict__ const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
             *reinterpret_cast<uint4*>(sh_b_dst) = *reinterpret_cast<const uint4*>(b_src);
         }
     };
@@ -187,12 +189,12 @@ __global__ void mm_kernel_fp16_prepacked_b(
         #pragma unroll
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
-            const int n_phys = tile_n * kWmmaN + lane_in_subgroup;
+            const int n_row = tile_n * kWmmaN + lane_in_subgroup;
 
             _Float16 reg_b_fp16[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
-                const half* const sh_b_src = sh_b_row_ptr(stage, k0, n_phys);
+                const half* __restrict__ const sh_b_src = sh_b_row_ptr(stage, k0, n_row);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
                     reg_b_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_b_src[k1]);
@@ -210,7 +212,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
             _Float16 reg_a_fp16[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
-                const half* const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
+                const half* __restrict__ const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
                     reg_a_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_a_src[k1]);
@@ -274,7 +276,7 @@ __global__ void mm_kernel_fp16_prepacked_b(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        half* const sh_c = sh.c[wave_id][0];
+        half* __restrict__ const sh_c = sh.c[wave_id][0];
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
 
@@ -315,8 +317,8 @@ __global__ void mm_kernel_fp16_prepacked_b(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                half* const out_ptr = c + out_row * stride_cm + out_col;
-                half* const h = sh_c + read_row_phys * kCStride + read_col_base;
+                half* __restrict__ const out_ptr = c + out_row * stride_cm + out_col;
+                half* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
                     #pragma unroll
@@ -342,6 +344,95 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
+extern "C" bool launch_mm_fp16(
+    const half* const a,
+    const half* const b_prepacked,
+    const half* const bias,
+    half* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int64_t stride_am,
+    const int64_t stride_cm,
+    const int has_bias,
+    const int block_warps_m,
+    const int block_warps_n,
+    const int unroll_k,
+    const int repeat_m,
+    const int repeat_n,
+    hipStream_t stream)
+{
+    const auto launch = [&](const auto tag) -> void {
+        constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
+        constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
+        constexpr int kUnrollK = decltype(tag)::kUnrollK;
+        constexpr int kRepeatM = decltype(tag)::kRepeatM;
+        constexpr int kRepeatN = decltype(tag)::kRepeatN;
+        constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
+        constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+
+        constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+        const dim3 block(kThreadsPerBlock, 1, 1);
+        const dim3 grid(
+            static_cast<uint32_t>(N / kBlockN),
+            static_cast<uint32_t>(M / kBlockM));
+
+        hipLaunchKernelGGL(
+            (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN>),
+            grid, block, 0, stream,
+            a, b_prepacked, bias, c,
+            M, N, K,
+            stride_am, stride_cm,
+            has_bias);
+    };
+
+    const auto try_launch = [&](const auto tag) -> bool {
+        if (block_warps_m == decltype(tag)::kBlockWarpsM &&
+            block_warps_n == decltype(tag)::kBlockWarpsN &&
+            unroll_k == decltype(tag)::kUnrollK &&
+            repeat_m == decltype(tag)::kRepeatM &&
+            repeat_n == decltype(tag)::kRepeatN) {
+            launch(tag);
+            return true;
+        }
+        return false;
+    };
+
+    // Autotune configs
+    // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
+    return
+        try_launch(ConfigTag<1, 1, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 1, 8, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 8, 4, 4>{}) ||
+        try_launch(ConfigTag<1, 2, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 8, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 8, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 2, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 1, 8, 2, 2>{}) ||
+        try_launch(ConfigTag<2, 2, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 2, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 2, 8, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 4, 4, 4>{}) ||
+        try_launch(ConfigTag<2, 4, 8, 4, 2>{}) ||
+        try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
+        try_launch(ConfigTag<4, 2, 8, 2, 4>{}) ||
+        false;
+}
+
+#ifndef NO_PYTORCH
 void mm_fp16(
     const torch::stable::Tensor& a,
     const torch::stable::Tensor& b_prepacked,
@@ -388,8 +479,8 @@ void mm_fp16(
         const auto& bias_t = *bias;
         STD_TORCH_CHECK(bias_t.is_cuda(), "bias must be a CUDA tensor");
         STD_TORCH_CHECK(bias_t.get_device_index() == device_index, "bias must be on the same device as a");
-        STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
         STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::Half, "bias must be float16");
+        STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
     }
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
@@ -410,90 +501,32 @@ void mm_fp16(
     STD_TORCH_CHECK(is_aligned_16(b_ptr), "b_prepacked data pointer must be 16-byte aligned");
     STD_TORCH_CHECK(is_aligned_16(c_ptr), "c data pointer must be 16-byte aligned");
 
-    const auto launch = [&](const auto tag) -> void {
-        constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
-        constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
-        constexpr int kUnrollK = decltype(tag)::kUnrollK;
-        constexpr int kRepeatM = decltype(tag)::kRepeatM;
-        constexpr int kRepeatN = decltype(tag)::kRepeatN;
-        constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
-        constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+    const int64_t block_m = kWmmaM * block_warps_m * repeat_m;
+    const int64_t block_n = kWmmaN * block_warps_n * repeat_n;
+    const int64_t chunk_k = kWmmaK * unroll_k;
 
-        STD_TORCH_CHECK(M % kBlockM == 0,
-            "M (", M, ") must be divisible by kBlockM (", kBlockM, ")");
-        STD_TORCH_CHECK(N % kBlockN == 0,
-            "N (", N, ") must be divisible by kBlockN (", kBlockN, ")");
-        STD_TORCH_CHECK(K % (kWmmaK * kUnrollK) == 0,
-            "K (", K, ") must be divisible by kChunkK (", kWmmaK * kUnrollK, ")");
+    STD_TORCH_CHECK(M % block_m == 0,
+        "M (", M, ") must be divisible by kBlockM (", block_m, ")");
+    STD_TORCH_CHECK(N % block_n == 0,
+        "N (", N, ") must be divisible by kBlockN (", block_n, ")");
+    STD_TORCH_CHECK(K % chunk_k == 0,
+        "K (", K, ") must be divisible by kChunkK (", chunk_k, ")");
 
-        constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
-        static_assert(kThreadsPerBlock <= 1024, "Block size exceeds HIP thread-per-block limit");
-        const dim3 block(kThreadsPerBlock, 1, 1);
-        const dim3 grid(
-            static_cast<uint32_t>(N / kBlockN),
-            static_cast<uint32_t>(M / kBlockM));
+    const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
+    STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
 
-        hipLaunchKernelGGL(
-            (mm_kernel_fp16_prepacked_b<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN>),
-            grid, block, 0, stream,
-            a_ptr, b_ptr, bias_ptr, c_ptr,
-            M, N, K,
-            a.stride(0), c.stride(0),
-            bias.has_value() ? 1 : 0);
-    };
-
-    const auto try_launch = [&](const auto tag) -> bool {
-        if (block_warps_m == decltype(tag)::kBlockWarpsM &&
-            block_warps_n == decltype(tag)::kBlockWarpsN &&
-            unroll_k == decltype(tag)::kUnrollK &&
-            repeat_m == decltype(tag)::kRepeatM &&
-            repeat_n == decltype(tag)::kRepeatN) {
-            launch(tag);
-            return true;
-        }
-        return false;
-    };
-
-    // Autotune candidate configs
-    // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
-    const bool launched =
-        try_launch(ConfigTag<1, 1, 2, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
-        try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 1, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<1, 1, 8, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 1, 8, 4, 4>{}) ||
-        try_launch(ConfigTag<1, 2, 2, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 2, 4, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 2, 8, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 4, 2, 4, 2>{}) ||
-        try_launch(ConfigTag<1, 4, 4, 4, 2>{}) ||
-        try_launch(ConfigTag<1, 4, 8, 4, 2>{}) ||
-        try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
-        try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
-        try_launch(ConfigTag<2, 1, 2, 2, 2>{}) ||
-        try_launch(ConfigTag<2, 1, 4, 2, 2>{}) ||
-        try_launch(ConfigTag<2, 1, 8, 2, 2>{}) ||
-        try_launch(ConfigTag<2, 2, 2, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 2, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 2, 8, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 4, 2, 4, 2>{}) ||
-        try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
-        try_launch(ConfigTag<2, 4, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 4, 8, 4, 2>{}) ||
-        try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
-        try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
-        try_launch(ConfigTag<4, 2, 8, 2, 4>{}) ||
-        false;
+    const bool launched = launch_mm_fp16(
+        a_ptr, b_ptr, bias_ptr, c_ptr,
+        M, N, K,
+        a.stride(0), c.stride(0),
+        bias.has_value() ? 1 : 0,
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
+        stream);
 
     STD_TORCH_CHECK(launched, "Unsupported config");
 
     const hipError_t launch_err = hipGetLastError();
-    STD_TORCH_CHECK(
-        launch_err == hipSuccess,
-        "scaled_mm kernel launch failed: ",
-        hipGetErrorString(launch_err));
+    STD_TORCH_CHECK(launch_err == hipSuccess, "mm_fp16 kernel launch failed: ", hipGetErrorString(launch_err));
 }
 
 STABLE_TORCH_LIBRARY(feather_ops, m)
@@ -516,3 +549,4 @@ STABLE_TORCH_LIBRARY_IMPL(feather_ops, CUDA, m)
 {
     m.impl("mm_fp16", TORCH_BOX(&mm_fp16));
 }
+#endif

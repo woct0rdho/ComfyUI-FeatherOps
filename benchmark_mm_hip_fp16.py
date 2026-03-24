@@ -38,13 +38,11 @@ def benchmark(N, provider):
     torch.cuda.empty_cache()
 
     device = "cuda"
-    a_dtype = torch.float16
-    b_dtype = torch.float16
-    out_dtype = torch.float16
 
-    a = torch.randn((N, N), device=device, dtype=torch.float32).to(a_dtype)
-    b = torch.randn((N, N), device=device, dtype=torch.float32).to(b_dtype)
-    bias = torch.randn(N, device=device, dtype=out_dtype)
+    a = torch.randn((N, N), device=device, dtype=torch.float32).to(torch.float16)
+    b = torch.randn((N, N), device=device, dtype=torch.float32).to(torch.float16)
+    bias = torch.randn(N, device=device, dtype=torch.float16)
+    out_dtype = torch.float16
 
     # Prepacking is done once and excluded from do_bench
     b_prepacked = prepack_b_for_mm_fp16(b)
