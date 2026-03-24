@@ -24,8 +24,7 @@ def test_config(cfg, M, N, K, device):
     l2_rel_err = l2_rel_err.item()
     max_abs_err = diff.max().item()
 
-    atol_threshold = 8 if out_dtype == torch.bfloat16 else 1
-    if l2_rel_err > 0.01 or max_abs_err > atol_threshold:
+    if l2_rel_err > 0.01 or max_abs_err > 1:
         return False, f"l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
     return True, f"l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
 

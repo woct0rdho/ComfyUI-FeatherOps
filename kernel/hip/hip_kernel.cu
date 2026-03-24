@@ -558,16 +558,16 @@ void scaled_mm(
         const auto& scale_t = *scale;
         STD_TORCH_CHECK(scale_t.is_cuda(), "scale must be a CUDA tensor");
         STD_TORCH_CHECK(scale_t.get_device_index() == device_index, "scale must be on the same device as a");
-        STD_TORCH_CHECK(scale_t.numel() == 1, "scale must have one element");
         STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::BFloat16, "scale must be bfloat16");
+        STD_TORCH_CHECK(scale_t.numel() == 1, "scale must have one element");
     }
     if (bias.has_value()) {
         STD_TORCH_CHECK(bias.has_value(), "bias must be provided when has_bias=True");
         const auto& bias_t = *bias;
         STD_TORCH_CHECK(bias_t.is_cuda(), "bias must be a CUDA tensor");
         STD_TORCH_CHECK(bias_t.get_device_index() == device_index, "bias must be on the same device as a");
-        STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
         STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::BFloat16, "bias must be bfloat16");
+        STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
     }
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
@@ -592,9 +592,9 @@ void scaled_mm(
     const int64_t block_m = kWmmaM * block_warps_m * repeat_m;
     const int64_t block_n = kWmmaN * block_warps_n * repeat_n;
     const int64_t chunk_k = kWmmaK * unroll_k;
-    STD_TORCH_CHECK(M % block_m == 0, "M (", M, ") must be divisible by block_m (", block_m, ")");
-    STD_TORCH_CHECK(N % block_n == 0, "N (", N, ") must be divisible by block_n (", block_n, ")");
-    STD_TORCH_CHECK(K % chunk_k == 0, "K (", K, ") must be divisible by chunk_k (", chunk_k, ")");
+    STD_TORCH_CHECK(M % block_m == 0, "M (", M, ") must be divisible by kBlockM (", block_m, ")");
+    STD_TORCH_CHECK(N % block_n == 0, "N (", N, ") must be divisible by kBlockN (", block_n, ")");
+    STD_TORCH_CHECK(K % chunk_k == 0, "K (", K, ") must be divisible by kChunkK (", chunk_k, ")");
 
     const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
