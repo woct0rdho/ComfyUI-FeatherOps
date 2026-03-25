@@ -166,8 +166,8 @@ int main(int argc, char** argv)
     const size_t scale_alpha_elems = static_cast<size_t>(opts.m);
     const size_t workspace_bytes = opts.workspace_mb * 1024ULL * 1024ULL;
     const double gemm_flops = 2.0 * static_cast<double>(opts.m) * opts.n * opts.k * opts.batch_count;
-    const double matrix_bytes_total = static_cast<double>(a_elems + b_elems + 2 * c_d_elems) * sizeof(__half) +
-                                      static_cast<double>(bias_elems) * sizeof(__half) +
+    const double matrix_bytes_total = static_cast<double>(a_elems + b_elems + 2 * c_d_elems) * sizeof(half) +
+                                      static_cast<double>(bias_elems) * sizeof(half) +
                                       static_cast<double>(scale_alpha_elems) * sizeof(float) +
                                       static_cast<double>(workspace_bytes);
 
@@ -181,11 +181,11 @@ int main(int argc, char** argv)
     CHECK_HIP(hipEventCreate(&start));
     CHECK_HIP(hipEventCreate(&stop));
 
-    __half* d_a = device_alloc<__half>(a_elems);
-    __half* d_b = device_alloc<__half>(b_elems);
-    __half* d_c = device_alloc<__half>(c_d_elems);
-    __half* d_d = device_alloc<__half>(c_d_elems);
-    __half* d_bias = device_alloc<__half>(bias_elems);
+    half* d_a = device_alloc<half>(a_elems);
+    half* d_b = device_alloc<half>(b_elems);
+    half* d_c = device_alloc<half>(c_d_elems);
+    half* d_d = device_alloc<half>(c_d_elems);
+    half* d_bias = device_alloc<half>(bias_elems);
     float* d_scale_alpha_vec = device_alloc<float>(scale_alpha_elems);
     void* d_workspace = nullptr;
 
