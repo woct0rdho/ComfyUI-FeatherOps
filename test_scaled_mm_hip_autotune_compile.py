@@ -20,16 +20,16 @@ def _make_inputs(m, n, k, device):
 def _check_close(out, ref, label, out_dtype=torch.bfloat16):
     out = out.float()
     ref = ref.float()
-    diff = (out - ref).abs()
-    l2_rel_err = diff.norm() / ref.abs().norm().clamp_min(1e-6)
-    l2_rel_err = l2_rel_err.item()
-    max_abs_err = diff.max().item()
+    diff = out - ref
+    fro_rel_err = torch.linalg.matrix_norm(diff) / torch.linalg.matrix_norm(ref).clamp(min=1e-6)
+    fro_rel_err = fro_rel_err.item()
+    max_abs_err = diff.abs().max().item()
 
     atol_threshold = 8 if out_dtype == torch.bfloat16 else 1
-    if l2_rel_err > 0.01 or max_abs_err > atol_threshold:
-        raise RuntimeError(f"{label} failed: l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
+    if fro_rel_err > 0.01 or max_abs_err > atol_threshold:
+        raise RuntimeError(f"{label} failed: fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
 
-    print(f"{label}: l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
+    print(f"{label}: fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
 
 
 def test_eager_configured(device):

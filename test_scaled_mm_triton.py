@@ -28,11 +28,11 @@ def main():
 
     out_triton = out_triton.float()
     out_ref = out_ref.float()
-    diff = (out_triton - out_ref).abs()
-    l2_rel_err = diff.norm() / out_ref.abs().norm().clamp_min(1e-6)
-    l2_rel_err = l2_rel_err.item()
-    max_abs_err = diff.max().item()
-    print(f"l2_rel_err={l2_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
+    diff = out_triton - out_ref
+    fro_rel_err = torch.linalg.matrix_norm(diff) / torch.linalg.matrix_norm(out_ref).clamp(min=1e-6)
+    fro_rel_err = fro_rel_err.item()
+    max_abs_err = diff.abs().max().item()
+    print(f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
 
 
 if __name__ == "__main__":
