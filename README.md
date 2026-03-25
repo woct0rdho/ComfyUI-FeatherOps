@@ -22,7 +22,7 @@ The kernel is written in HIP, with intrinsics and asm when needed, without abstr
 
 The kernel computes fp16 @ fp8e5m2 -> bf16 mixed precision matmul. fp8 @ fp8 seems not achieving further speedup. We choose fp8e5m2 rather than fp8e4m3, and fp16 rather than bf16, because it's extremely fast to upcast fp8e5m2 to fp16 in the K-loop. We use fp32 accumulator in the wmma, and downcast to bf16 as the output to avoid overflow in ComfyUI workloads.
 
-The kernel requires the inputs to be aligned with the M/N/K block sizes, and there are no branches to handle OOB cases. This is satisfied in most AI models. 
+The kernel requires the inputs to be aligned with the M/N/K block sizes, and there are no branches to handle OOB cases. This is satisfied in most AI models.
 
 We prepack the B matrix into `(K/16, N, 16)` layout to enable fast 128-bit loads from VRAM to LDS, and ensure that threads with adjacent N load adjacent 128-bit elements. Note that the B matrix (weight) is in `(N, K)` rather than `(K, N)` layout in usual ComfyUI workloads.
 
@@ -34,7 +34,7 @@ The kernel is tested on Strix Halo, and it should also work with RDNA3 GPUs.
 
 Benchmarks on Strix Halo, when the matrices are large: (The results may change with your driver, ROCm, and PyTorch versions)
 * Theoretical roofline is 59.4 TFLOPS
-* fp16 @ fp8e5m2 reaches 52 TFLOPS in C++
+* fp16 @ fp8e5m2 reaches 46 TFLOPS in C++
 * and 43 TFLOPS in Python with dispatch overhead, which can be reduced using torch.compile
 * torch fp16 @ fp16 (a Tensile kernel) only reaches 30 TFLOPS in Python
 

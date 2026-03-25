@@ -8,6 +8,7 @@
 #include <c10/hip/HIPFunctions.h>
 #include <c10/hip/HIPStream.h>
 
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -26,9 +27,9 @@
 extern "C" bool launch_scaled_mm(
     const half* a,
     const uint8_t* b_prepacked,
-    const half* scale,
-    const half* bias,
-    half* c,
+    const hip_bfloat16* scale,
+    const hip_bfloat16* bias,
+    hip_bfloat16* c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -127,7 +128,7 @@ int main(int argc, char** argv)
     const size_t b_elems = static_cast<size_t>(opts.k) * opts.n;
     const size_t c_elems = static_cast<size_t>(opts.m) * opts.n;
 
-    // fp16: 2 bytes, fp8: 1 byte
+    // fp16: 2 bytes, fp8: 1 byte, bf16: 2 bytes
     const double matrix_bytes_total = static_cast<double>(a_elems) * 2.0 +
                                       static_cast<double>(b_elems) * 1.0 +
                                       static_cast<double>(c_elems) * 2.0;
@@ -136,16 +137,21 @@ int main(int argc, char** argv)
     at::Device device(at::kCUDA, 0);
 
     auto options_fp16 = at::TensorOptions().dtype(at::kHalf).device(device);
+    auto options_bf16 = at::TensorOptions().dtype(at::kBFloat16).device(device);
     // Use Byte for FP8 E5M2 for simpler storage and access mapping
     auto options_fp8 = at::TensorOptions().dtype(at::kByte).device(device);
 
     at::Tensor d_a = at::empty({opts.m, opts.k}, options_fp16);
     // b_prepacked has shape [K/16, N, 16]
     at::Tensor d_b_prepacked = at::empty({opts.k / 16, opts.n, 16}, options_fp8);
-    at::Tensor d_c = at::empty({opts.m, opts.n}, options_fp16);
+    at::Tensor d_scale = at::empty({1}, options_bf16);
+    at::Tensor d_bias = at::empty({opts.n}, options_bf16);
+    at::Tensor d_c = at::empty({opts.m, opts.n}, options_bf16);
 
-    d_a.zero_();
-    d_b_prepacked.zero_();
+    d_a.normal_(0.0, 1.0);
+    d_b_prepacked.random_(0, 255);
+    d_scale.fill_(2.34);
+    d_bias.normal_(0.0, 1.0);
     d_c.zero_();
 
     hipStream_t stream = c10::hip::getCurrentHIPStream(device.index()).stream();
@@ -162,11 +168,12 @@ int main(int argc, char** argv)
         const bool launched = launch_scaled_mm(
             reinterpret_cast<const half*>(d_a.data_ptr()),
             reinterpret_cast<const uint8_t*>(d_b_prepacked.data_ptr()),
-            nullptr, nullptr,
-            reinterpret_cast<half*>(d_c.data_ptr()),
+            reinterpret_cast<const hip_bfloat16*>(d_scale.data_ptr()),
+            reinterpret_cast<const hip_bfloat16*>(d_bias.data_ptr()),
+            reinterpret_cast<hip_bfloat16*>(d_c.data_ptr()),
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
-            0, 0,
+            1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             1, // b_dtype=1 (fp8e5m2)
             stream
@@ -186,11 +193,12 @@ int main(int argc, char** argv)
         launch_scaled_mm(
             reinterpret_cast<const half*>(d_a.data_ptr()),
             reinterpret_cast<const uint8_t*>(d_b_prepacked.data_ptr()),
-            nullptr, nullptr,
-            reinterpret_cast<half*>(d_c.data_ptr()),
+            reinterpret_cast<const hip_bfloat16*>(d_scale.data_ptr()),
+            reinterpret_cast<const hip_bfloat16*>(d_bias.data_ptr()),
+            reinterpret_cast<hip_bfloat16*>(d_c.data_ptr()),
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
-            0, 0,
+            1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             1, // b_dtype=1 (fp8e5m2)
             stream
