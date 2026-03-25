@@ -53,7 +53,7 @@ def benchmark(N, provider):
     if provider in {"torch", "torch_compiled"}:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
     elif provider == "hipblaslt":
-        fn = lambda: providers[provider](a_col, b_col, scale, bias, out_dtype, solution_index=1112)
+        fn = lambda: providers[provider](a_col, b_col, scale, bias, out_dtype, solution_index=-2)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 

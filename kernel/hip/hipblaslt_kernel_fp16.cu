@@ -16,6 +16,7 @@
 namespace {
 
 constexpr size_t kWorkspaceBytes = 64ull * 1024ull * 1024ull;
+constexpr int kAutoTuneHeuristicCount = 8;
 
 struct DeviceContext {
     hipblasLtHandle_t handle = nullptr;
@@ -264,12 +265,32 @@ void mm_hipblaslt_fp16_colmajor(
         static_cast<int>(solution_index),
     };
 
+    hipblasStatus_t last_status = HIPBLAS_STATUS_NOT_SUPPORTED;
+
+    const auto initialize_if_supported = [&](hipblasLtMatmulAlgo_t& algo) {
+        size_t workspace_size = 0;
+        last_status = gemm.isAlgoSupported(algo, workspace_size);
+        if(last_status != HIPBLAS_STATUS_SUCCESS)
+        {
+            return false;
+        }
+        if(workspace_size > ctx.workspace_bytes)
+        {
+            last_status = HIPBLAS_STATUS_INVALID_VALUE;
+            return false;
+        }
+
+        last_status = gemm.initialize(algo, ctx.workspace, true, stream);
+        return last_status == HIPBLAS_STATUS_SUCCESS;
+    };
+
     {
         std::lock_guard<std::mutex> lock(g_context_mutex);
         const auto it = g_algo_cache.find(cache_key);
         if(it != g_algo_cache.end())
         {
-            if(gemm.initialize(it->second, ctx.workspace, true, stream) == HIPBLAS_STATUS_SUCCESS)
+            auto cached_algo = it->second;
+            if(initialize_if_supported(cached_algo))
             {
                 check_hipblaslt(gemm.run(stream), "hipblaslt_ext::Gemm::run(colmajor)");
                 const hipError_t launch_err = hipGetLastError();
@@ -281,38 +302,123 @@ void mm_hipblaslt_fp16_colmajor(
     }
 
     bool initialized = false;
-    hipblasStatus_t last_status = HIPBLAS_STATUS_NOT_SUPPORTED;
 
-    if(solution_index >= 0)
+    if(solution_index >= 0 || solution_index == -2)
     {
-        std::vector<hipblasLtMatmulHeuristicResult_t> all_algos;
-        check_hipblaslt(hipblaslt_ext::getAllAlgos(ctx.handle,
-                                                   hipblaslt_ext::GemmType::HIPBLASLT_GEMM,
-                                                   HIPBLAS_OP_N,
-                                                   HIPBLAS_OP_N,
-                                                   HIP_R_16F,
-                                                   HIP_R_16F,
-                                                   HIP_R_16F,
-                                                   HIP_R_16F,
-                                                   HIPBLAS_COMPUTE_32F,
-                                                   all_algos),
-                        "hipblaslt_ext::getAllAlgos(colmajor)");
-
-        for(const auto& candidate : all_algos)
+        if (solution_index >= 0)
         {
-            auto algo = candidate.algo;
-            if(hipblaslt_ext::getIndexFromAlgo(algo) != static_cast<int>(solution_index))
+            std::vector<hipblasLtMatmulHeuristicResult_t> all_algos;
+            check_hipblaslt(hipblaslt_ext::getAllAlgos(ctx.handle,
+                                                       hipblaslt_ext::GemmType::HIPBLASLT_GEMM,
+                                                       HIPBLAS_OP_N,
+                                                       HIPBLAS_OP_N,
+                                                       HIP_R_16F,
+                                                       HIP_R_16F,
+                                                       HIP_R_16F,
+                                                       HIP_R_16F,
+                                                       HIPBLAS_COMPUTE_32F,
+                                                       all_algos),
+                            "hipblaslt_ext::getAllAlgos(colmajor)");
+
+            for(const auto& candidate : all_algos)
             {
-                continue;
+                auto algo = candidate.algo;
+                if(hipblaslt_ext::getIndexFromAlgo(algo) != static_cast<int>(solution_index))
+                {
+                    continue;
+                }
+
+                if(initialize_if_supported(algo))
+                {
+                    std::lock_guard<std::mutex> lock(g_context_mutex);
+                    g_algo_cache[cache_key] = algo;
+                    initialized = true;
+                    break;
+                }
+            }
+        }
+        else // solution_index == -2 (auto-tune)
+        {
+            std::vector<hipblasLtMatmulHeuristicResult_t> heuristic_algos;
+            check_hipblaslt(gemm.algoGetHeuristic(kAutoTuneHeuristicCount, pref, heuristic_algos),
+                            "hipblaslt_ext::Gemm::algoGetHeuristic(colmajor autotune)");
+            STD_TORCH_CHECK(!heuristic_algos.empty(),
+                            "hipBLASLt returned no heuristic results for auto-tuning the column-major path");
+
+            float best_ms = 1e9f;
+            hipblasLtMatmulAlgo_t best_algo;
+            bool found_best = false;
+
+            hipEvent_t start, stop;
+            check_hip(hipEventCreate(&start), "hipEventCreate");
+            check_hip(hipEventCreate(&stop), "hipEventCreate");
+
+            for(const auto& candidate : heuristic_algos)
+            {
+                auto algo = candidate.algo;
+                if(initialize_if_supported(algo))
+                {
+                    // Warmup
+                    bool warmup_failed = false;
+                    for (int i = 0; i < 3; ++i) {
+                        if (gemm.run(stream) != HIPBLAS_STATUS_SUCCESS) {
+                            warmup_failed = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!warmup_failed) {
+                        if (hipStreamSynchronize(stream) != hipSuccess) {
+                            warmup_failed = true;
+                        }
+                    }
+                    
+                    if (warmup_failed) {
+                        // Clear all pending errors
+                        while (hipGetLastError() != hipSuccess) {}
+                        continue;
+                    }
+
+                    check_hip(hipEventRecord(start, stream), "hipEventRecord");
+                    const int iters = 10;
+                    bool run_failed = false;
+                    for (int i = 0; i < iters; ++i) {
+                        if (gemm.run(stream) != HIPBLAS_STATUS_SUCCESS) {
+                            run_failed = true;
+                            break;
+                        }
+                    }
+                    if (run_failed) {
+                        continue;
+                    }
+                    check_hip(hipEventRecord(stop, stream), "hipEventRecord");
+
+                    if (hipEventSynchronize(stop) != hipSuccess) {
+                        (void)hipGetLastError(); // Clear any pending errors
+                        continue;
+                    }
+
+                    float ms = 0;
+                    check_hip(hipEventElapsedTime(&ms, start, stop), "hipEventElapsedTime");
+
+                    if (ms < best_ms) {
+                        best_ms = ms;
+                        best_algo = algo;
+                        found_best = true;
+                    }
+                }
             }
 
-            last_status = gemm.initialize(algo, ctx.workspace, true, stream);
-            if(last_status == HIPBLAS_STATUS_SUCCESS)
-            {
-                std::lock_guard<std::mutex> lock(g_context_mutex);
-                g_algo_cache[cache_key] = algo;
-                initialized = true;
-                break;
+            check_hip(hipEventDestroy(start), "hipEventDestroy");
+            check_hip(hipEventDestroy(stop), "hipEventDestroy");
+
+            if (found_best) {
+                if(initialize_if_supported(best_algo)) {
+                    std::lock_guard<std::mutex> lock(g_context_mutex);
+                    g_algo_cache[cache_key] = best_algo;
+                    initialized = true;
+                    printf("hipBLASLt auto-tuning complete for M=%ld, N=%ld, K=%ld: best solution_index=%d (%.3f ms)\n", M, N, K, hipblaslt_ext::getIndexFromAlgo(best_algo), best_ms / 10.0f);
+                }
             }
         }
     }
@@ -325,11 +431,11 @@ void mm_hipblaslt_fp16_colmajor(
 
         for(const auto& heuristic : heuristics)
         {
-            last_status = gemm.initialize(heuristic.algo, ctx.workspace, true, stream);
-            if(last_status == HIPBLAS_STATUS_SUCCESS)
+            auto algo = heuristic.algo;
+            if(initialize_if_supported(algo))
             {
                 std::lock_guard<std::mutex> lock(g_context_mutex);
-                g_algo_cache[cache_key] = heuristic.algo;
+                g_algo_cache[cache_key] = algo;
                 initialized = true;
                 break;
             }
