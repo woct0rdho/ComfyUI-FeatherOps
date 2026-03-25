@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -45,34 +46,6 @@ struct Options
     int iters = 100;
     size_t workspace_mb = 64;
 };
-
-__global__ void fill_half_pattern(__half* data, size_t count, float scale, int period)
-{
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count)
-    {
-        int centered = static_cast<int>(idx % static_cast<size_t>(period)) - (period / 2);
-        data[idx] = __float2half(scale * static_cast<float>(centered));
-    }
-}
-
-__global__ void fill_half_constant(__half* data, size_t count, float value)
-{
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count)
-    {
-        data[idx] = __float2half(value);
-    }
-}
-
-__global__ void fill_float_constant(float* data, size_t count, float value)
-{
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count)
-    {
-        data[idx] = value;
-    }
-}
 
 void print_usage(const char* argv0)
 {
@@ -162,28 +135,24 @@ T* device_alloc(size_t count)
     return ptr;
 }
 
-void launch_fill_half_pattern(__half* ptr, size_t count, float scale, int period, hipStream_t stream)
-{
-    constexpr int threads = 256;
-    int blocks = static_cast<int>((count + threads - 1) / threads);
-    hipLaunchKernelGGL(fill_half_pattern, dim3(blocks), dim3(threads), 0, stream, ptr, count, scale, period);
-    CHECK_HIP(hipGetLastError());
+void fill_random_half(half* ptr, size_t size) {
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<half> host_data(size);
+    for (size_t i = 0; i < size; ++i) {
+        host_data[i] = static_cast<half>(dist(gen));
+    }
+    CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(half), hipMemcpyHostToDevice));
 }
 
-void launch_fill_half_constant(__half* ptr, size_t count, float value, hipStream_t stream)
-{
-    constexpr int threads = 256;
-    int blocks = static_cast<int>((count + threads - 1) / threads);
-    hipLaunchKernelGGL(fill_half_constant, dim3(blocks), dim3(threads), 0, stream, ptr, count, value);
-    CHECK_HIP(hipGetLastError());
-}
-
-void launch_fill_float_constant(float* ptr, size_t count, float value, hipStream_t stream)
-{
-    constexpr int threads = 256;
-    int blocks = static_cast<int>((count + threads - 1) / threads);
-    hipLaunchKernelGGL(fill_float_constant, dim3(blocks), dim3(threads), 0, stream, ptr, count, value);
-    CHECK_HIP(hipGetLastError());
+void fill_random_float(float* ptr, size_t size) {
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> host_data(size);
+    for (size_t i = 0; i < size; ++i) {
+        host_data[i] = dist(gen);
+    }
+    CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(float), hipMemcpyHostToDevice));
 }
 
 int main(int argc, char** argv)
@@ -225,12 +194,12 @@ int main(int argc, char** argv)
         CHECK_HIP(hipMalloc(&d_workspace, workspace_bytes));
     }
 
-    launch_fill_half_pattern(d_a, a_elems, 1.0f / 128.0f, 17, stream);
-    launch_fill_half_pattern(d_b, b_elems, 1.0f / 256.0f, 13, stream);
-    launch_fill_half_constant(d_c, c_d_elems, 0.0f, stream);
-    launch_fill_half_constant(d_d, c_d_elems, 0.0f, stream);
-    launch_fill_half_constant(d_bias, bias_elems, 0.125f, stream);
-    launch_fill_float_constant(d_scale_alpha_vec, scale_alpha_elems, 1.0f, stream);
+    fill_random_half(d_a, a_elems);
+    fill_random_half(d_b, b_elems);
+    CHECK_HIP(hipMemset(d_c, 0, c_d_elems * sizeof(half)));
+    CHECK_HIP(hipMemset(d_d, 0, c_d_elems * sizeof(half)));
+    fill_random_half(d_bias, bias_elems);
+    fill_random_float(d_scale_alpha_vec, scale_alpha_elems);
     CHECK_HIP(hipStreamSynchronize(stream));
 
     float alpha = 1.0f;

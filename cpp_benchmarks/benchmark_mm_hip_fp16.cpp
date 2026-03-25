@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,16 @@ Options parse_args(int argc, char** argv)
     return opts;
 }
 
+void fill_random_half(half* ptr, size_t size) {
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<half> host_data(size);
+    for (size_t i = 0; i < size; ++i) {
+        host_data[i] = static_cast<half>(dist(gen));
+    }
+    CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(half), hipMemcpyHostToDevice));
+}
+
 int main(int argc, char** argv)
 {
     const Options opts = parse_args(argc, argv);
@@ -131,14 +142,17 @@ int main(int argc, char** argv)
 
     half* d_a = nullptr;
     half* d_b_prepacked = nullptr;
+    half* d_bias = nullptr;
     half* d_c = nullptr;
 
     CHECK_HIP(hipMalloc(&d_a, a_elems * sizeof(half)));
     CHECK_HIP(hipMalloc(&d_b_prepacked, b_elems * sizeof(half)));
+    CHECK_HIP(hipMalloc(&d_bias, opts.n * sizeof(half)));
     CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(half)));
 
-    CHECK_HIP(hipMemset(d_a, 0, a_elems * sizeof(half)));
-    CHECK_HIP(hipMemset(d_b_prepacked, 0, b_elems * sizeof(half)));
+    fill_random_half(d_a, a_elems);
+    fill_random_half(d_b_prepacked, b_elems);
+    fill_random_half(d_bias, opts.n);
     CHECK_HIP(hipMemset(d_c, 0, c_elems * sizeof(half)));
 
     hipStream_t stream = nullptr;
@@ -154,10 +168,10 @@ int main(int argc, char** argv)
     for (int i = 0; i < opts.warmup_iters; ++i)
     {
         const bool launched = launch_mm_fp16(
-            d_a, d_b_prepacked, nullptr, d_c,
+            d_a, d_b_prepacked, d_bias, d_c,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
-            0,
+            1, // has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             stream
         );
@@ -174,10 +188,10 @@ int main(int argc, char** argv)
     {
         CHECK_HIP(hipEventRecord(start, stream));
         launch_mm_fp16(
-            d_a, d_b_prepacked, nullptr, d_c,
+            d_a, d_b_prepacked, d_bias, d_c,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
-            0,
+            1, // has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             stream
         );
@@ -213,6 +227,7 @@ int main(int argc, char** argv)
     CHECK_HIP(hipEventDestroy(start));
     CHECK_HIP(hipStreamDestroy(stream));
     CHECK_HIP(hipFree(d_c));
+    CHECK_HIP(hipFree(d_bias));
     CHECK_HIP(hipFree(d_b_prepacked));
     CHECK_HIP(hipFree(d_a));
 

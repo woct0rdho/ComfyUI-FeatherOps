@@ -4,9 +4,11 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -25,9 +27,9 @@
 extern "C" bool launch_scaled_mm(
     const half* const a,
     const uint8_t* const b_prepacked,
-    const half* const scale,
-    const half* const bias,
-    half* const c,
+    const hip_bfloat16* const scale,
+    const hip_bfloat16* const bias,
+    hip_bfloat16* const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -112,6 +114,36 @@ Options parse_args(int argc, char** argv)
     return opts;
 }
 
+void fill_random_half(half* ptr, size_t size) {
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<half> host_data(size);
+    for (size_t i = 0; i < size; ++i) {
+        host_data[i] = static_cast<half>(dist(gen));
+    }
+    CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(half), hipMemcpyHostToDevice));
+}
+
+void fill_random_bf16(hip_bfloat16* ptr, size_t size) {
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<hip_bfloat16> host_data(size);
+    for (size_t i = 0; i < size; ++i) {
+        host_data[i] = static_cast<hip_bfloat16>(dist(gen));
+    }
+    CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(hip_bfloat16), hipMemcpyHostToDevice));
+}
+
+void fill_random_uint8(uint8_t* ptr, size_t size) {
+    std::mt19937 gen(42);
+    std::uniform_int_distribution<int> dist(0, 255);
+    std::vector<uint8_t> host_data(size);
+    for (size_t i = 0; i < size; ++i) {
+        host_data[i] = static_cast<uint8_t>(dist(gen));
+    }
+    CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(uint8_t), hipMemcpyHostToDevice));
+}
+
 int main(int argc, char** argv)
 {
     const Options opts = parse_args(argc, argv);
@@ -126,7 +158,7 @@ int main(int argc, char** argv)
     const size_t b_elems = static_cast<size_t>(opts.k) * opts.n;
     const size_t c_elems = static_cast<size_t>(opts.m) * opts.n;
 
-    // fp16: 2 bytes, fp8: 1 byte
+    // fp16: 2 bytes, fp8: 1 byte, bf16: 2 bytes
     const double matrix_bytes_total = static_cast<double>(a_elems) * 2.0 +
                                       static_cast<double>(b_elems) * 1.0 +
                                       static_cast<double>(c_elems) * 2.0;
@@ -134,15 +166,22 @@ int main(int argc, char** argv)
 
     half* d_a = nullptr;
     uint8_t* d_b_prepacked = nullptr;
-    half* d_c = nullptr;
+    hip_bfloat16* d_scale = nullptr;
+    hip_bfloat16* d_bias = nullptr;
+    hip_bfloat16* d_c = nullptr;
 
     CHECK_HIP(hipMalloc(&d_a, a_elems * sizeof(half)));
     CHECK_HIP(hipMalloc(&d_b_prepacked, b_elems * sizeof(uint8_t)));
-    CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(half)));
+    CHECK_HIP(hipMalloc(&d_scale, sizeof(hip_bfloat16)));
+    CHECK_HIP(hipMalloc(&d_bias, opts.n * sizeof(hip_bfloat16)));
+    CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(hip_bfloat16)));
 
-    CHECK_HIP(hipMemset(d_a, 0, a_elems * sizeof(half)));
-    CHECK_HIP(hipMemset(d_b_prepacked, 0, b_elems * sizeof(uint8_t)));
-    CHECK_HIP(hipMemset(d_c, 0, c_elems * sizeof(half)));
+    fill_random_half(d_a, a_elems);
+    fill_random_uint8(d_b_prepacked, b_elems);
+    hip_bfloat16 host_scale = static_cast<hip_bfloat16>(2.34f);
+    CHECK_HIP(hipMemcpy(d_scale, &host_scale, sizeof(hip_bfloat16), hipMemcpyHostToDevice));
+    fill_random_bf16(d_bias, opts.n);
+    CHECK_HIP(hipMemset(d_c, 0, c_elems * sizeof(hip_bfloat16)));
 
     hipStream_t stream = nullptr;
     hipEvent_t start = nullptr;
@@ -157,10 +196,10 @@ int main(int argc, char** argv)
     for (int i = 0; i < opts.warmup_iters; ++i)
     {
         const bool launched = launch_scaled_mm(
-            d_a, d_b_prepacked, nullptr, nullptr, d_c,
+            d_a, d_b_prepacked, d_scale, d_bias, d_c,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
-            0, 0,
+            1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             1, // b_dtype=1 (fp8e5m2)
             stream
@@ -178,10 +217,10 @@ int main(int argc, char** argv)
     {
         CHECK_HIP(hipEventRecord(start, stream));
         launch_scaled_mm(
-            d_a, d_b_prepacked, nullptr, nullptr, d_c,
+            d_a, d_b_prepacked, d_scale, d_bias, d_c,
             opts.m, opts.n, opts.k,
             opts.k, opts.n,
-            0, 0,
+            1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             1, // b_dtype=1 (fp8e5m2)
             stream
@@ -218,6 +257,8 @@ int main(int argc, char** argv)
     CHECK_HIP(hipEventDestroy(start));
     CHECK_HIP(hipStreamDestroy(stream));
     CHECK_HIP(hipFree(d_c));
+    CHECK_HIP(hipFree(d_bias));
+    CHECK_HIP(hipFree(d_scale));
     CHECK_HIP(hipFree(d_b_prepacked));
     CHECK_HIP(hipFree(d_a));
 
