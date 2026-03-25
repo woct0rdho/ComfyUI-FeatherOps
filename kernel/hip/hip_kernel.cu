@@ -119,9 +119,9 @@ __global__ void scaled_mm_kernel(
     constexpr int kAStrideK1 = kK1;
     constexpr int kShASize = kUnrollK * kK0 * kBlockM * kAStrideK1;
 
-    // B uses KxN layout for efficient vec16 stores during loading
-    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 halfs.
-    constexpr int kCStride = kWmmaN;  // 16 halfs per row
+    // B uses NxK prepacked layout for efficient vec16 stores during loading
+    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 bfloat16s.
+    constexpr int kCStride = kWmmaN;  // 16 elements per row
 
     union SharedStorage {
         struct {
@@ -205,7 +205,7 @@ __global__ void scaled_mm_kernel(
         }
     };
 
-    // Loading B: KxN layout with vec16 fp8->fp16 conversion
+    // Loading B: NxK prepacked layout with vec16 loads
     constexpr int kBVecs = kBlockN;
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
 
@@ -294,7 +294,7 @@ __global__ void scaled_mm_kernel(
         }
     };
 
-    // Prologue: load first chunk into LDS using monolithic loads
+    // Prologue: load first chunk into LDS
     #pragma unroll
     for (int u = 0; u < kUnrollK; ++u) {
         const int64_t k = static_cast<int64_t>(u) * kWmmaK;
@@ -534,7 +534,7 @@ void scaled_mm(
     }
 
     STD_TORCH_CHECK(a.dim() == 2, "a must be 2D");
-    STD_TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D [K/16, N, 16]");
+    STD_TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D (K/16, N, 16)");
     STD_TORCH_CHECK(c.dim() == 2, "c must be 2D");
 
     const int64_t M = a.size(0);

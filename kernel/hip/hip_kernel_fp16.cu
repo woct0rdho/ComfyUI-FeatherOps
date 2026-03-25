@@ -47,8 +47,6 @@ __global__ void mm_fp16_kernel(
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
     // K0xMxK1 layout for A matrix (no extra LDS padding).
-    // Apply row permutation on A store to improve LDS local-read banking while
-    // keeping compact LDS footprint and 128-bit accesses.
     // K1 = 8 for fp16: enables vec8 LDS reads (like CK)
     constexpr int kK1 = 8;
     // K0 = 16 / 8 = 2
@@ -120,7 +118,7 @@ __global__ void mm_fp16_kernel(
 
         const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
 
-        // Physical LDS space is traversed directly; global logical row is obtained by inverse map.
+        // Physical LDS space is traversed directly.
         #pragma unroll
         for (int v = 0; v < kAVecsPerOwnerThread; ++v) {
             const int vec_idx = a_owner_tid + v * kAOwnerThreads;
@@ -159,7 +157,7 @@ __global__ void mm_fp16_kernel(
             const int64_t ktile = kk / kWmmaK;
             const int64_t n_row = block_n + n_phys;
 
-            // The python prepack stores B in [K/16, 2, N, 8] with logical N order.
+            // The python prepack stores B in (K/16, 2, N, 8) with logical N order.
             // Adjacent n_row values still access adjacent 8-element (uint4) chunks.
             const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_row * 8;
             const half* __restrict__ const b_src = b_prepacked + gidx;
@@ -234,7 +232,7 @@ __global__ void mm_fp16_kernel(
         }
     };
 
-    // Prologue: load first chunk into LDS using monolithic loads
+    // Prologue: load first chunk into LDS
     #pragma unroll
     for (int u = 0; u < kUnrollK; ++u) {
         const int64_t k = static_cast<int64_t>(u) * kWmmaK;
@@ -454,7 +452,7 @@ void mm_fp16(
     STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half, "c must be float16");
 
     STD_TORCH_CHECK(a.dim() == 2, "a must be 2D");
-    STD_TORCH_CHECK(b_prepacked.dim() == 4, "b_prepacked must be 4D [K/16, 2, N, 8]");
+    STD_TORCH_CHECK(b_prepacked.dim() == 4, "b_prepacked must be 4D (K/16, 2, N, 8)");
     STD_TORCH_CHECK(c.dim() == 2, "c must be 2D");
 
     const int64_t M = a.size(0);
