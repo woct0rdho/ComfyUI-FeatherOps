@@ -179,28 +179,28 @@ __global__ void mm_fp16_kernel(
     const auto wmma_compute_stage = [&](const int stage) -> void {
         if (wave_id >= kBlockWarpsM * kBlockWarpsN) return;
 
-        using fp16x16_t = _Float16 __attribute__((ext_vector_type(16)));
+        using fp16x16_t = uint16_t __attribute__((ext_vector_type(16)));
         using fp32x8_t = float __attribute__((ext_vector_type(8)));
 
         const int lane_in_subgroup = lane % 16;
 
         // Pre-load all B fragments (one per rn tile)
-        _Float16 all_reg_b[kRepeatN][16];
+        half all_reg_b[kRepeatN][16];
         #pragma unroll
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
             const int n_row = tile_n * kWmmaN + lane_in_subgroup;
 
-            _Float16 reg_b_fp16[16];
+            half reg_b[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
                 const half* __restrict__ const sh_b_src = sh_b_row_ptr(stage, k0, n_row);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
-                    reg_b_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_b_src[k1]);
+                    reg_b[k0 * kK1 + k1] = sh_b_src[k1];
                 }
             }
-            *reinterpret_cast<fp16x16_t*>(&all_reg_b[rn]) = *reinterpret_cast<fp16x16_t*>(&reg_b_fp16);
+            *reinterpret_cast<fp16x16_t*>(&all_reg_b[rn]) = *reinterpret_cast<fp16x16_t*>(&reg_b);
         }
 
         // For each rm: load A once, compute all rn tiles with cached B
@@ -209,17 +209,17 @@ __global__ void mm_fp16_kernel(
             const int tile_m = warp_m + rm * kBlockWarpsM;
             const int m_row = tile_m * kWmmaM + lane_in_subgroup;
 
-            _Float16 reg_a_fp16[16];
+            half reg_a[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
                 const half* __restrict__ const sh_a_src = sh_a_row_ptr(stage, k0, m_row);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
-                    reg_a_fp16[k0 * kK1 + k1] = static_cast<_Float16>(sh_a_src[k1]);
+                    reg_a[k0 * kK1 + k1] = sh_a_src[k1];
                 }
             }
 
-            const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a_fp16);
+            const fp16x16_t a_frag = *reinterpret_cast<const fp16x16_t*>(reg_a);
 
             #pragma unroll
             for (int rn = 0; rn < kRepeatN; ++rn) {

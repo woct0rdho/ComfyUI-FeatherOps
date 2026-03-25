@@ -300,7 +300,7 @@ void mm_hipblaslt_fp16_colmajor(
 
         for(const auto& candidate : all_algos)
         {
-            const auto algo = candidate.algo;
+            auto algo = candidate.algo;
             if(hipblaslt_ext::getIndexFromAlgo(algo) != static_cast<int>(solution_index))
             {
                 continue;
