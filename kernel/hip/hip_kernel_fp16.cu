@@ -75,7 +75,7 @@ __global__ void mm_fp16_kernel(
     const int block_m = static_cast<int>(blockIdx.y) * kBlockM;
     const int block_n = static_cast<int>(blockIdx.x) * kBlockN;
 
-    const int tid = static_cast<int>(threadIdx.x) + static_cast<int>(threadIdx.y) * static_cast<int>(blockDim.x);
+    const int tid = static_cast<int>(threadIdx.x);
     constexpr int kThreads = kWaveSize * kBlockWarpsM * kBlockWarpsN;
 
     // Flattened wave mapping with 1D thread blocks.
@@ -373,9 +373,7 @@ extern "C" bool launch_mm_fp16(
 
         constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
         const dim3 block(kThreadsPerBlock, 1, 1);
-        const dim3 grid(
-            static_cast<uint32_t>(N / kBlockN),
-            static_cast<uint32_t>(M / kBlockM));
+        const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
 
         hipLaunchKernelGGL(
             (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN>),
