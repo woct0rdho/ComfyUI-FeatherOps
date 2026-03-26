@@ -200,6 +200,7 @@ def old_autotune(
     if not candidates:
         raise RuntimeError(f"No compatible config for M={M} N={N} K={K}.")
 
+    # Same defaults as triton.autotune
     warmup_ms = max(1, int(os.environ.get("AUTOTUNE_WARMUP_MS", "25")))
     rep_ms = max(1, int(os.environ.get("AUTOTUNE_REP_MS", "100")))
     best_cfg = candidates[0]

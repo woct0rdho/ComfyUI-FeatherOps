@@ -126,6 +126,60 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - On `N=2048`, the runtime `old_autotune` short probe window incorrectly preferred `(1,8,2,8,2)` even though the benchmark harness (`triton.testing.do_bench`) measured that config slower than `(4,2,2,2,4)` / `(4,2,4,2,4)`.
   - Restricting `(1,8,2,8,2)` to `N >= 4096` matches the observed crossover after P3 and removes the end-to-end `2048` regression.
 
+### P5: Native B-Prefetch Sweep And Runtime Heuristic - KEEP
+
+- Added native `auto|on|off` B-prefetch control to the FP16 benchmark/kernel path:
+  - benchmark harness: `cpp_benchmarks/benchmark_mm_hip_fp16.cpp`
+  - build script: `cpp_benchmarks/build_benchmark_mm_hip_fp16.sh`
+  - sweep runner: `tmp_fp16_analysis/run_b_prefetch_sweep.py`
+  - transition sweep runner: `tmp_fp16_analysis/run_b_prefetch_region_sweep.py`
+  - raw sweep results: `tmp_fp16_analysis/b_prefetch_sweep.csv`
+  - focused transition sweep log: `tmp_fp16_analysis/b_prefetch_region_sweep.txt`
+- The kernel now supports the simplified policy requested for this search:
+  - either prefetch **all** B stages in the next chunk,
+  - or prefetch **none** of them.
+- Sweep protocol:
+  - run native C++ benchmark only (`--no-bias`) to avoid Python/Torch overhead,
+  - test both `b_prefetch=off` and `b_prefetch=on`,
+  - sweep all compatible autotune configs over these shapes:
+    - target Qwen-Image shapes: `(32,12288,2048)`, `(32,2048,12288)`, `(8192,12288,2048)`, `(8192,2048,12288)`
+    - extra crossover shapes: `(128,12288,2048)`, `(128,2048,12288)`, `(512,12288,2048)`, `(512,2048,12288)`, `(2048,12288,2048)`, `(2048,2048,12288)`
+- Target-shape result summary from the sweep:
+  - `(32,12288,2048)`: best `off ~6.99 TFLOPS`, best `on ~7.21 TFLOPS`
+  - `(32,2048,12288)`: best `off ~3.09 TFLOPS`, best `on ~5.43 TFLOPS`
+  - `(8192,12288,2048)`: best `off ~29.06 TFLOPS`, best `on ~28.37 TFLOPS`
+  - `(8192,2048,12288)`: best `off ~34.48 TFLOPS`, best `on ~37.71 TFLOPS`
+- Main sweep conclusions:
+  - B prefetch is **not** a monotonic “large shape = on” optimization.
+  - Long-K shapes (`K >= 8192`) benefit much more consistently than short-K shapes.
+  - The strongest always-positive config families in this sweep were:
+    - `(2,4,2,4,2)`
+    - `(2,4,4,4,2)`
+    - `(2,1,4,2,2)`
+  - The wide `128x256` family `(1,8,*,8,2)` benefits on most shapes, but the large wide-N / short-K case `(8192,12288,2048)` is a real exception and should keep prefetch off.
+  - Very small-`M` row paths need a small explicit exception: `(1,8,2,1,2)` helps on `(32,12288,2048)` even though the general short-K rule is more conservative.
+- Focused transition sweep (`tmp_fp16_analysis/b_prefetch_region_sweep.txt`) tightened the boundaries:
+  - short-K wide-N `128x256` tile `(1,8,2,8,2)` stays positive through `M=2048`, then flips negative by `M=4096`
+  - long-K `128x128` / `warps_n=2` families split into two coarse regions:
+    - balanced `warps_m == warps_n` stays positive only up to about `M=512`
+    - asymmetric `warps_m != warps_n` is positive at very small `M` and again from about `M=2048`
+- Kept runtime heuristic in `hip_kernel_fp16.cu`, written as shape regions instead of tuple-specific exceptions:
+  - Region A, long-K: `K >= 8192`
+    - if `block_warps_n >= 4`, enable B-prefetch
+    - else if `block_warps_m == block_warps_n`, enable only for `M <= 512`
+    - else enable for `M <= 256` or `M >= 2048`
+  - Region B, short-K wide-N: `K <= 2048 && N >= 8192`
+    - enable only when `block_n >= 256` and `M <= 2048`
+  - otherwise keep B-prefetch off
+- Validation after keeping the heuristic:
+  - native `--b_prefetch auto` best-config scan on the four target Qwen shapes selected:
+    - `(32,12288,2048)` -> `(1,8,2,1,2)` at about `7.08 TFLOPS`
+    - `(32,2048,12288)` -> `(1,1,4,1,2)` at about `5.38 TFLOPS`
+    - `(8192,12288,2048)` -> `(1,8,2,8,2)` at about `29.99 TFLOPS`
+    - `(8192,2048,12288)` -> `(4,2,4,2,4)` at about `39.02 TFLOPS`
+- Keep reason:
+  - this simpler region heuristic still matches the measured sweep winner on the studied shapes while avoiding the clear regression on the large wide-N / short-K case.
+
 ### Durable Findings
 
 - Zero-conflict B LDS access is achievable without padding or larger LDS allocation.
@@ -153,6 +207,11 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - `(4,2,2,2,4)` / `(4,2,4,2,4)` remain the better small/medium-N benchmark-harness choices around `N=2048`.
   - `(1,8,2,8,2)` with kept P3 B-prefetch now wins at `N=4096..8192`.
   - The runtime autotune path should respect that crossover explicitly, because the short probe window can mis-rank configs near the boundary.
+- For FP16 B-prefetch, the useful decision boundary is **config-sensitive plus K-sensitive**:
+  - `K >= 8192` is the strongest generic signal for turning prefetch on.
+  - `block_warps_n >= 4` is a good coarse long-K proxy for a prefetch-positive region.
+  - balanced `warps_m == warps_n` narrow-N families only want B-prefetch at small `M`.
+  - the large wide-N / short-K crossover is mainly an `M` threshold: keep prefetch on through about `M=2048`, then turn it off by `M=4096`.
 
 ## Non-Negotiable Run Protocol
 
@@ -179,16 +238,6 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - prefer scalarized state over arrays/references if any A prefetch buffer is introduced,
   - reject immediately if the change adds a third chunk barrier or pushes the wide tile back behind the `N=4096` crossover.
 - **Decision:** Keep only if `N=8192` improves again and `2048` / `4096` stay at least as good as the current kept baseline.
-
-### P5: Tighten Runtime Autotune Fidelity Around The Crossover
-
-- **Rationale:** The kept P3 result required a shape guard because the current `old_autotune` short probe window mis-ranked `(1,8,2,8,2)` at `N=2048`.
-- **Method:** If the current explicit guard becomes too blunt later, revisit the runtime autotune method itself rather than undoing the kept kernel.
-- **Candidate directions:**
-  - spend more probe iterations only near the known `2048/4096` crossover,
-  - keep a tiny shape-based allow/deny table for the wide `128x256` tile,
-  - compare autotune probe results against a more stable benchmark mode before trusting a crossover move.
-- **Decision:** Keep only if it preserves the current `4096` / `8192` gains while avoiding any new small/medium-N regressions.
 
 ### Future Branches Worth Revisiting Only With New Preconditions
 

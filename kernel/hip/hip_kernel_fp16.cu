@@ -16,6 +16,9 @@ namespace {
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
+constexpr int kBPrefetchAuto = 0;
+[[maybe_unused]] constexpr int kBPrefetchOff = 1;
+[[maybe_unused]] constexpr int kBPrefetchOn = 2;
 // gfx11 uses wave32 - hardcode for consistent host/device behavior
 // rocwmma::Constants::AMDGCN_WAVE_SIZE returns 64 during host compilation
 constexpr int kWaveSize = 32;
@@ -30,7 +33,8 @@ template <int kBlockWarpsM,
           int kBlockWarpsN,
           int kUnrollK,
           int kRepeatM,
-          int kRepeatN>
+          int kRepeatN,
+          bool kEnableBPrefetch>
 __global__ void mm_fp16_kernel(
     const half* __restrict__ const a,
     const half* __restrict__ const b_prepacked,
@@ -262,48 +266,65 @@ __global__ void mm_fp16_kernel(
 
     // Main loop
     for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
-        constexpr bool kBPrefetch =
-            kBlockWarpsM == 1 &&
-            kBlockWarpsN == 8 &&
-            kUnrollK == 2 &&
-            kRepeatM == 8 &&
-            kRepeatN == 2;
+        if constexpr (kEnableBPrefetch) {
+            static_assert(kUnrollK == 2 || kUnrollK == 4);
+            static_assert(kBVecsPerThread >= 1 && kBVecsPerThread <= 4);
+            static_assert(kBVecs == kBVecsPerThread * kThreads);
 
-        if constexpr (kBPrefetch) {
-            static_assert(kBVecsPerThread == 2);
-            static_assert(kBVecs == 2 * kThreads);
+            struct BPrefetchStage {
+                uint4 v0;
+                uint4 v1;
+                uint4 v2;
+                uint4 v3;
+            };
 
-            uint4 b_stage0_prefetch0;
-            uint4 b_stage0_prefetch1;
-            uint4 b_stage1_prefetch0;
-            uint4 b_stage1_prefetch1;
+            const auto load_prefetch_stage = [&](BPrefetchStage& dst, const int64_t kk) -> void {
+                if constexpr (kBVecsPerThread >= 1) dst.v0 = load_b_global_vec(tid, kk);
+                if constexpr (kBVecsPerThread >= 2) dst.v1 = load_b_global_vec(tid + kThreads, kk);
+                if constexpr (kBVecsPerThread >= 3) dst.v2 = load_b_global_vec(tid + 2 * kThreads, kk);
+                if constexpr (kBVecsPerThread >= 4) dst.v3 = load_b_global_vec(tid + 3 * kThreads, kk);
+            };
+
+            const auto store_prefetch_stage = [&](const int stage, const BPrefetchStage& src) -> void {
+                if constexpr (kBVecsPerThread >= 1) store_b_lds_vec(stage, tid, src.v0);
+                if constexpr (kBVecsPerThread >= 2) store_b_lds_vec(stage, tid + kThreads, src.v1);
+                if constexpr (kBVecsPerThread >= 3) store_b_lds_vec(stage, tid + 2 * kThreads, src.v2);
+                if constexpr (kBVecsPerThread >= 4) store_b_lds_vec(stage, tid + 3 * kThreads, src.v3);
+            };
+
+            BPrefetchStage b_stage0_prefetch;
+            BPrefetchStage b_stage1_prefetch;
+            BPrefetchStage b_stage2_prefetch;
+            BPrefetchStage b_stage3_prefetch;
             const bool has_next = iter_idx + 1 < total_chunks;
             const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
-            const int vec_idx0 = tid;
-            const int vec_idx1 = tid + kThreads;
 
             if (has_next) {
                 asm volatile("s_setprio 1" ::: "memory");
-                b_stage0_prefetch0 = load_b_global_vec(vec_idx0, k_next);
-                b_stage0_prefetch1 = load_b_global_vec(vec_idx1, k_next);
-                b_stage1_prefetch0 = load_b_global_vec(vec_idx0, k_next + kWmmaK);
-                b_stage1_prefetch1 = load_b_global_vec(vec_idx1, k_next + kWmmaK);
+                if constexpr (kUnrollK >= 1) load_prefetch_stage(b_stage0_prefetch, k_next);
+                if constexpr (kUnrollK >= 2) load_prefetch_stage(b_stage1_prefetch, k_next + kWmmaK);
+                if constexpr (kUnrollK >= 3) load_prefetch_stage(b_stage2_prefetch, k_next + 2 * kWmmaK);
+                if constexpr (kUnrollK >= 4) load_prefetch_stage(b_stage3_prefetch, k_next + 3 * kWmmaK);
                 asm volatile("s_setprio 0" ::: "memory");
             }
 
-            wmma_compute_stage(0);
-            wmma_compute_stage(1);
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
+                wmma_compute_stage(u);
+            }
             __syncthreads();
 
             if (has_next) {
-                store_b_lds_vec(0, vec_idx0, b_stage0_prefetch0);
-                store_b_lds_vec(0, vec_idx1, b_stage0_prefetch1);
-                store_b_lds_vec(1, vec_idx0, b_stage1_prefetch0);
-                store_b_lds_vec(1, vec_idx1, b_stage1_prefetch1);
+                if constexpr (kUnrollK >= 1) store_prefetch_stage(0, b_stage0_prefetch);
+                if constexpr (kUnrollK >= 2) store_prefetch_stage(1, b_stage1_prefetch);
+                if constexpr (kUnrollK >= 3) store_prefetch_stage(2, b_stage2_prefetch);
+                if constexpr (kUnrollK >= 4) store_prefetch_stage(3, b_stage3_prefetch);
 
                 asm volatile("s_setprio 1" ::: "memory");
-                load_a_lds_k0mk1(0, k_next);
-                load_a_lds_k0mk1(1, k_next + kWmmaK);
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
+                    load_a_lds_k0mk1(u, k_next + static_cast<int64_t>(u) * kWmmaK);
+                }
                 asm volatile("s_setprio 0" ::: "memory");
                 __syncthreads();
             }
@@ -403,7 +424,44 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-extern "C" bool launch_mm_fp16(
+constexpr bool should_enable_b_prefetch_by_heuristic(
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int block_warps_m,
+    const int block_warps_n,
+    [[maybe_unused]] const int unroll_k,
+    [[maybe_unused]] const int repeat_m,
+    const int repeat_n)
+{
+    const int block_n = kWmmaN * block_warps_n * repeat_n;
+
+    // Region A: long-K / refill-dominated shapes.
+    // Wide-N config families are consistently positive here.
+    if (K >= 8192) {
+        if (block_warps_n >= 4) {
+            return true;
+        }
+
+        // Balanced narrow-N families only help at small-M.
+        if (block_warps_m == block_warps_n) {
+            return M <= 512;
+        }
+
+        // Asymmetric narrow-N families help for tiny-M and large-M, but not the mid-M crossover.
+        return M <= 256 || M >= 2048;
+    }
+
+    // Region B: short-K / wide-N shapes.
+    // Only the wide-N tiles benefit, and only until M grows past the crossover.
+    if (K <= 2048 && N >= 8192) {
+        return block_n >= 256 && M <= 2048;
+    }
+
+    return false;
+}
+
+extern "C" bool launch_mm_fp16_b_prefetch_mode(
     const half* const a,
     const half* const b_prepacked,
     const half* const bias,
@@ -417,9 +475,10 @@ extern "C" bool launch_mm_fp16(
     const int unroll_k,
     const int repeat_m,
     const int repeat_n,
+    const int b_prefetch_mode,
     hipStream_t stream)
 {
-    const auto launch = [&](const auto tag) -> void {
+    const auto launch = [&](const auto tag, const bool enable_b_prefetch) -> void {
         constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
         constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
         constexpr int kUnrollK = decltype(tag)::kUnrollK;
@@ -432,12 +491,21 @@ extern "C" bool launch_mm_fp16(
         const dim3 block(kThreadsPerBlock, 1, 1);
         const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
 
-        hipLaunchKernelGGL(
-            (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN>),
-            grid, block, 0, stream,
-            a, b_prepacked, bias, c,
-            M, N, K,
-            has_bias);
+        if (enable_b_prefetch) {
+            hipLaunchKernelGGL(
+                (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
+                grid, block, 0, stream,
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias);
+        } else {
+            hipLaunchKernelGGL(
+                (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
+                grid, block, 0, stream,
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias);
+        }
     };
 
     const auto try_launch = [&](const auto tag) -> bool {
@@ -446,7 +514,15 @@ extern "C" bool launch_mm_fp16(
             unroll_k == decltype(tag)::kUnrollK &&
             repeat_m == decltype(tag)::kRepeatM &&
             repeat_n == decltype(tag)::kRepeatN) {
-            launch(tag);
+            bool enable_b_prefetch = false;
+            if (b_prefetch_mode == kBPrefetchOn) {
+                enable_b_prefetch = true;
+            } else if (b_prefetch_mode == kBPrefetchAuto) {
+                enable_b_prefetch = should_enable_b_prefetch_by_heuristic(
+                    M, N, K,
+                    block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n);
+            }
+            launch(tag, enable_b_prefetch);
             return true;
         }
         return false;
@@ -484,6 +560,40 @@ extern "C" bool launch_mm_fp16(
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
         false;
+}
+
+extern "C" bool launch_mm_fp16(
+    const half* const a,
+    const half* const b_prepacked,
+    const half* const bias,
+    half* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int has_bias,
+    const int block_warps_m,
+    const int block_warps_n,
+    const int unroll_k,
+    const int repeat_m,
+    const int repeat_n,
+    hipStream_t stream)
+{
+    return launch_mm_fp16_b_prefetch_mode(
+        a,
+        b_prepacked,
+        bias,
+        c,
+        M,
+        N,
+        K,
+        has_bias,
+        block_warps_m,
+        block_warps_n,
+        unroll_k,
+        repeat_m,
+        repeat_n,
+        kBPrefetchAuto,
+        stream);
 }
 
 #ifndef NO_PYTORCH
