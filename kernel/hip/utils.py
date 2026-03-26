@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch._inductor.kernel.custom_op as inductor_custom_op
+import triton
 from torch._inductor.kernel.custom_op import CustomOpConfig
 from torch._inductor.select_algorithm import realize_inputs
 from torch.fx.experimental.symbolic_shapes import hint_int
@@ -199,22 +200,13 @@ def old_autotune(
     if not candidates:
         raise RuntimeError(f"No compatible config for M={M} N={N} K={K}.")
 
-    warmup_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_WARMUP", "1")))
-    bench_iters = max(1, int(os.environ.get("HIP_AUTOTUNE_ITERS", "10")))
+    warmup_ms = max(1, int(os.environ.get("AUTOTUNE_WARMUP_MS", "25")))
+    rep_ms = max(1, int(os.environ.get("AUTOTUNE_REP_MS", "100")))
     best_cfg = candidates[0]
     best_ms = None
 
     for cfg in candidates:
-        for _ in range(warmup_iters):
-            run_fn(cfg)
-    torch.cuda.synchronize()
-
-    for cfg in candidates:
-        start = time.perf_counter()
-        for _ in range(bench_iters):
-            run_fn(cfg)
-        torch.cuda.synchronize()
-        ms = (time.perf_counter() - start) * 1000 / bench_iters
+        ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup_ms, rep=rep_ms)
         if best_ms is None or ms < best_ms:
             best_ms = ms
             best_cfg = cfg

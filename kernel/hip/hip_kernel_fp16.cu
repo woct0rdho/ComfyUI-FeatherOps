@@ -164,6 +164,24 @@ __global__ void mm_fp16_kernel(
         }
     };
 
+    const auto load_b_global_vec = [&](const int vec_idx, const int64_t kk) -> uint4 {
+        const int k0 = vec_idx / kBlockN;
+        const int n_phys = vec_idx % kBlockN;
+
+        const int64_t b_col = block_n + n_phys;
+        const int64_t b_k = kk + k0 * kK1;
+        const half* __restrict__ const b_src = b_prepacked + b_k * N + b_col * kBStrideK1;
+        return *reinterpret_cast<const uint4*>(b_src);
+    };
+
+    const auto store_b_lds_vec = [&](const int stage, const int vec_idx, const uint4 value) -> void {
+        const int k0 = vec_idx / kBlockN;
+        const int n_phys = vec_idx % kBlockN;
+
+        half* __restrict__ const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
+        *reinterpret_cast<uint4*>(sh_b_dst) = value;
+    };
+
     // Pipeline setup
     constexpr int kChunkK = kWmmaK * kUnrollK;
     const int total_chunks = static_cast<int>(K / kChunkK);
@@ -244,27 +262,74 @@ __global__ void mm_fp16_kernel(
 
     // Main loop
     for (int iter_idx = 0; iter_idx < total_chunks; ++iter_idx) {
-        #pragma unroll
-        for (int u = 0; u < kUnrollK; ++u) {
-            wmma_compute_stage(u);
-        }
-        __syncthreads();
+        constexpr bool kBPrefetch =
+            kBlockWarpsM == 1 &&
+            kBlockWarpsN == 8 &&
+            kUnrollK == 2 &&
+            kRepeatM == 8 &&
+            kRepeatN == 2;
 
-        if (iter_idx + 1 < total_chunks) {
+        if constexpr (kBPrefetch) {
+            static_assert(kBVecsPerThread == 2);
+            static_assert(kBVecs == 2 * kThreads);
+
+            uint4 b_stage0_prefetch0;
+            uint4 b_stage0_prefetch1;
+            uint4 b_stage1_prefetch0;
+            uint4 b_stage1_prefetch1;
+            const bool has_next = iter_idx + 1 < total_chunks;
             const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
-            asm volatile("s_setprio 1" ::: "memory");
-            #pragma unroll
-            for (int u = 0; u < kUnrollK; ++u) {
-                const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                load_a_lds_k0mk1(u, k);
+            const int vec_idx0 = tid;
+            const int vec_idx1 = tid + kThreads;
+
+            if (has_next) {
+                asm volatile("s_setprio 1" ::: "memory");
+                b_stage0_prefetch0 = load_b_global_vec(vec_idx0, k_next);
+                b_stage0_prefetch1 = load_b_global_vec(vec_idx1, k_next);
+                b_stage1_prefetch0 = load_b_global_vec(vec_idx0, k_next + kWmmaK);
+                b_stage1_prefetch1 = load_b_global_vec(vec_idx1, k_next + kWmmaK);
+                asm volatile("s_setprio 0" ::: "memory");
             }
-            #pragma unroll
-            for (int u = 0; u < kUnrollK; ++u) {
-                const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
-                load_b_lds_k0nk1(u, k);
-            }
-            asm volatile("s_setprio 0" ::: "memory");
+
+            wmma_compute_stage(0);
+            wmma_compute_stage(1);
             __syncthreads();
+
+            if (has_next) {
+                store_b_lds_vec(0, vec_idx0, b_stage0_prefetch0);
+                store_b_lds_vec(0, vec_idx1, b_stage0_prefetch1);
+                store_b_lds_vec(1, vec_idx0, b_stage1_prefetch0);
+                store_b_lds_vec(1, vec_idx1, b_stage1_prefetch1);
+
+                asm volatile("s_setprio 1" ::: "memory");
+                load_a_lds_k0mk1(0, k_next);
+                load_a_lds_k0mk1(1, k_next + kWmmaK);
+                asm volatile("s_setprio 0" ::: "memory");
+                __syncthreads();
+            }
+        } else {
+            #pragma unroll
+            for (int u = 0; u < kUnrollK; ++u) {
+                wmma_compute_stage(u);
+            }
+            __syncthreads();
+
+            if (iter_idx + 1 < total_chunks) {
+                const int64_t k_next = static_cast<int64_t>(iter_idx + 1) * kChunkK;
+                asm volatile("s_setprio 1" ::: "memory");
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    load_a_lds_k0mk1(u, k);
+                }
+                #pragma unroll
+                for (int u = 0; u < kUnrollK; ++u) {
+                    const int64_t k = k_next + static_cast<int64_t>(u) * kWmmaK;
+                    load_b_lds_k0nk1(u, k);
+                }
+                asm volatile("s_setprio 0" ::: "memory");
+                __syncthreads();
+            }
         }
     }
 

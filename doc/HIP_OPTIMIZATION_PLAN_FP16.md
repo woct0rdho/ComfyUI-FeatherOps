@@ -15,8 +15,13 @@
 ## Current Baseline
 
 - Latest full benchmark (`python benchmark_mm_hip_fp16.py`):
-  - `N=8192`: `~27.4k` GFLOPS
-- Current autotuned/profiled winner at `N=8192`: `(1,8,2,8,2)`
+  - `N=2048`: `~15.7k` GFLOPS
+  - `N=4096`: `~34.3k` GFLOPS
+  - `N=8192`: `~27.9k` GFLOPS
+- Current autotuned winner:
+  - `N=2048`: `(4,2,2,2,4)`
+  - `N=4096`: `(1,8,2,8,2)`
+  - `N=8192`: `(1,8,2,8,2)`
 - Current B path keeps 128-bit transport via identity-order prepack `(K/8, N, 8)` plus identity B LDS loads.
 
 ## Hardware Profiling Insights
@@ -90,6 +95,37 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - The `reuse_b` delta implies that the full B LDS->VGPR fragment load cost is on the order of `~6-7 ms` if the effect scaled linearly, but treat that as a rough upper estimate rather than a strict decomposition.
     - The combined half-ablation is not additive, which means these inner LDS reads interact with the surrounding instruction schedule; simple per-side deltas should be read as *exposed* cost, not exact standalone service time.
 
+### P3: B-Only Full-Chunk Prefetch Under WMMA - KEEP
+
+- Kept target: `(1,8,2,8,2)` only.
+- Final kept schedule:
+  - issue both next-chunk B stages as global->VGPR `uint4` prefetches before current-chunk WMMA,
+  - keep those values in four explicit scalar `uint4` temporaries,
+  - compute the current two WMMA stages unchanged,
+  - after the existing chunk barrier, commit prefetched B into LDS and refill A on the old path,
+  - keep the original two-barrier structure.
+- Generated-code / metadata confirmation on the kept variant (`extracted hsaco metadata`):
+  - `(1,8,2,8,2)` now uses `VGPR=190`, `LDS=24576 B`, `private=0`, `vgpr_spills=0`.
+  - This preserves the old LDS footprint while adding only modest register pressure.
+- Full benchmark result (`python benchmark_mm_hip_fp16.py`) after adding a small/medium-N autotune guard:
+  - `N=2048`: `~15.7k` GFLOPS, autotuned to `(4,2,2,2,4)`
+  - `N=4096`: `~34.3k` GFLOPS, autotuned to `(1,8,2,8,2)`
+  - `N=8192`: `~27.9k` GFLOPS, autotuned to `(1,8,2,8,2)`
+- Net effect versus the previous baseline:
+  - `N=8192` improved from about `27.4k` to about `27.9k` GFLOPS.
+  - `N=4096` improved materially and moved onto the wider `128x256` tile.
+  - `N=2048` stays on the narrower path after guarding the wide tile out of the runtime autotune set below `N=4096`.
+- Two rejected sub-variants from this P3 search:
+  - `REJECT`: rolling one-stage B prefetch with an array/ref-based buffer
+    - correctness passed, but extracted metadata showed `(1,8,2,8,2)` inflated to `LDS=57344 B`, and `N=8192` collapsed to about `22.2k` GFLOPS.
+    - regression reason: the intended register-prefetch state was effectively lowered into compiler-managed LDS, destroying occupancy.
+  - `REJECT`: scalarized rolling one-stage B prefetch with per-stage commit
+    - correctness passed and metadata returned to `LDS=24576 B`, but the added mid-chunk barrier/control cost limited `N=8192` to about `26.9k` GFLOPS.
+    - regression reason: preserving the current LDS footprint was not enough; the extra synchronization erased the overlap gain.
+- Why the small/medium-N autotune guard is kept:
+  - On `N=2048`, the runtime `old_autotune` short probe window incorrectly preferred `(1,8,2,8,2)` even though the benchmark harness (`triton.testing.do_bench`) measured that config slower than `(4,2,2,2,4)` / `(4,2,4,2,4)`.
+  - Restricting `(1,8,2,8,2)` to `N >= 4096` matches the observed crossover after P3 and removes the end-to-end `2048` regression.
+
 ### Durable Findings
 
 - Zero-conflict B LDS access is achievable without padding or larger LDS allocation.
@@ -111,10 +147,12 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - Even if a direct-to-LDS path becomes usable later, it carries strong layout constraints: each lane transfers one DWORD and lanes in a wave must write consecutive DWORDs into LDS. That does not map naturally onto the current vec8 / `uint4` fp16 transport without non-trivial repartitioning.
 - Full AB ping-pong LDS buffering is risky for `(1,8,2,8,2)`: doubling LDS from `24576 B` to `49152 B` would cut the occupancy model from roughly `50%` to roughly `25%`, so it should not be the first overlap experiment.
 - Because the refill ablation is strongly **B-side dominated**, the first overlap attempts should prioritize hiding **B refill** earlier than A refill, or more aggressively than A refill, before trying symmetric AB double-buffering.
+- For this kernel family, explicit scalar `uint4` prefetch state is materially safer than array/ref-style prefetch buffers. The latter can trigger compiler-generated LDS growth even when the source change looks like a register-only prefetch.
+- On gfx1151 for `(1,8,2,8,2)`, keeping the original two-barrier chunk structure mattered: the final kept P3 shape worked only after removing the extra mid-chunk barrier from the rolling prefetch attempt.
 - Config crossover is driven by A reuse vs control overhead:
-  - `(4,2,4,2,4)` = `128x128`, `chunkK=64`, `VGPR=144`, `LDS=32768 B`; it wins at `N=512..4096` because it halves the number of K refills / barriers and has lower per-wave state.
-  - `(1,8,2,8,2)` = `128x256`, `chunkK=32`, `VGPR=184`, `LDS=24576 B`; it wins at `N=8192` because the wider `N` tile halves duplicated A-tile reloads across columns.
-  - Forced profile check confirms the crossover: at `N=4096`, `(4,2,4,2,4)` is faster (`~3.69 ms` vs `~5.07 ms`), while at `N=8192`, `(1,8,2,8,2)` is faster (`~38.37 ms` vs `~43.37 ms`).
+  - `(4,2,2,2,4)` / `(4,2,4,2,4)` remain the better small/medium-N benchmark-harness choices around `N=2048`.
+  - `(1,8,2,8,2)` with kept P3 B-prefetch now wins at `N=4096..8192`.
+  - The runtime autotune path should respect that crossover explicitly, because the short probe window can mis-rank configs near the boundary.
 
 ## Non-Negotiable Run Protocol
 
@@ -131,33 +169,26 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 
 ## Next Experiments
 
-### P3: Software-Pipeline Next-Chunk Refill Under Current-Chunk WMMA
+### P4: Add A-Light Overlap On Top Of Kept B Prefetch
 
-- **Rationale:** Profiling now shows the winner `(1,8,2,8,2)` is dominated by serialized refill + barrier cost. The most promising remaining headroom is to hide the next chunk's global-memory latency behind the current chunk's WMMA work.
-- **Method:** Rework the main loop schedule so next-chunk global loads are issued earlier and only waited on near first use. Prioritize schedules that preserve the current `24576 B` LDS footprint and current occupancy model.
-- **Order of attack:**
-  - **P3-A:** `B-first overlap without extra LDS stage`
-    - Start with the B path, because the refill ablation shows the exposed refill cost is B-dominated.
-    - Goal: issue next-chunk B global loads during current-chunk WMMA and delay `vmcnt` waits until B is about to be consumed.
-    - Preferred forms: register prefetch, partial-prefetch, or wave-specialized B refill that does **not** add a full extra LDS stage.
-  - **P3-B:** `Asymmetric overlap (B aggressive, A conservative)`
-    - If P3-A helps but is incomplete, let B use the more aggressive overlap scheme while keeping A on a lighter-weight path.
-    - Rationale: A refill is smaller and A LDS->VGPR cost is near noise-floor in the current schedule, so symmetric AB treatment is unlikely to be optimal.
-  - **P3-C:** `Symmetric AB overlap only if lighter schemes stall`
-    - Only after P3-A/P3-B fail to capture enough headroom, try fuller AB overlap schemes.
-    - Treat full LDS ping-pong as high-risk because doubling LDS to `49152 B` would likely reduce occupancy from about `50%` to about `25%` for this config.
-- **Decision:** Keep only if correctness passes and `N=8192` improves without materially regressing `2048` / `4096`.
-
-### P4: If P3 Fails, Reduce Chunk-Boundary Control Cost
-
-- **Rationale:** If true overlap is too expensive or unsafe, the fallback is to reduce the frequency or cost of chunk-boundary synchronization/refill events.
-- **Method:** Explore alternatives that preserve the current `128x256` A-reuse advantage while reducing refill/barrier overhead, but do not re-open solved bank-conflict work.
+- **Rationale:** B-prefetch is now working and large-N improved, so the remaining exposed chunk-boundary cost is most likely the A refill plus the waits/control still surrounding it.
+- **Method:** Build only on top of the kept P3 kernel. Avoid reintroducing extra barriers or any compiler pattern that inflates LDS beyond `24576 B`.
 - **Candidate directions:**
-  - reduce unnecessary whole-workgroup synchronization around refill/consume handoff,
-  - move waits later and make them more local/partial where correctness allows,
-  - shrink the exposed B refill slice without changing the winning macro-tile shape,
-  - consider modest control-structure changes that reduce chunk-boundary overhead without adding a second full LDS stage.
-- **Decision:** Keep only if the large-`N` metric improves and the crossover against `(4,2,4,2,4)` remains favorable at `N=8192`.
+  - try a one-stage or partial A prefetch only if codegen keeps VGPR near the current `~190` level and preserves `LDS=24576 B`,
+  - hoist only one A stage first, leaving the other on the existing path,
+  - prefer scalarized state over arrays/references if any A prefetch buffer is introduced,
+  - reject immediately if the change adds a third chunk barrier or pushes the wide tile back behind the `N=4096` crossover.
+- **Decision:** Keep only if `N=8192` improves again and `2048` / `4096` stay at least as good as the current kept baseline.
+
+### P5: Tighten Runtime Autotune Fidelity Around The Crossover
+
+- **Rationale:** The kept P3 result required a shape guard because the current `old_autotune` short probe window mis-ranked `(1,8,2,8,2)` at `N=2048`.
+- **Method:** If the current explicit guard becomes too blunt later, revisit the runtime autotune method itself rather than undoing the kept kernel.
+- **Candidate directions:**
+  - spend more probe iterations only near the known `2048/4096` crossover,
+  - keep a tiny shape-based allow/deny table for the wide `128x256` tile,
+  - compare autotune probe results against a more stable benchmark mode before trusting a crossover move.
+- **Decision:** Keep only if it preserves the current `4096` / `8192` gains while avoiding any new small/medium-N regressions.
 
 ### Future Branches Worth Revisiting Only With New Preconditions
 
