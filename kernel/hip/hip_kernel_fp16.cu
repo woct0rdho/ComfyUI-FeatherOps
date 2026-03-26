@@ -390,34 +390,34 @@ extern "C" bool launch_mm_fp16(
     // Autotune configs
     // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     return
+        try_launch(ConfigTag<1, 1, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 4, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 2, 4, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 4, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 2, 1, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 4, 1, 2>{}) ||
         try_launch(ConfigTag<1, 1, 2, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
         try_launch(ConfigTag<1, 1, 4, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 1, 2, 4, 4>{}) ||
         try_launch(ConfigTag<1, 1, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<1, 1, 8, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 1, 8, 4, 4>{}) ||
         try_launch(ConfigTag<1, 2, 2, 2, 2>{}) ||
         try_launch(ConfigTag<1, 2, 4, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 2, 8, 2, 2>{}) ||
-        try_launch(ConfigTag<1, 4, 2, 4, 2>{}) ||
-        try_launch(ConfigTag<1, 4, 4, 4, 2>{}) ||
-        try_launch(ConfigTag<1, 4, 8, 4, 2>{}) ||
-        try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
-        try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
         try_launch(ConfigTag<2, 1, 2, 2, 2>{}) ||
         try_launch(ConfigTag<2, 1, 4, 2, 2>{}) ||
-        try_launch(ConfigTag<2, 1, 8, 2, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 2, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 2, 8, 2>{}) ||
+        try_launch(ConfigTag<1, 8, 4, 8, 2>{}) ||
         try_launch(ConfigTag<2, 2, 2, 4, 4>{}) ||
         try_launch(ConfigTag<2, 2, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 2, 8, 4, 4>{}) ||
         try_launch(ConfigTag<2, 4, 2, 4, 2>{}) ||
-        try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
         try_launch(ConfigTag<2, 4, 4, 4, 2>{}) ||
+        try_launch(ConfigTag<2, 4, 2, 4, 4>{}) ||
         try_launch(ConfigTag<2, 4, 4, 4, 4>{}) ||
-        try_launch(ConfigTag<2, 4, 8, 4, 2>{}) ||
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
-        try_launch(ConfigTag<4, 2, 8, 2, 4>{}) ||
         false;
 }
 
