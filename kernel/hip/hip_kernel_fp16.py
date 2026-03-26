@@ -4,10 +4,12 @@ from typing import Optional
 import torch
 from torch._inductor.kernel.custom_op import register_custom_op_autotuning
 
-from .utils import generate_autotune_configs, get_compatible_config, load_hip_stable_extension, old_autotune
+from .utils import generate_autotune_configs, get_compatible_config, load_hip_stable_extension, old_autotune, patch_inductor_custom_op_autotune_realize_inputs
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 load_hip_stable_extension("mm_hip_fp16_ext", cur_dir, "hip_kernel_fp16.cu")
+
+patch_inductor_custom_op_autotune_realize_inputs()
 
 
 @torch.library.custom_op("feather_ops_internal::mm_fp16_configured", mutates_args=())

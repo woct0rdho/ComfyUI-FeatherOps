@@ -101,8 +101,6 @@ __global__ void scaled_mm_kernel(
     const int64_t M,
     const int64_t N,
     const int64_t K,
-    const int64_t stride_am,
-    const int64_t stride_cm,
     const int has_scale,
     const int has_bias)
 {
@@ -173,7 +171,7 @@ __global__ void scaled_mm_kernel(
         return tile_base + a_row_phys_to_logi_16(local);
     };
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
-        const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
+        const int idx = ((stage * kK0 + k0) * kBlockM + m) * kAStrideK1;
         return &sh.ab.a[idx];
     };
 
@@ -198,7 +196,7 @@ __global__ void scaled_mm_kernel(
 
             const int64_t a_row = block_m + m_logi;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
-            const half* __restrict__ const a_src = a + a_row * stride_am + a_k;
+            const half* __restrict__ const a_src = a + a_row * K + a_k;
 
             half* __restrict__ const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
             *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_src);
@@ -210,20 +208,17 @@ __global__ void scaled_mm_kernel(
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
 
     const auto load_b_lds_prepacked = [&](const int stage, const int64_t kk) -> void {
-        const int ktile = static_cast<int>(kk / kWmmaK);
         #pragma unroll
         for (int v = 0; v < kBVecsPerThread; ++v) {
             const int vec_idx = tid + v * kThreads;
             if (vec_idx >= kBVecs) continue;
 
-            const int col_local = vec_idx;
-            const int col = block_n + col_local;
+            const int n_phys = vec_idx;
+            const int b_col = block_n + n_phys;
+            const uint8_t* __restrict__ const b_src = b_prepacked + kk * N + b_col * kWmmaK;
 
-            const int64_t gidx = ((static_cast<int64_t>(ktile) * N + col) * kWmmaK);
-            const uint8_t* __restrict__ const b_src = b_prepacked + gidx;
-
-            uint8_t* __restrict__ const b_dst = &sh.ab.b[stage][col_local][0];
-            *reinterpret_cast<uint4*>(b_dst) = *reinterpret_cast<const uint4*>(b_src);
+            uint8_t* __restrict__ const sh_b_dst = &sh.ab.b[stage][n_phys][0];
+            *reinterpret_cast<uint4*>(sh_b_dst) = *reinterpret_cast<const uint4*>(b_src);
         }
     };
 
@@ -248,6 +243,7 @@ __global__ void scaled_mm_kernel(
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
             const int n_col = tile_n * kWmmaN + lane_in_subgroup;
+
             const uint4 p = *reinterpret_cast<const uint4*>(&sh.ab.b[stage][n_col][0]);
             const uint32_t p32[4] = {p.x, p.y, p.z, p.w};
             uint32_t h32[8];
@@ -375,7 +371,7 @@ __global__ void scaled_mm_kernel(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                bfloat16_t* __restrict__ const out_ptr = c + out_row * stride_cm + out_col;
+                bfloat16_t* __restrict__ const out_ptr = c + out_row * N + out_col;
                 bfloat16_t* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
@@ -411,8 +407,6 @@ extern "C" bool launch_scaled_mm(
     const int64_t M,
     const int64_t N,
     const int64_t K,
-    const int64_t stride_am,
-    const int64_t stride_cm,
     const int has_scale,
     const int has_bias,
     const int block_warps_m,
@@ -437,23 +431,20 @@ extern "C" bool launch_scaled_mm(
         const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
 
         const bool use_fp8_e5m2 = (b_dtype == 1);
-
         if (use_fp8_e5m2) {
             hipLaunchKernelGGL(
                 (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
-                stride_am, stride_cm,
-                has_scale ? 1 : 0, has_bias ? 1 : 0);
+                has_scale, has_bias);
         } else {
             hipLaunchKernelGGL(
                 (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
-                stride_am, stride_cm,
-                has_scale ? 1 : 0, has_bias ? 1 : 0);
+                has_scale, has_bias);
         }
     };
 
@@ -541,15 +532,19 @@ void scaled_mm(
     const int64_t K = a.size(1);
     const int64_t N = b_prepacked.size(1);
     STD_TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
-    STD_TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK, "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
-    STD_TORCH_CHECK(b_prepacked.size(2) == kWmmaK, "b_prepacked.shape[2] must be 16");
+    STD_TORCH_CHECK(b_prepacked.size(0) == K / 16, "b_prepacked.shape[0] must equal K/16 (", K / 16, ")");
+    STD_TORCH_CHECK(b_prepacked.size(2) == 16, "b_prepacked.shape[2] must be 16");
     STD_TORCH_CHECK(c.size(0) == M, "c.shape[0] must equal M");
     STD_TORCH_CHECK(c.size(1) == N, "c.shape[1] must equal N");
 
     // Contiguous fast path requirements
-    STD_TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
-    STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim (K=16) must be contiguous");
-    STD_TORCH_CHECK(c.stride(1) == 1, "c must be row-contiguous (stride(1) == 1)");
+    STD_TORCH_CHECK(a.stride(0) == K, "a.stride(0) must equal K (", K, ")");
+    STD_TORCH_CHECK(a.stride(1) == 1, "a.stride(1) must be 1");
+    STD_TORCH_CHECK(b_prepacked.stride(0) == N * 16, "b_prepacked.stride(0) must equal N*16 (", N * 16, ")");
+    STD_TORCH_CHECK(b_prepacked.stride(1) == 16, "b_prepacked.stride(1) must be 16");
+    STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked.stride(2) must be 1");
+    STD_TORCH_CHECK(c.stride(0) == N, "c.stride(0) must equal N (", N, ")");
+    STD_TORCH_CHECK(c.stride(1) == 1, "c.stride(1) must be 1");
 
     if (scale.has_value()) {
         STD_TORCH_CHECK(scale.has_value(), "scale must be provided when has_scale=True");
@@ -600,7 +595,6 @@ void scaled_mm(
     const bool launched = launch_scaled_mm(
         a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
         M, N, K,
-        a.stride(0), c.stride(0),
         scale.has_value() ? 1 : 0, bias.has_value() ? 1 : 0,
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
         b_dtype, stream);

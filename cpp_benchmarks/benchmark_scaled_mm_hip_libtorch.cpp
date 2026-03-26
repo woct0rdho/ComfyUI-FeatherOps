@@ -33,8 +33,6 @@ extern "C" bool launch_scaled_mm(
     const int64_t M,
     const int64_t N,
     const int64_t K,
-    const int64_t stride_am,
-    const int64_t stride_cm,
     const int has_scale,
     const int has_bias,
     const int block_warps_m,
@@ -172,7 +170,6 @@ int main(int argc, char** argv)
             reinterpret_cast<const hip_bfloat16*>(d_bias.data_ptr()),
             reinterpret_cast<hip_bfloat16*>(d_c.data_ptr()),
             opts.m, opts.n, opts.k,
-            opts.k, opts.n,
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             1, // b_dtype=1 (fp8e5m2)
@@ -197,7 +194,6 @@ int main(int argc, char** argv)
             reinterpret_cast<const hip_bfloat16*>(d_bias.data_ptr()),
             reinterpret_cast<hip_bfloat16*>(d_c.data_ptr()),
             opts.m, opts.n, opts.k,
-            opts.k, opts.n,
             1, 1, // has_scale=1, has_bias=1
             opts.block_warps_m, opts.block_warps_n, opts.unroll_k, opts.repeat_m, opts.repeat_n,
             1, // b_dtype=1 (fp8e5m2)
