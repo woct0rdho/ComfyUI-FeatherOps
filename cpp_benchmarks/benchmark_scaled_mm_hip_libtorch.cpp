@@ -142,7 +142,7 @@ int main(int argc, char** argv)
     auto options_fp8 = at::TensorOptions().dtype(at::kByte).device(device);
 
     at::Tensor d_a = at::empty({opts.m, opts.k}, options_fp16);
-    // b_prepacked has shape [K/16, N, 16]
+    // b_prepacked has shape (K/16, N, 16)
     at::Tensor d_b_prepacked = at::empty({opts.k / 16, opts.n, 16}, options_fp8);
     at::Tensor d_scale = at::empty({1}, options_bf16);
     at::Tensor d_bias = at::empty({opts.n}, options_bf16);

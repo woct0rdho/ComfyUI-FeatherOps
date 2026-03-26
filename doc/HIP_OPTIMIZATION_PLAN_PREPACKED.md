@@ -12,7 +12,7 @@
 
 ## Current Baseline
 
-- Data path kept: prepacked B as fp8 bytes in `[K/16, N, 16]`.
+- Data path kept: prepacked B as fp8 bytes in `(K/16, N, 16)`.
 - Best autotune config: `1,8,2,2,8,2` (no-swizzle).
 - Latest full benchmark (`benchmark_scaled_mm_hip.py`):
   - `N=8192`: `hip_prepacked ~40.5k`, `hip ~36.2k`, `torch_compiled ~32.4k` GFLOPS.

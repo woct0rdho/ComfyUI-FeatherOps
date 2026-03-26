@@ -22,7 +22,7 @@ def _configured_op(
     repeat_m: int,
     repeat_n: int,
 ) -> torch.Tensor:
-    out = torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
+    out = torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
     torch.ops.feather_ops.mm_fp16.default(
         a,
         b_prepacked,
@@ -49,7 +49,7 @@ def _(
     repeat_m: int,
     repeat_n: int,
 ) -> torch.Tensor:
-    return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
+    return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
 mm_hip_fp16_configured = _configured_op
@@ -99,7 +99,7 @@ def _autotuned_op(
     repeat_n: int = 0,
 ) -> torch.Tensor:
     if min(block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n) <= 0:
-        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = get_compatible_config(a, b_prepacked, 2, _CONFIGS)
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = get_compatible_config(a, b_prepacked, 1, _CONFIGS)
     return _configured_op(a, b_prepacked, bias, out_dtype, block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n)
 
 
@@ -115,10 +115,10 @@ def _(
     repeat_m: int = 0,
     repeat_n: int = 0,
 ) -> torch.Tensor:
-    return torch.empty((a.shape[0], b_prepacked.shape[2]), device=a.device, dtype=out_dtype)
+    return torch.empty((a.shape[0], b_prepacked.shape[1]), device=a.device, dtype=out_dtype)
 
 
-register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS, 2))
+register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS, 1))
 
 
 def mm_hip_fp16(
@@ -135,7 +135,7 @@ def mm_hip_fp16(
 
     best_cfg = old_autotune(
         a.shape[0],
-        b_prepacked.shape[2],
+        b_prepacked.shape[1],
         a.shape[1],
         _CONFIGS,
         run_fn,
@@ -145,4 +145,4 @@ def mm_hip_fp16(
 
 
 def prepack_b_for_mm_fp16(b: torch.Tensor) -> torch.Tensor:
-    return b.view(b.shape[0] // 16, 2, 8, b.shape[1] // 16, 2, 8).permute(0, 1, 3, 4, 5, 2).contiguous().view(b.shape[0] // 16, 2, b.shape[1], 8)
+    return b.view(b.shape[0] // 8, 8, b.shape[1]).permute(0, 2, 1).contiguous()

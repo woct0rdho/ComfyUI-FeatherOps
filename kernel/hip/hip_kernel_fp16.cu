@@ -154,12 +154,12 @@ __global__ void mm_fp16_kernel(
             const int k0 = vec_idx / kBlockN;
             const int n_phys = vec_idx % kBlockN;
 
-            const int64_t ktile = kk / kWmmaK;
-            const int64_t n_row = block_n + n_phys;
+            const int64_t b_row = block_n + n_phys;
+            const int64_t kpack = kk / kK1 + k0;
 
-            // The python prepack stores B in (K/16, 2, N, 8) with logical N order.
-            // Adjacent n_row values still access adjacent 8-element (uint4) chunks.
-            const int64_t gidx = ktile * (2 * N * 8) + k0 * (N * 8) + n_row * 8;
+            // The python prepack stores B in (K/8, N, 8) with logical N order.
+            // Adjacent b_row values still access adjacent 8-element (uint4) chunks.
+            const int64_t gidx = (kpack * N + b_row) * kBStrideK1;
             const half* __restrict__ const b_src = b_prepacked + gidx;
 
             half* __restrict__ const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
@@ -452,22 +452,21 @@ void mm_fp16(
     STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half, "c must be float16");
 
     STD_TORCH_CHECK(a.dim() == 2, "a must be 2D");
-    STD_TORCH_CHECK(b_prepacked.dim() == 4, "b_prepacked must be 4D (K/16, 2, N, 8)");
+    STD_TORCH_CHECK(b_prepacked.dim() == 3, "b_prepacked must be 3D (K/8, N, 8)");
     STD_TORCH_CHECK(c.dim() == 2, "c must be 2D");
 
     const int64_t M = a.size(0);
     const int64_t K = a.size(1);
-    const int64_t N = b_prepacked.size(2);
+    const int64_t N = b_prepacked.size(1);
     STD_TORCH_CHECK(K % kWmmaK == 0, "K must be divisible by 16");
-    STD_TORCH_CHECK(b_prepacked.size(0) == K / kWmmaK, "b_prepacked.shape[0] must equal K/16 (", K / kWmmaK, ")");
-    STD_TORCH_CHECK(b_prepacked.size(1) == 2, "b_prepacked.shape[1] must be 2");
-    STD_TORCH_CHECK(b_prepacked.size(3) == 8, "b_prepacked.shape[3] must be 8");
+    STD_TORCH_CHECK(b_prepacked.size(0) == K / 8, "b_prepacked.shape[0] must equal K/8 (", K / 8, ")");
+    STD_TORCH_CHECK(b_prepacked.size(2) == 8, "b_prepacked.shape[2] must be 8");
     STD_TORCH_CHECK(c.size(0) == M, "c.shape[0] must equal M");
     STD_TORCH_CHECK(c.size(1) == N, "c.shape[1] must equal N");
 
     // Contiguous fast path requirements
     STD_TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
-    STD_TORCH_CHECK(b_prepacked.stride(3) == 1, "b_prepacked last dim must be contiguous");
+    STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim must be contiguous");
     STD_TORCH_CHECK(c.stride(1) == 1, "c must be row-contiguous (stride(1) == 1)");
 
     if (bias.has_value()) {

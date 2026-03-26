@@ -3,7 +3,7 @@
 ## Scope and Metric
 
 - Prepack contract:
-  - B is pre-transposed into identity-order `[K/16, 2, N, 8]` layout, preserving vec8 / 128-bit chunks.
+  - B is pre-transposed into identity-order `(K/8, N, 8)` layout, preserving vec8 / 128-bit chunks.
   - The C++ kernel consumes this prepacked storage to perform direct loads into LDS without additional transposition.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
 - Performance metric: `benchmark_mm_hip_fp16.py` GFLOPS (prepack excluded from timed region).
@@ -17,7 +17,7 @@
 - Latest full benchmark (`python benchmark_mm_hip_fp16.py`):
   - `N=8192`: `~27.4k` GFLOPS
 - Current autotuned/profiled winner at `N=8192`: `(1,8,2,8,2)`
-- Current B path keeps 128-bit transport via identity-order prepack `[K/16, 2, N, 8]` plus identity B LDS loads.
+- Current B path keeps 128-bit transport via identity-order prepack `(K/8, N, 8)` plus identity B LDS loads.
 
 ## Hardware Profiling Insights
 
@@ -36,7 +36,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - C-shuffle bypass (`rocprof_fp16_bank_noc/`): `~14.815%` -> C-shuffle is not the source
   - temporary A-swizzle variant (`rocprof_fp16_bank_a_swizzle/`): `~46.512%` -> A-side swizzle is actively worse
   - temporary B-identity-load variant (`rocprof_fp16_bank_b_identity/`): `0.0%` -> conflicts came from the B LDS load remap in `wmma_compute_stage`
-- Implemented fix: change FP16 prepack to keep logical N order while preserving `[K/16, 2, N, 8]` vec8 chunks, and change compute-side B LDS reads to identity mapping.
+- Implemented fix: change FP16 prepack to keep logical N order while preserving `(K/8, N, 8)` vec8 chunks, and change compute-side B LDS reads to identity mapping.
 - Final validation (`rocprof_fp16_bank_identity_final/`, forced `(1,8,2,8,2)`): `LDSBankConflict = 0.0%`, average profiled kernel time `~37.9 ms`.
 - Full benchmark result (`python benchmark_mm_hip_fp16.py`): `N=8192 ~27.4k` GFLOPS (up from `~26.7k`), with the winner config still `(1,8,2,8,2)`.
 - Key takeaway: B prepack is useful for 128-bit transport, but it does not need the old swizzled-N order; identity-order prepack keeps the same LDS footprint and removes bank conflicts.
