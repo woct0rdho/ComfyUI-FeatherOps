@@ -39,8 +39,6 @@ __global__ void mm_fp16_kernel(
     const int64_t M,
     const int64_t N,
     const int64_t K,
-    const int64_t stride_am,
-    const int64_t stride_cm,
     const int has_bias)
 {
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
@@ -59,7 +57,7 @@ __global__ void mm_fp16_kernel(
     constexpr int kShBSize = kUnrollK * kK0 * kBlockN * kBStrideK1;
 
     // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 halfs.
-    constexpr int kCStride = kWmmaN;  // 16 halfs per row
+    constexpr int kCStride = kWmmaN;  // 16 elements per row
 
     union SharedStorage {
         struct {
@@ -106,7 +104,7 @@ __global__ void mm_fp16_kernel(
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
     const auto sh_a_row_ptr = [&](const int stage, const int k0, const int m) -> half* {
-        const int idx = (((stage * kK0 + k0) * kBlockM + m) * kAStrideK1);
+        const int idx = ((stage * kK0 + k0) * kBlockM + m) * kAStrideK1;
         return &sh.ab.a[idx];
     };
 
@@ -130,7 +128,7 @@ __global__ void mm_fp16_kernel(
 
             const int64_t a_row = block_m + m_phys;
             const int64_t a_k = kk + k0 * kK1; // Start K position for this K0 slice
-            const half* __restrict__ const a_src = a + a_row * stride_am + a_k;
+            const half* __restrict__ const a_src = a + a_row * K + a_k;
 
             half* __restrict__ const sh_a_dst = sh_a_row_ptr(stage, k0, m_phys);
             *reinterpret_cast<uint4*>(sh_a_dst) = *reinterpret_cast<const uint4*>(a_src);
@@ -141,7 +139,7 @@ __global__ void mm_fp16_kernel(
     constexpr int kBVecs = kK0 * kBlockN;
     constexpr int kBVecsPerThread = (kBVecs + kThreads - 1) / kThreads;
     const auto sh_b_row_ptr = [&](const int stage, const int k0, const int n) -> half* {
-        const int idx = (((stage * kK0 + k0) * kBlockN + n) * kBStrideK1);
+        const int idx = ((stage * kK0 + k0) * kBlockN + n) * kBStrideK1;
         return &sh.ab.b[idx];
     };
 
@@ -154,13 +152,12 @@ __global__ void mm_fp16_kernel(
             const int k0 = vec_idx / kBlockN;
             const int n_phys = vec_idx % kBlockN;
 
-            const int64_t b_row = block_n + n_phys;
-            const int64_t kpack = kk / kK1 + k0;
+            const int64_t b_col = block_n + n_phys;
+            const int64_t b_k = kk + k0 * kK1;
 
             // The python prepack stores B in (K/8, N, 8) with logical N order.
             // Adjacent b_row values still access adjacent 8-element (uint4) chunks.
-            const int64_t gidx = (kpack * N + b_row) * kBStrideK1;
-            const half* __restrict__ const b_src = b_prepacked + gidx;
+            const half* __restrict__ const b_src = b_prepacked + b_k * N + b_col * kBStrideK1;
 
             half* __restrict__ const sh_b_dst = sh_b_row_ptr(stage, k0, n_phys);
             *reinterpret_cast<uint4*>(sh_b_dst) = *reinterpret_cast<const uint4*>(b_src);
@@ -187,12 +184,12 @@ __global__ void mm_fp16_kernel(
         #pragma unroll
         for (int rn = 0; rn < kRepeatN; ++rn) {
             const int tile_n = warp_n + rn * kBlockWarpsN;
-            const int n_row = tile_n * kWmmaN + lane_in_subgroup;
+            const int n_col = tile_n * kWmmaN + lane_in_subgroup;
 
             half reg_b[16];
             #pragma unroll
             for (int k0 = 0; k0 < kK0; ++k0) {
-                const half* __restrict__ const sh_b_src = sh_b_row_ptr(stage, k0, n_row);
+                const half* __restrict__ const sh_b_src = sh_b_row_ptr(stage, k0, n_col);
                 #pragma unroll
                 for (int k1 = 0; k1 < kK1; ++k1) {
                     reg_b[k0 * kK1 + k1] = sh_b_src[k1];
@@ -298,8 +295,7 @@ __global__ void mm_fp16_kernel(
                     // subgroup 1 (lanes 16-31) holds odd rows: 1, 3, 5, 7, 9, 11, 13, 15
                     const int row_logi = acc_idx * 2 + subgroup;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    const half val = __float2half_rn(acc[repeat_idx][acc_idx]);
-                    sh_c[row_phys * kCStride + col] = val;
+                    sh_c[row_phys * kCStride + col] = __float2half_rn(acc[repeat_idx][acc_idx]);
                 }
 
                 // Wave executes in lockstep (SIMT), so all writes complete before reads
@@ -315,7 +311,7 @@ __global__ void mm_fp16_kernel(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                half* __restrict__ const out_ptr = c + out_row * stride_cm + out_col;
+                half* __restrict__ const out_ptr = c + out_row * N + out_col;
                 half* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
@@ -350,8 +346,6 @@ extern "C" bool launch_mm_fp16(
     const int64_t M,
     const int64_t N,
     const int64_t K,
-    const int64_t stride_am,
-    const int64_t stride_cm,
     const int has_bias,
     const int block_warps_m,
     const int block_warps_n,
@@ -378,7 +372,6 @@ extern "C" bool launch_mm_fp16(
             grid, block, 0, stream,
             a, b_prepacked, bias, c,
             M, N, K,
-            stride_am, stride_cm,
             has_bias);
     };
 
@@ -465,9 +458,13 @@ void mm_fp16(
     STD_TORCH_CHECK(c.size(1) == N, "c.shape[1] must equal N");
 
     // Contiguous fast path requirements
-    STD_TORCH_CHECK(a.stride(1) == 1, "a must be row-contiguous (stride(1) == 1)");
-    STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked last dim must be contiguous");
-    STD_TORCH_CHECK(c.stride(1) == 1, "c must be row-contiguous (stride(1) == 1)");
+    STD_TORCH_CHECK(a.stride(0) == K, "a.stride(0) must equal K (", K, ")");
+    STD_TORCH_CHECK(a.stride(1) == 1, "a.stride(1) must be 1");
+    STD_TORCH_CHECK(b_prepacked.stride(0) == N * 8, "b_prepacked.stride(0) must equal N*8 (", N * 8, ")");
+    STD_TORCH_CHECK(b_prepacked.stride(1) == 8, "b_prepacked.stride(1) must be 8");
+    STD_TORCH_CHECK(b_prepacked.stride(2) == 1, "b_prepacked.stride(2) must be 1");
+    STD_TORCH_CHECK(c.stride(0) == N, "c.stride(0) must equal N (", N, ")");
+    STD_TORCH_CHECK(c.stride(1) == 1, "c.stride(1) must be 1");
 
     if (bias.has_value()) {
         STD_TORCH_CHECK(bias.has_value(), "bias must be provided when has_bias=True");
@@ -499,13 +496,9 @@ void mm_fp16(
     const int64_t block_m = kWmmaM * block_warps_m * repeat_m;
     const int64_t block_n = kWmmaN * block_warps_n * repeat_n;
     const int64_t chunk_k = kWmmaK * unroll_k;
-
-    STD_TORCH_CHECK(M % block_m == 0,
-        "M (", M, ") must be divisible by kBlockM (", block_m, ")");
-    STD_TORCH_CHECK(N % block_n == 0,
-        "N (", N, ") must be divisible by kBlockN (", block_n, ")");
-    STD_TORCH_CHECK(K % chunk_k == 0,
-        "K (", K, ") must be divisible by kChunkK (", chunk_k, ")");
+    STD_TORCH_CHECK(M % block_m == 0, "M (", M, ") must be divisible by kBlockM (", block_m, ")");
+    STD_TORCH_CHECK(N % block_n == 0, "N (", N, ") must be divisible by kBlockN (", block_n, ")");
+    STD_TORCH_CHECK(K % chunk_k == 0, "K (", K, ") must be divisible by kChunkK (", chunk_k, ")");
 
     const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
@@ -513,11 +506,9 @@ void mm_fp16(
     const bool launched = launch_mm_fp16(
         a_ptr, b_ptr, bias_ptr, c_ptr,
         M, N, K,
-        a.stride(0), c.stride(0),
         bias.has_value() ? 1 : 0,
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
         stream);
-
     STD_TORCH_CHECK(launched, "Unsupported config");
 
     const hipError_t launch_err = hipGetLastError();
