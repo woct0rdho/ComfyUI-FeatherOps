@@ -62,6 +62,33 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - `L2CacheHit ~32.5`
   - `VALUInsts = 11406`
 - Main conclusion: after fixing B bank conflicts, the `(1,8,2,8,2)` kernel is bottlenecked by serialized chunk-boundary refill + synchronization. The current loop computes the whole current chunk, then hits a barrier, then fetches the next chunk, then hits another barrier. There is effectively no overlap between next-chunk global refill and current-chunk WMMA.
+- Controlled C++ ablation benchmark (`tmp_fp16_analysis/mm_fp16_vram_lds_ablation.cu`, `tmp_fp16_analysis/benchmark_mm_fp16_vram_lds_ablation.cpp`) now isolates the chunk-refill path without Python/Torch overhead and without zero-input bias:
+  - Forced config only: `(1,8,2,8,2)`
+  - Kept method: load the first chunk from real random fp16 inputs, then for later chunks selectively **reuse** the already-random LDS contents instead of refilling from global memory; this avoids the known `WMMA-with-zeros` speedup while also avoiding synthetic-PRNG overhead in the timed loop.
+  - Repeated `N=8192` runs (2 passes, 100 timed iters each) give mean kernel times:
+    - `full`: `~40.16 ms` (`~27.38 TFLOPS`)
+    - `reuse_a`: `~34.76 ms` (`delta ~5.41 ms`, `~13.5%` of full time)
+    - `reuse_b`: `~26.51 ms` (`delta ~13.65 ms`, `~34.0%` of full time)
+    - `reuse_ab`: `~24.96 ms` (`delta ~15.21 ms`, `~37.9%` of full time, `~44.06 TFLOPS`)
+  - Interpretation:
+    - Roughly `15 ms` of the `~40 ms` end-to-end kernel time is tied to the repeated global/L2->LDS refill path for this config.
+    - The B-side refill dominates the exposed cost; that matches the larger per-chunk B payload (`16 KB`) versus A (`8 KB`) for `(1,8,2,8,2)`.
+    - The A-only and B-only deltas are not additive (`5.4 + 13.7 > 15.2 ms`), so the refill costs share fixed sync/issue overhead and interact with each other.
+    - With both refills removed, the kernel rises to `~44 TFLOPS`, which is strong evidence that the math/LDS-read body is already capable of near-FP8-class throughput once chunk refills are taken out of the critical path.
+- Controlled C++ ablation benchmark for the compute-side LDS->VGPR path (`tmp_fp16_analysis/mm_fp16_lds_vgpr_ablation.cu`, `tmp_fp16_analysis/benchmark_mm_fp16_lds_vgpr_ablation.cpp`) now measures the *exposed* cost of the inner `ds_read -> VGPR` fragment loads while keeping global refill intact:
+  - Forced config only: `(1,8,2,8,2)`
+  - Kept method: always use real random fp16 A/B input tensors; inside the compute stage, selectively reuse already-loaded random fragments to remove part of the LDS->VGPR traffic without introducing zero operands.
+  - To avoid changing occupancy with long-lived fragment caches, the A-side study uses a *pairwise* reuse mode (`reuse_a_p2`): the kernel loads A from LDS on even `rm` and reuses that fragment for the next odd `rm`, so **50% of A LDS->VGPR loads are removed**. The B-side study (`reuse_b`) loads only one of the two `rn` fragments and reuses it for the second tile, so **50% of B LDS->VGPR loads are removed**.
+  - Repeated `N=8192` runs (2 passes, 100 timed iters each) give mean kernel times:
+    - `full`: `~40.37 ms` (`~27.23 TFLOPS`)
+    - `reuse_a_p2` (50% A LDS->VGPR removed): `~40.23 ms` (`delta ~0.14 ms`, `~0.36%`)
+    - `reuse_b` (50% B LDS->VGPR removed): `~36.93 ms` (`delta ~3.44 ms`, `~8.53%`)
+    - `reuse_ab_p2` (50% A + 50% B removed): `~37.71 ms` (`delta ~2.67 ms`, `~6.61%`)
+  - Interpretation:
+    - The exposed LDS->VGPR cost is heavily **B-side dominated** on this config.
+    - A-side LDS->VGPR reads are close to noise-floor in this experiment; either their direct cost is very small, or they are largely hidden by the existing schedule.
+    - The `reuse_b` delta implies that the full B LDS->VGPR fragment load cost is on the order of `~6-7 ms` if the effect scaled linearly, but treat that as a rough upper estimate rather than a strict decomposition.
+    - The combined half-ablation is not additive, which means these inner LDS reads interact with the surrounding instruction schedule; simple per-side deltas should be read as *exposed* cost, not exact standalone service time.
 
 ### Durable Findings
 
@@ -70,9 +97,20 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - A-side swizzle is a bad direction on the current winner path (`~46.5%` conflict rate in the isolation build).
 - The purpose of FP16 B prepack is to preserve vec8 / 128-bit transport, not specifically to preserve the old swizzled order.
 - After removing LDS bank conflicts, the dominant large-`N` bottleneck is global-refill latency amplified by workgroup-wide synchronization, not WMMA throughput.
+- A direct refill ablation on `(1,8,2,8,2)` attributes about `38%` of `N=8192` wall time to repeated global/L2->LDS chunk refill; B-side refill is the larger exposed component.
+- A direct compute-side LDS->VGPR ablation shows the exposed inner-fragment load cost is much smaller than the global-refill cost and is mostly on the B side; A-side LDS->VGPR reads are near the noise floor in this schedule.
 - `FP Convert` and general `VALU` are not important bottlenecks on the FP16 kernel (`PC sampling: FP Convert ~0.1%, VALU Other ~1.3%`).
 - `LDS Read` remains a secondary issue-pressure hotspot, but the first thing to attack is the serialized refill/barrier structure around `s_waitcnt vmcnt(*)` and `s_barrier`.
 - For unstable large-`N` ATT on gfx1151, use no-detail ATT first; detailed `N=8192` ATT is still unsafe on the current tooling stack.
+- On gfx1151, practical latency hiding for this kernel should be treated as a **software-pipelining / occupancy** problem, not a search for a magical async global->LDS primitive.
+- gfx10+ HIP compute defaults to **WGP mode**; CU mode is not the default path. That matters because some LDS-direct mechanisms are CU-mode-specific, so any CU-mode experiment should be treated as a separate, toolchain-dependent branch rather than the default optimization direction.
+- Direct global->LDS is **not a primary near-term path** for this kernel on gfx1151:
+  - the older async-to-LDS intrinsics are documented for gfx9/gfx10,
+  - the newer `global.load.async.to.lds.b{8,32,64,128}` path is gfx1250+,
+  - LLVM MC currently marks `global_load_lds_*` unsupported on gfx11.
+- Even if a direct-to-LDS path becomes usable later, it carries strong layout constraints: each lane transfers one DWORD and lanes in a wave must write consecutive DWORDs into LDS. That does not map naturally onto the current vec8 / `uint4` fp16 transport without non-trivial repartitioning.
+- Full AB ping-pong LDS buffering is risky for `(1,8,2,8,2)`: doubling LDS from `24576 B` to `49152 B` would cut the occupancy model from roughly `50%` to roughly `25%`, so it should not be the first overlap experiment.
+- Because the refill ablation is strongly **B-side dominated**, the first overlap attempts should prioritize hiding **B refill** earlier than A refill, or more aggressively than A refill, before trying symmetric AB double-buffering.
 - Config crossover is driven by A reuse vs control overhead:
   - `(4,2,4,2,4)` = `128x128`, `chunkK=64`, `VGPR=144`, `LDS=32768 B`; it wins at `N=512..4096` because it halves the number of K refills / barriers and has lower per-wave state.
   - `(1,8,2,8,2)` = `128x256`, `chunkK=32`, `VGPR=184`, `LDS=24576 B`; it wins at `N=8192` because the wider `N` tile halves duplicated A-tile reloads across columns.
@@ -93,14 +131,37 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 
 ## Next Experiments
 
-### P3: Overlap Next-Chunk Refill With Current-Chunk Compute
+### P3: Software-Pipeline Next-Chunk Refill Under Current-Chunk WMMA
 
 - **Rationale:** Profiling now shows the winner `(1,8,2,8,2)` is dominated by serialized refill + barrier cost. The most promising remaining headroom is to hide the next chunk's global-memory latency behind the current chunk's WMMA work.
-- **Method:** Rework the main loop schedule so next-chunk A/B global loads begin earlier, while preserving correctness and preferably keeping the same LDS footprint / occupancy. Start with schedules that do not add extra stages or padding.
+- **Method:** Rework the main loop schedule so next-chunk global loads are issued earlier and only waited on near first use. Prioritize schedules that preserve the current `24576 B` LDS footprint and current occupancy model.
+- **Order of attack:**
+  - **P3-A:** `B-first overlap without extra LDS stage`
+    - Start with the B path, because the refill ablation shows the exposed refill cost is B-dominated.
+    - Goal: issue next-chunk B global loads during current-chunk WMMA and delay `vmcnt` waits until B is about to be consumed.
+    - Preferred forms: register prefetch, partial-prefetch, or wave-specialized B refill that does **not** add a full extra LDS stage.
+  - **P3-B:** `Asymmetric overlap (B aggressive, A conservative)`
+    - If P3-A helps but is incomplete, let B use the more aggressive overlap scheme while keeping A on a lighter-weight path.
+    - Rationale: A refill is smaller and A LDS->VGPR cost is near noise-floor in the current schedule, so symmetric AB treatment is unlikely to be optimal.
+  - **P3-C:** `Symmetric AB overlap only if lighter schemes stall`
+    - Only after P3-A/P3-B fail to capture enough headroom, try fuller AB overlap schemes.
+    - Treat full LDS ping-pong as high-risk because doubling LDS to `49152 B` would likely reduce occupancy from about `50%` to about `25%` for this config.
 - **Decision:** Keep only if correctness passes and `N=8192` improves without materially regressing `2048` / `4096`.
 
 ### P4: If P3 Fails, Reduce Chunk-Boundary Control Cost
 
 - **Rationale:** If true overlap is too expensive or unsafe, the fallback is to reduce the frequency or cost of chunk-boundary synchronization/refill events.
 - **Method:** Explore alternatives that preserve the current `128x256` A-reuse advantage while reducing refill/barrier overhead, but do not re-open solved bank-conflict work.
+- **Candidate directions:**
+  - reduce unnecessary whole-workgroup synchronization around refill/consume handoff,
+  - move waits later and make them more local/partial where correctness allows,
+  - shrink the exposed B refill slice without changing the winning macro-tile shape,
+  - consider modest control-structure changes that reduce chunk-boundary overhead without adding a second full LDS stage.
 - **Decision:** Keep only if the large-`N` metric improves and the crossover against `(4,2,4,2,4)` remains favorable at `N=8192`.
+
+### Future Branches Worth Revisiting Only With New Preconditions
+
+- **F1: CU-mode / direct-to-LDS branch**
+  - **Rationale:** RDNA supports some memory->LDS direct paths, but they are not the default practical path on gfx1151 today.
+  - **Preconditions:** reliable CU-mode compilation path for this kernel, toolchain support that actually assembles and schedules the needed instructions on gfx1151, and generated code confirmation that the loads are truly direct-to-LDS.
+  - **Reason for low priority:** current gfx1151 evidence points to software pipelining as the primary path, while the direct-to-LDS route is constrained or unsupported in the current gfx11 toolchain stack.
