@@ -20,6 +20,7 @@
   - `N=8192`: ~44.0 TFLOPS
 - Latest full benchmark on the current ROCm nightly after the A-WSGR heuristic refresh (`python benchmark_scaled_mm_hip.py`):
   - `N=8192`: ~40.7 TFLOPS
+  - Later we'll investigate how to restore from this regression in ROCm
 
 ## Profiling Insights
 
@@ -93,6 +94,54 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 | P19 | KEEP analysis | mixed-precision VRAM->LDS refill ablation | exposed refill share is config-sensitive; current `8192^3` winner only gains `~2%` from `reuse_ab` | unlike the older FP16 wide-tile path, current mixed winners are not uniformly refill-dominated |
 | P20 | KEEP analysis | mixed-precision fp8->fp16 decode ablation | current `8192^3` winner only gains `~1.7%` from skipping decode while keeping the LDS->VGPR B load intact | on the new nightly, exposed decode cost is real but still smaller than the earlier suspected front-end bound; the square winner remains only weakly sensitive to this decode path in isolation |
 | P21 | KEEP analysis | mixed-precision LDS->VGPR fragment-load ablation | current `8192^3` winner gains `~3.3%` from removing half of A LDS loads, `~1.5%` from removing half of B LDS loads, and `~6.1%` from removing half of both | compute-side fragment-load cost is measurable on the square winner, and the exposed A-side cost is larger than the exposed B-side cost on current nightly |
+| P22 | REJECT | mixed-precision A-only global->VGPR prefetch sweep | giant wins only on weak fixed configs (up to `~1.99x`), but autotuned target-shape delta was only `+0.20%`, `-14.73%`, `+1.56%`, `-0.59%` | not robust on the winner path; reverted |
+| P23 | REJECT | mixed-precision B-only global->VGPR prefetch sweep | forced-`on` beat the new forced-`off` variants, but still lost to the last clean baseline on all four Qwen target shapes (`-1.15%`, `-20.91%`, `-3.23%`, `-4.26%` autotuned) | not a real keeper; reverted |
+
+### P22: Mixed-Precision A-Only Prefetch Sweep - REJECT
+
+- Goal: test the FP16-style split schedule on the mixed-precision kernel by prefetching only A (`global -> VGPR`) before WMMA, then committing A to LDS after compute while leaving B on the old synchronous refill path.
+- Validation:
+  - correctness passed with the forced-on experiment across all 28 configs;
+  - analysis artifacts live under `tmp_mixed_precision_analysis/`, especially:
+    - `qwen_shape_sweep_prefetch_off.csv` / `qwen_shape_sweep_prefetch_on.csv`
+    - `orientation_region_prefetch_off.csv` / `orientation_region_prefetch_on.csv`
+- Target Qwen-Image shapes:
+  - `(32, 12288, 2048)`: autotuned `6774.382 -> 6788.073 GFLOPS` (`+0.20%`)
+  - `(32, 2048, 12288)`: autotuned `6419.085 -> 5473.285 GFLOPS` (`-14.73%`)
+  - `(8192, 12288, 2048)`: autotuned `41198.620 -> 41841.567 GFLOPS` (`+1.56%`)
+  - `(8192, 2048, 12288)`: autotuned `37918.623 -> 37694.521 GFLOPS` (`-0.59%`)
+- Best fixed-config outliers:
+  - max relative win: `(8192, 2048, 12288)` with `(2,1,2,2,2)` improved `7910.751 -> 15762.446 GFLOPS` (`+99.25%`)
+  - max absolute win: `(8192, 12288, 2048)` with `(2,1,2,2,2)` improved `16582.693 -> 30384.287 GFLOPS` (`+13801.594 GFLOPS`, `+83.23%`)
+- Interpretation:
+  - the large gains are limited to weak, non-winning configs and do not translate into a meaningful end-to-end autotuned gain;
+  - in the short-K / wide-N orientation, some tall/wide configs such as `(1,8,4,8,2)` improved by roughly `~3-5%` once `M >= 1024`, but the strongest square winner `(2,4,4,4,4)` regressed by roughly `~2-4%`;
+  - in the long-K / narrow-N orientation, the prefetch path was usually negative on good configs, with several double-digit regressions.
+- Decision:
+  - do not keep A prefetch in the mixed-precision kernel on the current nightly;
+  - the shape/config dependence is too strong, and the actual autotuned winner path does not improve enough to justify a runtime heuristic.
+
+### P23: Mixed-Precision B-Only Prefetch Sweep - REJECT
+
+- Goal: port the kept FP16 split schedule to the mixed-precision kernel by prefetching only B (`global -> VGPR`) before WMMA, then committing B into LDS after compute while refilling A on the old path.
+- Validation:
+  - correctness passed both with the default path and with forced `FEATHER_SCALED_MM_B_PREFETCH=on`;
+  - analysis artifacts live under `tmp_mixed_precision_analysis/`, especially:
+    - `qwen_shape_bprefetch_off.csv` / `qwen_shape_bprefetch_on.csv`
+- Important measurement note:
+  - within the patched kernel, forced `on` looked much faster than forced `off` on many shapes, but that comparison was misleading because the non-prefetch instantiations were materially slower than the last clean pre-change baseline;
+  - keeper decisions therefore used the last clean baseline (`qwen_shape_baseline_sweep_before.csv`) rather than the patched forced-`off` variants.
+- Target Qwen-Image shapes, autotuned comparison versus the clean pre-change baseline:
+  - `(32, 12288, 2048)`: `6790.405 -> 6712.173 GFLOPS` (`-1.15%`)
+  - `(32, 2048, 12288)`: `6399.727 -> 5061.764 GFLOPS` (`-20.91%`)
+  - `(8192, 12288, 2048)`: `41299.947 -> 39965.495 GFLOPS` (`-3.23%`)
+  - `(8192, 2048, 12288)`: `36804.286 -> 35237.978 GFLOPS` (`-4.26%`)
+- Interpretation:
+  - despite large apparent `on` vs patched-`off` gains, the prefetch path did not beat the last clean winner path on any of the target Qwen shapes;
+  - the strongest pre-change winners were still better than the prefetched winners on all four target shapes, so there is no heuristic worth shipping from this experiment.
+- Decision:
+  - do not keep B prefetch in the mixed-precision kernel on the current nightly;
+  - revert the experiment and treat any future revisit as requiring a new precondition plus a cleaner non-prefetch control for benchmarking.
 
 ## Durable Findings
 
@@ -125,6 +174,13 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
   - replacing every other B fragment load with a fixed synthetic fragment, while keeping the fp8->fp16 decode count unchanged, reduced time from `24.418 ms` to `24.063 ms`, an exposed delta of `0.355 ms` (`~1.5%`)
   - replacing every other A and B fragment load together reduced time to `22.933 ms`, an exposed delta of `1.485 ms` (`~6.1%`)
   - this is still an ablation, not a valid kernel: the removed loads are replaced with fixed synthetic fragments, so treat the numbers as exposed-load estimates rather than a strict additive decomposition
+- Mixed-precision A-only prefetch is not a good keeper on the current nightly:
+  - it can produce huge gains on weak fixed configs, but the best measured autotuned improvement on the target Qwen-Image shapes was only `~+1.6%`, and two of the four target shapes regressed
+  - the short-K / wide-N orientation has a small positive region for some tall/wide configs, but the strongest square winner still regresses there
+  - the long-K / narrow-N orientation is broadly negative on strong configs, so there is no robust runtime heuristic worth shipping from the current data
+- Mixed-precision B-only prefetch is also not a keeper on the current nightly:
+  - comparing only forced `on` vs forced `off` inside the patched kernel can overstate the benefit because the non-prefetch instantiations themselves can move;
+  - against the last clean baseline, the prefetched autotuned winner regressed on all four target Qwen-Image shapes, including the two large target shapes.
 
 ## Do-Not-Repeat (Unless New Preconditions)
 
@@ -139,6 +195,8 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 - Any conversion rewrite whose thesis depends on `V_PK_*` / VOP3P dual-issue.
 - Cross-wave broadcast/shuffle ideas built on `ds_permute_b32`.
 - Hot-loop address-calc micro-optimizations unless new generated code shows materially higher address VALU than the prior kernels.
+- Mixed-precision A-only prefetch on the current nightly, unless a new precondition changes the winner-config set or shows a materially larger autotuned gain on the real Qwen-Image shapes.
+- Mixed-precision B-only prefetch on the current nightly, unless a new precondition both restores a clean non-prefetch baseline and shows a real autotuned gain on the actual Qwen-Image target shapes.
 
 ## Reference
 
