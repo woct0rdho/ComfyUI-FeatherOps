@@ -1,103 +1,147 @@
-# hipBLASLt FP16 Matmul Wrapper Reference
+# hipBLASLt FP16 Reference
 
-## Goal
+## Purpose
 
-Make the ComfyUI FeatherOps hipBLASLt fp16 benchmark hit the same gfx1151 kernel path as the standalone benchmark in `~/rocm-libraries/hipblaslt_fp16_bench`.
+- Keep the verified facts needed to identify and reproduce the gfx1151 hipBLASLt FP16 kernel used for `M=N=K=8192`.
+- This doc is about the native hipBLASLt kernel path, not the custom HIP kernel.
 
-## Files changed so far
+## Current Verified Status
 
+- Local native benchmark:
+  - `cpp_benchmarks/build_benchmark_mm_hipblaslt_fp16.sh`
+  - `cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`
+- Logging command:
+
+```bash
+HIPBLASLT_LOG_MASK=96 ./cpp_benchmarks/benchmark_mm_hipblaslt_fp16 --warmup 0 --iters 1 --workspace-mb 64
+```
+
+- For `8192^3`, hipBLASLt selects public `solution_index 1112`.
+- Important log line:
+
+```text
+hipblaslt-bench --api_method cpp ... --solution_index 1112 --activation_type relu ...
+```
+
+- Important solution prefix:
+
+```text
+Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_...
+```
+
+- Expected steady-state performance from earlier full benchmark runs:
+  - native C++ path: about `37-38 TFLOPS`
+  - FeatherOps fast-layout Python wrapper: about `36-37 TFLOPS`
+- Single-iteration `rocprofv3` runs are useful for kernel metadata only. Their timing is not representative.
+
+## Source Of Truth
+
+- Tensile logic entry:
+
+```text
+~/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx1151/GridBased/gfx1151_Cijk_Ailk_Bljk_HHS_BH_Bias_HAS_SAV_UserArgs.yaml
+```
+
+- Match this kernel by its long solution or kernel name prefix, not by Tensile `SolutionIndex`.
+- Important nuance:
+  - runtime public algo index: `1112`
+  - matching Tensile YAML entry: `SolutionIndex: 71`
+- The reliable join is the kernel or solution name string, not the integer index.
+
+## Exact Kernel Facts
+
+- Matching gfx1151 Tensile entry facts:
+  - `MacroTile0 = 128`
+  - `MacroTile1 = 96`
+  - `DepthU = 64`
+  - `MatrixInstruction = [16, 16, 16, 1]`
+  - `WavefrontSize = 32`
+  - `NumThreads = 128`
+  - `WorkGroup = [64, 2, 1]`
+  - `MIWaveGroup = [4, 1]`
+  - `MIWaveTile = [2, 6]`
+  - `ThreadTile0 = 16`
+  - `ThreadTile1 = 6`
+
+- Equivalent custom-kernel tuple:
+  - `warps_m = 4`
+  - `warps_n = 1`
+  - `unroll_k = 4`
+  - `repeat_m = 2`
+  - `repeat_n = 6`
+
+- Why this mapping is correct:
+  - `MacroTile0 = 16 * 4 * 2 = 128`
+  - `MacroTile1 = 16 * 1 * 6 = 96`
+  - `DepthU = 16 * 4 = 64`
+
+- Memory and scheduling properties:
+  - `1LDSBuffer = 1`
+  - `LdsNumBytes = 30336`
+  - `LdsPadA = 8`
+  - `LdsPadB = 8`
+  - `GlobalReadVectorWidthA = 8`
+  - `GlobalReadVectorWidthB = 8`
+  - `LocalReadVectorWidth = 16`
+  - `NumLoadsA = 8`
+  - `NumLoadsB = 6`
+  - `PrefetchGlobalRead = 2`
+  - `PrefetchLocalRead = 0`
+  - `ScheduleIterAlg = 3`
+  - `ScheduleGlobalRead = 1`
+  - `ScheduleLocalWrite = 1`
+  - `TransposeLDS = 1`
+  - `UnrollMajorLDSB = true`
+  - `SourceSwap = true`
+  - `StaggerU = 32`
+  - `WorkGroupMapping = 8`
+  - `DirectToLdsA/B = false`
+  - `DirectToVgprA/B = false`
+
+- rocprof kernel metadata from a single-iteration trace:
+  - `vgpr_count = 256`
+  - `sgpr_count = 128`
+  - `lds_size = 30336`
+  - `workgroup_x = 128`
+
+## Important Interpretation
+
+- This is a software-pipelined single-LDS-buffer kernel.
+- It does not rely on direct global-to-LDS or direct-to-VGPR paths.
+- The key comparison points versus our current custom HIP winner are:
+  - deeper K pipeline: `64` instead of `32`
+  - fewer waves per block: `4` instead of `8`
+  - narrower N tile: `128x96` instead of `128x256`
+  - higher register pressure: about `256 VGPR` instead of about `192 VGPR`
+
+## Historical Pitfall That Still Matters
+
+- Old symptom:
+  - native or standalone hipBLASLt path picked `1112`
+  - Torch extension path picked `1002`
+  - extension performance stayed around `26-28 TFLOPS`
+
+- Root cause:
+  - the extension was compiled against local `rocm-libraries` hipBLASLt headers
+  - runtime linked against the installed system `libhipblaslt.so`
+  - `hipblaslt_ext::GemmPreference` and `hipblaslt_ext::GemmInputs` layouts did not match
+  - `setMaxWorkspaceBytes` wrote garbage offsets
+  - hipBLASLt rejected the fast solution and fell back
+
+- Fix:
+  - build the extension only against the installed system headers that match the loaded system library
+
+- Result:
+  - the FeatherOps fast-layout wrapper can dispatch the target kernel and recover the expected `~36-37 TFLOPS`
+
+- Important note:
+  - current logs show the chosen solution uses `0 MiB` workspace at runtime
+  - the workspace preference still had to be ABI-correct, because the library used that preference when deciding whether the fast solution was supported
+
+## Relevant Local Files
+
+- `cpp_benchmarks/build_benchmark_mm_hipblaslt_fp16.sh`
+- `cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`
 - `kernel/hip/hipblaslt_kernel_fp16.cu`
 - `kernel/hip/hipblaslt_kernel_fp16.py`
 - `benchmark_mm_hipblaslt_fp16.py`
-
-## Reference files
-
-- Standalone binary: `~/rocm-libraries/hipblaslt_fp16_bench`
-- Standalone source: `~/rocm-libraries/hipblaslt_fp16_bench.cpp`
-- Existing FeatherOps HIP wrapper pattern: `~/ComfyUI-FeatherOps/kernel/hip/hip_kernel_fp16.cu`
-- Existing FeatherOps HIP Python wrapper pattern: `~/ComfyUI-FeatherOps/kernel/hip/hip_kernel_fp16.py`
-
-## What works now
-
-- The FeatherOps hipBLASLt extension builds and loads.
-- The Python wrapper works numerically for the supported fp16 path.
-- The benchmark script exists and can exercise both the semantic wrapper path and a column-major fast-layout path.
-- The extension build cache was deleted after the last unsafe experiment, so the next import should rebuild from source.
-
-## Current findings
-
-### Standalone benchmark
-
-Command:
-
-```bash
-HIPBLASLT_LOG_MASK=96 ~/rocm-libraries/hipblaslt_fp16_bench
-```
-
-Observed:
-
-- Picks `solution_index 1112`
-- Kernel name starts with:
-
-```text
-Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_...
-```
-
-- Performance is about `38 TFLOP/s` average / `38.4+ TFLOP/s` best on `8192^3`
-
-### FeatherOps/Torch extension path
-
-Current wrapper paths still pick `solution_index 1002`, not `1112`, even after:
-
-- switching benchmark tensors to column-major layout
-- matching the standalone `setProblem(M, N, K, ...)` path
-- using a separate internal `C` buffer instead of `C == D`
-- preferring installed hipBLASLt headers before repo headers
-
-Observed command from logging:
-
-```text
-hipblaslt-bench --api_method cpp ... --solution_index 1002 --activation_type relu
-```
-
-Measured performance from the extension path is still about `26-28 TFLOP/s`.
-
-## Current findings (resolved)
-
-The initial discrepancy between the standalone C++ benchmark (hitting ~38 TFLOP/s with `solution_index 1112`) and the Torch extension (hitting ~27 TFLOP/s with `solution_index 1002`) was traced down to an **ABI mismatch**.
-
-### The root cause
-
-The PyTorch extension (`hipblaslt_kernel_fp16.cu`) was being compiled with custom headers included from the local `~/rocm-libraries/projects/hipblaslt/library/include` directory. However, at runtime, the Python environment (via `rocm_sdk`) was dynamically linking against the installed system library `libhipblaslt.so.1` (from `_rocm_sdk_devel`).
-
-These two versions of the headers had diverging definitions for `hipblaslt_ext::GemmPreference` and `hipblaslt_ext::GemmInputs`. Because of this struct layout misalignment:
-- When the Python C++ wrapper called `setMaxWorkspaceBytes`, it wrote to the incorrect memory offsets.
-- Consequently, the system `hipBLASLt` library read garbage workspace sizes, deemed the `1112` configuration unsupported due to "insufficient workspace", and fell back to the slower `1002` heuristic.
-
-### The fix
-
-The custom include path (`-I$HOME/rocm-libraries/...`) was removed from the compilation flags in `kernel/hip/hipblaslt_kernel_fp16.py`. The extension is now compiled strictly against the same system headers that match the dynamically linked system library (`_rocm_sdk_devel`).
-
-## Verification
-
-After wiping the build cache and forcing a clean recompile, the fix was verified:
-
-1. **Python Benchmark**: Running `benchmark_mm_hipblaslt_fp16.py` now correctly hits **~36.7 TFLOPS** on the 8192^3 problem size using the `hipblaslt_fast_layout` path, closely matching the standalone C++ benchmark.
-2. **Kernel Profiling**: Running a minimal fast layout script under `rocprofv3 --kernel-trace` empirically confirmed that the Python extension successfully dispatches the target optimal kernel:
-   ```text
-   Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_SN_LDSB1...
-   ```
-
-## Current source status notes
-
-- `kernel/hip/hipblaslt_kernel_fp16.cu` contains:
-  - the semantic row-major wrapper
-  - a column-major fast-layout wrapper
-  - a `benchmark_raw_buffers` path (added during debugging to isolate Torch memory allocators)
-  - safe `getAllAlgos`-based forced-solution fallback logic
-- `kernel/hip/hipblaslt_kernel_fp16.py` exposes:
-  - `mm_hipblaslt_fp16(...)`
-  - `mm_hipblaslt_fp16_colmajor(...)`
-  - `to_col_major(...)`
-  - compilation flags pointing *only* to system headers.
-- `benchmark_mm_hipblaslt_fp16.py` successfully benchmarks the fast layout via `mm_hipblaslt_fp16_colmajor` using `solution_index=1112`.

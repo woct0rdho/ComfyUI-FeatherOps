@@ -157,8 +157,7 @@ __global__ void scaled_mm_kernel(
     // Loading A: K0xMxK1 layout with physical/inverse row mapping and
     // wave-separated global-read ownership.
     constexpr int kAVecs = kK0 * kBlockM;
-    constexpr int kAOwnerWaves =
-        kEnableAWsgr ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
+    constexpr int kAOwnerWaves = kEnableAWsgr ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
     const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
@@ -394,12 +393,6 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-enum AWsgrMode : int {
-    kAWsgrAuto = 0,
-    kAWsgrOff = 1,
-    kAWsgrOn = 2,
-};
-
 template <typename Config>
 constexpr bool should_enable_a_wsgr_by_heuristic(const int64_t K)
 {
@@ -429,20 +422,6 @@ constexpr bool should_enable_a_wsgr_by_heuristic(const int64_t K)
 }
 
 template <typename Config>
-constexpr bool resolve_a_wsgr(
-    const int64_t K,
-    const int a_wsgr_mode)
-{
-    if (a_wsgr_mode == kAWsgrOn) {
-        return true;
-    }
-    if (a_wsgr_mode == kAWsgrOff) {
-        return false;
-    }
-    return should_enable_a_wsgr_by_heuristic<Config>(K);
-}
-
-template <typename Config>
 void launch_scaled_mm_configured(
     const half* const a,
     const uint8_t* const b_prepacked,
@@ -455,7 +434,6 @@ void launch_scaled_mm_configured(
     const int has_scale,
     const int has_bias,
     const int b_dtype,
-    const int a_wsgr_mode,
     hipStream_t stream)
 {
     constexpr int kBlockWarpsM = Config::kBlockWarpsM;
@@ -466,15 +444,15 @@ void launch_scaled_mm_configured(
     constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
     constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-    const bool enable_a_wsgr = resolve_a_wsgr<Config>(K, a_wsgr_mode);
+    const bool enable_a_wsgr = should_enable_a_wsgr_by_heuristic<Config>(K);
 
     constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
     const dim3 block(kThreadsPerBlock, 1, 1);
     const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
 
     const bool use_fp8_e5m2 = (b_dtype == 1);
-    if (use_fp8_e5m2) {
-        if (enable_a_wsgr) {
+    if (enable_a_wsgr) {
+        if (use_fp8_e5m2) {
             hipLaunchKernelGGL(
                 (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true>),
                 grid, block, 0, stream,
@@ -483,16 +461,16 @@ void launch_scaled_mm_configured(
                 has_scale, has_bias);
         } else {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true>),
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
                 has_scale, has_bias);
         }
     } else {
-        if (enable_a_wsgr) {
+        if (use_fp8_e5m2) {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false>),
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
@@ -508,14 +486,24 @@ void launch_scaled_mm_configured(
     }
 }
 
-template <typename DispatchFn>
-bool dispatch_scaled_mm_config(
-    DispatchFn&& dispatch,
+extern "C" bool launch_scaled_mm(
+    const half* const a,
+    const uint8_t* const b_prepacked,
+    const bfloat16_t* const scale,
+    const bfloat16_t* const bias,
+    bfloat16_t* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int has_scale,
+    const int has_bias,
     const int block_warps_m,
     const int block_warps_n,
     const int unroll_k,
     const int repeat_m,
-    const int repeat_n)
+    const int repeat_n,
+    const int b_dtype,
+    hipStream_t stream)
 {
     const auto try_launch = [&](const auto tag) -> bool {
         if (block_warps_m == decltype(tag)::kBlockWarpsM &&
@@ -523,12 +511,18 @@ bool dispatch_scaled_mm_config(
             unroll_k == decltype(tag)::kUnrollK &&
             repeat_m == decltype(tag)::kRepeatM &&
             repeat_n == decltype(tag)::kRepeatN) {
-            dispatch(tag);
+            launch_scaled_mm_configured<decltype(tag)>(
+                a, b_prepacked, scale, bias, c,
+                M, N, K,
+                has_scale, has_bias,
+                b_dtype, stream);
             return true;
         }
         return false;
     };
 
+    // Autotune configs
+    // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     return
         try_launch(ConfigTag<1, 1, 2, 1, 2>{}) ||
         try_launch(ConfigTag<1, 1, 4, 1, 2>{}) ||
@@ -559,72 +553,6 @@ bool dispatch_scaled_mm_config(
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
         false;
-}
-
-extern "C" bool launch_scaled_mm_tuning_mode(
-    const half* const a,
-    const uint8_t* const b_prepacked,
-    const bfloat16_t* const scale,
-    const bfloat16_t* const bias,
-    bfloat16_t* const c,
-    const int64_t M,
-    const int64_t N,
-    const int64_t K,
-    const int has_scale,
-    const int has_bias,
-    const int block_warps_m,
-    const int block_warps_n,
-    const int unroll_k,
-    const int repeat_m,
-    const int repeat_n,
-    const int b_dtype,
-    const int a_wsgr_mode,
-    hipStream_t stream)
-{
-    return dispatch_scaled_mm_config(
-        [&](const auto tag) {
-            launch_scaled_mm_configured<decltype(tag)>(
-                a, b_prepacked, scale, bias, c,
-                M, N, K,
-                has_scale, has_bias,
-                b_dtype,
-                a_wsgr_mode,
-                stream);
-        },
-        block_warps_m,
-        block_warps_n,
-        unroll_k,
-        repeat_m,
-        repeat_n);
-}
-
-extern "C" bool launch_scaled_mm(
-    const half* const a,
-    const uint8_t* const b_prepacked,
-    const bfloat16_t* const scale,
-    const bfloat16_t* const bias,
-    bfloat16_t* const c,
-    const int64_t M,
-    const int64_t N,
-    const int64_t K,
-    const int has_scale,
-    const int has_bias,
-    const int block_warps_m,
-    const int block_warps_n,
-    const int unroll_k,
-    const int repeat_m,
-    const int repeat_n,
-    const int b_dtype,
-    hipStream_t stream)
-{
-    return launch_scaled_mm_tuning_mode(
-        a, b_prepacked, scale, bias, c,
-        M, N, K,
-        has_scale, has_bias,
-        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
-        b_dtype,
-        kAWsgrAuto,
-        stream);
 }
 
 #ifndef NO_PYTORCH
