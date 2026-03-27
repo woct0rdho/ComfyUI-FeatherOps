@@ -180,6 +180,60 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - Keep reason:
   - this simpler region heuristic still matches the measured sweep winner on the studied shapes while avoiding the clear regression on the large wide-N / short-K case.
 
+### P6: Native A-WSGR Sweep And Runtime Heuristic - KEEP
+
+- Restored native FP16 benchmark controls and added explicit A-side WSGR mode selection:
+  - benchmark harness: `cpp_benchmarks/benchmark_mm_hip_fp16.cpp`
+  - kernel launch entrypoint: `launch_mm_fp16_tuning_mode(...)`
+  - full sweep runner: `tmp_fp16_analysis/run_a_wsgr_sweep.py`
+  - focused transition runner: `tmp_fp16_analysis/run_a_wsgr_region_sweep.py`
+  - raw sweep results: `tmp_fp16_analysis/a_wsgr_sweep.csv`
+  - focused transition log: `tmp_fp16_analysis/a_wsgr_region_sweep.txt`
+  - target-shape auto validation: `tmp_fp16_analysis/a_wsgr_auto_validation.txt`
+- Sweep protocol:
+  - keep `B-prefetch=auto`,
+  - benchmark only native C++ `--no-bias`,
+  - compare `a_wsgr=off` vs `a_wsgr=on`,
+  - sweep the 20 config families where A-side WSGR actually changes codegen (`block_warps_n > 1`),
+  - shapes:
+    - target / crossover set: `(32,12288,2048)`, `(32,2048,12288)`, `(128,12288,2048)`, `(128,2048,12288)`, `(512,12288,2048)`, `(512,2048,12288)`, `(2048,12288,2048)`, `(2048,2048,12288)`, `(8192,12288,2048)`, `(8192,2048,12288)`
+- Main sweep result:
+  - the old A-side rule was effectively just `repeat_m <= 4`; with B-prefetch left on auto, that is too broad.
+  - A-WSGR is clearly **negative** on the wide `128x256` family `(1,8,*,8,2)`:
+    - focused sweep confirms `(1,8,2,8,2)` is negative on every tested point, both short-K and long-K.
+  - A-WSGR is clearly **positive** on the balanced square `128x128` / `u=2` family `(2,2,2,4,4)`:
+    - focused sweep shows positive deltas across the full tested `M=128..8192` range for both `K=2048` and `K=12288`.
+  - A-WSGR is also consistently positive on the tall `128x128` / `repeat_m=2` / `u=2` family `(4,2,2,2,4)`:
+    - gain is small but stable across the same `M=128..8192` range.
+  - The only important crossover inside the positive families is `(4,2,4,2,4)`:
+    - focused sweep shows it is negative at `M=128` and `M=256`,
+    - it flips positive from `M=512` upward for both short-K and long-K.
+  - Most remaining N-heavy families are mixed or negative:
+    - `(1,2,*,2,2)` is always negative in the sweep,
+    - `(1,4,4,4,2)`, `(2,4,2,4,2)`, `(2,4,4,4,2)`, `(2,4,4,4,4)` are mostly negative,
+    - `(1,4,2,4,2)` and `(1,8,4,8,2)` become positive in some long-K / large-M regions, but they never become the best autotune winner on the studied target shapes.
+- Kept runtime heuristic in `hip_kernel_fp16.cu`, written as coarse regions:
+  - Region A: `repeat_m == 1` or `repeat_m >= 8`
+    - keep A-WSGR off
+  - Region B: `repeat_m == 2`
+    - enable only on tall wave layouts `block_warps_m > block_warps_n`
+    - for `unroll_k == 4`, require `M >= 512`
+  - Region C: `repeat_m == 4`
+    - enable only on balanced square layouts `block_warps_m == block_warps_n` with `unroll_k == 2`
+  - otherwise keep A-WSGR off
+- Replay result on the 10-shape native sweep:
+  - this kept heuristic matches the per-shape best winner across the studied sweep set.
+  - the old `repeat_m <= 4` rule missed the best winner on `(128,2048,12288)` by over-enabling WSGR on a `repeat_m=1` path.
+- Auto validation on the four target Qwen-Image shapes (`tmp_fp16_analysis/a_wsgr_auto_validation.txt`):
+  - `(32,12288,2048)` -> best `(1,8,2,1,2)` at about `7.23 TFLOPS`
+  - `(32,2048,12288)` -> best `(1,1,4,1,2)` at about `5.40 TFLOPS`
+  - `(8192,12288,2048)` -> best `(1,8,2,8,2)` at about `29.58 TFLOPS`
+  - `(8192,2048,12288)` -> best `(4,2,4,2,4)` at about `38.21 TFLOPS`
+- Keep reason:
+  - this region heuristic is simpler than the old implicit `repeat_m <= 4` rule,
+  - it preserves the measured best winner on the studied target shapes,
+  - it avoids the large regressions from turning A-WSGR on for the wide `repeat_m=8` family.
+
 ### Durable Findings
 
 - Zero-conflict B LDS access is achievable without padding or larger LDS allocation.
@@ -212,6 +266,12 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - `block_warps_n >= 4` is a good coarse long-K proxy for a prefetch-positive region.
   - balanced `warps_m == warps_n` narrow-N families only want B-prefetch at small `M`.
   - the large wide-N / short-K crossover is mainly an `M` threshold: keep prefetch on through about `M=2048`, then turn it off by `M=4096`.
+- For A-side WSGR, the useful boundary is **tile-family-sensitive** rather than a generic `repeat_m <= 4` rule:
+  - `repeat_m=8` wide tiles should keep WSGR off.
+  - `repeat_m=1` paths are near noise-floor and are safer to keep off.
+  - square `128x128` / `u=2` tiles are consistently WSGR-positive.
+  - tall `128x128` / `repeat_m=2` tiles are WSGR-positive, but the `u=4` family needs `M >= 512`.
+  - most N-heavy `repeat_m=4` families stay negative or too mixed to justify enabling by default.
 
 ## Non-Negotiable Run Protocol
 
