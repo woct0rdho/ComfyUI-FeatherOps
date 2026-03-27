@@ -20,14 +20,6 @@ constexpr int kWmmaK = 16;
 // rocwmma::Constants::AMDGCN_WAVE_SIZE returns 64 during host compilation
 constexpr int kWaveSize = 32;
 
-constexpr int kAWsgrAuto = 0;
-[[maybe_unused]] constexpr int kAWsgrOff = 1;
-[[maybe_unused]] constexpr int kAWsgrOn = 2;
-
-constexpr int kBPrefetchAuto = 0;
-[[maybe_unused]] constexpr int kBPrefetchOff = 1;
-[[maybe_unused]] constexpr int kBPrefetchOn = 2;
-
 // 16-row swizzle used by LDS physical mapping.
 __device__ __forceinline__ constexpr int c_row_logi_to_phys_16(const int x)
 {
@@ -424,61 +416,50 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-constexpr bool should_enable_a_wsgr_by_heuristic(
-    const int64_t M,
-    [[maybe_unused]] const int64_t N,
-    [[maybe_unused]] const int64_t K,
-    const int block_warps_m,
-    const int block_warps_n,
-    const int unroll_k,
-    const int repeat_m,
-    [[maybe_unused]] const int repeat_n)
+template <typename Config>
+constexpr bool should_enable_a_wsgr_by_heuristic(const int64_t M)
 {
-    if (block_warps_n == 1) {
+    if constexpr (Config::kBlockWarpsN == 1) {
         return false;
     }
 
     // Region 1: tiny-M tiles (repeat_m=1) and very tall tiles (repeat_m=8)
     // do not benefit from concentrating A stores onto owner waves.
-    if (repeat_m == 1 || repeat_m >= 8) {
+    if constexpr (Config::kRepeatM == 1 || Config::kRepeatM >= 8) {
         return false;
     }
 
     // Region 2: repeat_m=2 only helps on tall wave layouts.
     // u=2 stays mildly positive across the sweep; u=4 flips on at M ~= 512.
-    if (repeat_m == 2) {
-        if (block_warps_m > block_warps_n) {
-            return unroll_k == 2 || M >= 512;
+    if constexpr (Config::kRepeatM == 2) {
+        if constexpr (Config::kBlockWarpsM > Config::kBlockWarpsN) {
+            return Config::kUnrollK == 2 || M >= 512;
         }
         return false;
     }
 
     // Region 3: repeat_m=4 is only consistently positive on balanced square tiles
     // with the lighter u=2 chunk schedule.
-    return block_warps_m == block_warps_n && unroll_k == 2;
+    return Config::kBlockWarpsM == Config::kBlockWarpsN && Config::kUnrollK == 2;
 }
 
+template <typename Config>
 constexpr bool should_enable_b_prefetch_by_heuristic(
     const int64_t M,
     const int64_t N,
-    const int64_t K,
-    const int block_warps_m,
-    const int block_warps_n,
-    [[maybe_unused]] const int unroll_k,
-    [[maybe_unused]] const int repeat_m,
-    const int repeat_n)
+    const int64_t K)
 {
-    const int block_n = kWmmaN * block_warps_n * repeat_n;
+    constexpr int kBlockN = kWmmaN * Config::kBlockWarpsN * Config::kRepeatN;
 
     // Region 1: long-K / refill-dominated shapes.
     // Wide-N config families are consistently positive here.
     if (K >= 8192) {
-        if (block_warps_n >= 4) {
+        if constexpr (Config::kBlockWarpsN >= 4) {
             return true;
         }
 
         // Balanced narrow-N families only help at small-M.
-        if (block_warps_m == block_warps_n) {
+        if constexpr (Config::kBlockWarpsM == Config::kBlockWarpsN) {
             return M <= 512;
         }
 
@@ -489,13 +470,78 @@ constexpr bool should_enable_b_prefetch_by_heuristic(
     // Region 2: short-K / wide-N shapes.
     // Only the wide-N tiles benefit, and only until M grows past the crossover.
     if (K <= 2048 && N >= 8192) {
-        return block_n >= 256 && M <= 2048;
+        if constexpr (kBlockN >= 256) {
+            return M <= 2048;
+        }
+        return false;
     }
 
     return false;
 }
 
-extern "C" bool launch_mm_fp16_tuning_mode(
+template <typename Config>
+void launch_mm_fp16_configured(
+    const half* const a,
+    const half* const b_prepacked,
+    const half* const bias,
+    half* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int has_bias,
+    hipStream_t stream)
+{
+    constexpr int kBlockWarpsM = Config::kBlockWarpsM;
+    constexpr int kBlockWarpsN = Config::kBlockWarpsN;
+    constexpr int kUnrollK = Config::kUnrollK;
+    constexpr int kRepeatM = Config::kRepeatM;
+    constexpr int kRepeatN = Config::kRepeatN;
+    constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
+    constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+
+    const bool enable_a_wsgr = should_enable_a_wsgr_by_heuristic<Config>(M);
+    const bool enable_b_prefetch = should_enable_b_prefetch_by_heuristic<Config>(M, N, K);
+
+    constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+    const dim3 block(kThreadsPerBlock, 1, 1);
+    const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
+
+    if (enable_a_wsgr) {
+        if (enable_b_prefetch) {
+            hipLaunchKernelGGL(
+                (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true>),
+                grid, block, 0, stream,
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias);
+        } else {
+            hipLaunchKernelGGL(
+                (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false>),
+                grid, block, 0, stream,
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias);
+        }
+    } else {
+        if (enable_b_prefetch) {
+            hipLaunchKernelGGL(
+                (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true>),
+                grid, block, 0, stream,
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias);
+        } else {
+            hipLaunchKernelGGL(
+                (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false>),
+                grid, block, 0, stream,
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias);
+        }
+    }
+}
+
+extern "C" bool launch_mm_fp16(
     const half* const a,
     const half* const b_prepacked,
     const half* const bias,
@@ -509,84 +555,19 @@ extern "C" bool launch_mm_fp16_tuning_mode(
     const int unroll_k,
     const int repeat_m,
     const int repeat_n,
-    const int a_wsgr_mode,
-    const int b_prefetch_mode,
     hipStream_t stream)
 {
-    const auto launch = [&](const auto tag, const bool enable_a_wsgr, const bool enable_b_prefetch) -> void {
-        constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
-        constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
-        constexpr int kUnrollK = decltype(tag)::kUnrollK;
-        constexpr int kRepeatM = decltype(tag)::kRepeatM;
-        constexpr int kRepeatN = decltype(tag)::kRepeatN;
-        constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
-        constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
-
-        constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
-        const dim3 block(kThreadsPerBlock, 1, 1);
-        const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
-
-        if (enable_a_wsgr) {
-            if (enable_b_prefetch) {
-                hipLaunchKernelGGL(
-                    (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true>),
-                    grid, block, 0, stream,
-                    a, b_prepacked, bias, c,
-                    M, N, K,
-                    has_bias);
-            } else {
-                hipLaunchKernelGGL(
-                    (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false>),
-                    grid, block, 0, stream,
-                    a, b_prepacked, bias, c,
-                    M, N, K,
-                    has_bias);
-            }
-        } else {
-            if (enable_b_prefetch) {
-                hipLaunchKernelGGL(
-                    (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true>),
-                    grid, block, 0, stream,
-                    a, b_prepacked, bias, c,
-                    M, N, K,
-                    has_bias);
-            } else {
-                hipLaunchKernelGGL(
-                    (mm_fp16_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false>),
-                    grid, block, 0, stream,
-                    a, b_prepacked, bias, c,
-                    M, N, K,
-                    has_bias);
-            }
-        }
-    };
-
     const auto try_launch = [&](const auto tag) -> bool {
         if (block_warps_m == decltype(tag)::kBlockWarpsM &&
             block_warps_n == decltype(tag)::kBlockWarpsN &&
             unroll_k == decltype(tag)::kUnrollK &&
             repeat_m == decltype(tag)::kRepeatM &&
             repeat_n == decltype(tag)::kRepeatN) {
-
-            bool enable_a_wsgr = false;
-            if (a_wsgr_mode == kAWsgrOn) {
-                enable_a_wsgr = true;
-            } else if (a_wsgr_mode == kAWsgrAuto) {
-                enable_a_wsgr = should_enable_a_wsgr_by_heuristic(
-                    M, N, K,
-                    block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n);
-            }
-
-            bool enable_b_prefetch = false;
-            if (b_prefetch_mode == kBPrefetchOn) {
-                enable_b_prefetch = true;
-            } else if (b_prefetch_mode == kBPrefetchAuto) {
-                enable_b_prefetch = should_enable_b_prefetch_by_heuristic(
-                    M, N, K,
-                    block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n);
-            }
-
-            launch(tag, enable_a_wsgr, enable_b_prefetch);
+            launch_mm_fp16_configured<decltype(tag)>(
+                a, b_prepacked, bias, c,
+                M, N, K,
+                has_bias,
+                stream);
             return true;
         }
         return false;
@@ -624,41 +605,6 @@ extern "C" bool launch_mm_fp16_tuning_mode(
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
         false;
-}
-
-extern "C" bool launch_mm_fp16(
-    const half* const a,
-    const half* const b_prepacked,
-    const half* const bias,
-    half* const c,
-    const int64_t M,
-    const int64_t N,
-    const int64_t K,
-    const int has_bias,
-    const int block_warps_m,
-    const int block_warps_n,
-    const int unroll_k,
-    const int repeat_m,
-    const int repeat_n,
-    hipStream_t stream)
-{
-    return launch_mm_fp16_tuning_mode(
-        a,
-        b_prepacked,
-        bias,
-        c,
-        M,
-        N,
-        K,
-        has_bias,
-        block_warps_m,
-        block_warps_n,
-        unroll_k,
-        repeat_m,
-        repeat_n,
-        kAWsgrAuto,
-        kBPrefetchAuto,
-        stream);
 }
 
 #ifndef NO_PYTORCH
