@@ -16,8 +16,10 @@
 
 ## Current Baseline
 
-- Latest full benchmark (`python benchmark_scaled_mm_hip.py`):
+- Historical full benchmark on an older ROCm nightly:
   - `N=8192`: ~44.0 TFLOPS
+- Latest full benchmark on the current ROCm nightly after the A-WSGR heuristic refresh (`python benchmark_scaled_mm_hip.py`):
+  - `N=8192`: ~40.7 TFLOPS
 
 ## Profiling Insights
 
@@ -87,6 +89,10 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 | P15 | REJECT | hoist `v_perm_b32` literals to VGPRs | `N=8192` regressed ~42.62k | did not fix VOP3 issue latency (VGPR read ports), compiler barrier worsened global memory scheduling (`vmcnt` stalls up 18%) |
 | P16 | KEEP | chunk size expansion (`unroll_k`=4,8) + `stages` cleanup | `N=8192` flat (~43.1k), but HUGE gains on `N=1024..4096` (+15-35%) | verified code has no A/B double buffering (synchronous wait); increasing chunk size drastically reduces frequency of hitting the 3,500-cycle `vmcnt` stall |
 | P17 | KEEP | remove `kBPad` and `kCPad` LDS padding | `N=8192` flat (~44.6k) | `LDSBankConflict` PMC profiling proved bank conflicts are virtually zero (~0.3%), padding was wasting LDS capacity without providing performance benefits |
+| P18 | KEEP | mixed-precision A WSGR auto heuristic refresh | current-nightly replays: square `6/7` exact, broad `12/14` exact, residual loss `<=0.329 TFLOPS` | refreshed sweeps moved the surviving `repeat_m=1` win region to `u=4 && K<=1024`; keep tall `repeat_m=2` and square `repeat_m=4` rules conservative |
+| P19 | KEEP analysis | mixed-precision VRAM->LDS refill ablation | exposed refill share is config-sensitive; current `8192^3` winner only gains `~2%` from `reuse_ab` | unlike the older FP16 wide-tile path, current mixed winners are not uniformly refill-dominated |
+| P20 | KEEP analysis | mixed-precision fp8->fp16 decode ablation | current `8192^3` winner only gains `~1.7%` from skipping decode while keeping the LDS->VGPR B load intact | on the new nightly, exposed decode cost is real but still smaller than the earlier suspected front-end bound; the square winner remains only weakly sensitive to this decode path in isolation |
+| P21 | KEEP analysis | mixed-precision LDS->VGPR fragment-load ablation | current `8192^3` winner gains `~3.3%` from removing half of A LDS loads, `~1.5%` from removing half of B LDS loads, and `~6.1%` from removing half of both | compute-side fragment-load cost is measurable on the square winner, and the exposed A-side cost is larger than the exposed B-side cost on current nightly |
 
 ## Durable Findings
 
@@ -101,6 +107,24 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 - `V_PK_*` / VOP3P packed-half instructions are not VOPD-eligible, so conversion rewrites that depend on packed 16-bit ops gaining dual-issue are unlikely to help.
 - `ds_permute_b32` only permutes within a wave32; it cannot be used for cross-wave fragment sharing or broadcast across the 8-wave workgroup.
 - Rigid inline ASM / manual instruction ordering can block compiler interleaving and worsen `vmcnt` hiding or register scheduling; use ASM only when it unlocks an otherwise impossible instruction form.
+- Mixed-precision A WSGR should stay conservative and region-based on current ROCm nightly:
+  - `repeat_m == 1`: enable only for `unroll_k == 4 && K <= 1024`
+  - `repeat_m == 2`: enable only for tall tiles (`block_warps_m > block_warps_n`) with `unroll_k == 2`
+  - `repeat_m == 4`: enable only for square tiles (`block_warps_m == block_warps_n`) with `unroll_k == 2`
+  - Otherwise keep it off; the remaining misses in refreshed sweeps were small enough to ignore.
+- Mixed-precision global->LDS refill cost is strongly config-dependent on the current nightly:
+  - wide `repeat_m=1` path `(1,8,4,1,2)` at `2048^3` is clearly B-dominated: `reuse_a ~4%`, `reuse_b ~14%`, `reuse_ab ~15%`
+  - balanced mid-size path `(1,4,4,4,2)` at `4096^3` is roughly even between A and B: both are about `~6%`
+  - tall WSGR-on path `(4,2,2,2,4)` at `(8192,2048,12288)` is A-dominated: `reuse_a ~15%`, `reuse_b ~8%`
+  - current large square winner `(2,4,4,4,4)` at `8192^3` only gains about `~2%` from removing both refills, so refill is no longer the dominant exposed bottleneck there
+- Mixed-precision fp8->fp16 decode cost on the current large square winner is also modest in isolation:
+  - on `8192^3` with `(2,4,4,4,4)`, skipping only the decode while preserving the LDS `uint4` load path reduced time from `24.251 ms` to `23.846 ms`, an exposed delta of `0.405 ms` (`~1.7%`)
+  - this ablation intentionally feeds WMMA garbage half bits derived from the raw fp8 bytes, so it is only an exposed-cost estimate, not a numerically valid kernel
+- Mixed-precision LDS->VGPR fragment-load cost is more visible than decode on the current `8192^3` square winner:
+  - on `8192^3` with `(2,4,4,4,4)`, replacing every other A fragment load with a fixed synthetic fragment reduced time from `24.418 ms` to `23.621 ms`, an exposed delta of `0.797 ms` (`~3.3%`)
+  - replacing every other B fragment load with a fixed synthetic fragment, while keeping the fp8->fp16 decode count unchanged, reduced time from `24.418 ms` to `24.063 ms`, an exposed delta of `0.355 ms` (`~1.5%`)
+  - replacing every other A and B fragment load together reduced time to `22.933 ms`, an exposed delta of `1.485 ms` (`~6.1%`)
+  - this is still an ablation, not a valid kernel: the removed loads are replaced with fixed synthetic fragments, so treat the numbers as exposed-load estimates rather than a strict additive decomposition
 
 ## Do-Not-Repeat (Unless New Preconditions)
 

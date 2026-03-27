@@ -91,6 +91,7 @@ template <int kBlockWarpsM,
           int kUnrollK,
           int kRepeatM,
           int kRepeatN,
+          bool kEnableAWsgr,
           bool kUseFp8E5M2>
 __global__ void scaled_mm_kernel(
     const half* __restrict__ const a,
@@ -156,13 +157,8 @@ __global__ void scaled_mm_kernel(
     // Loading A: K0xMxK1 layout with physical/inverse row mapping and
     // wave-separated global-read ownership.
     constexpr int kAVecs = kK0 * kBlockM;
-    // Use wave-separated ownership only when per-thread vec count stays small (<=4).
-    // For large kBlockM (e.g. kRepeatM=8, kBlockM=256) WSGR causes too many VGPRs
-    // for the A prefetch buffer, hurting occupancy.
-    constexpr bool kUseWsgrAStoreOwnership =
-        (kAVecs / (kBlockWarpsM * kWaveSize)) <= 4;
     constexpr int kAOwnerWaves =
-        kUseWsgrAStoreOwnership ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
+        kEnableAWsgr ? kBlockWarpsM : (kBlockWarpsM * kBlockWarpsN);
     constexpr int kAOwnerThreads = kAOwnerWaves * kWaveSize;
     constexpr int kAVecsPerOwnerThread = (kAVecs + kAOwnerThreads - 1) / kAOwnerThreads;
     const auto a_row_phys_to_logi = [&](const int row_phys) -> int {
@@ -177,11 +173,11 @@ __global__ void scaled_mm_kernel(
 
     const auto load_a_lds_k0mk1 = [&](const int stage, const int64_t kk) -> void {
         // WSGR ownership: only A-owner waves issue A global->LDS stores.
-        if constexpr (kUseWsgrAStoreOwnership) {
+        if constexpr (kEnableAWsgr) {
             if (wave_id >= kAOwnerWaves) return;
         }
 
-        const int a_owner_tid = kUseWsgrAStoreOwnership ? (wave_id * kWaveSize + lane) : tid;
+        const int a_owner_tid = kEnableAWsgr ? (wave_id * kWaveSize + lane) : tid;
 
         // Physical LDS space is traversed directly; global logical row is obtained by inverse map.
         #pragma unroll
@@ -398,7 +394,56 @@ struct ConfigTag {
     static constexpr int kRepeatN = RN;
 };
 
-extern "C" bool launch_scaled_mm(
+enum AWsgrMode : int {
+    kAWsgrAuto = 0,
+    kAWsgrOff = 1,
+    kAWsgrOn = 2,
+};
+
+template <typename Config>
+constexpr bool should_enable_a_wsgr_by_heuristic(const int64_t K)
+{
+    if constexpr (Config::kBlockWarpsN == 1) {
+        return false;
+    }
+
+    // Mixed-precision A WSGR is only robust in a few regions on current ROCm nightly:
+    // small-K u=4 repeat_m=1 kernels, tall u=2 repeat_m=2 kernels, and square u=2 repeat_m=4 kernels.
+    if constexpr (Config::kRepeatM == 1) {
+        return Config::kUnrollK == 4 && K <= 1024;
+    }
+
+    if constexpr (Config::kRepeatM >= 8) {
+        return false;
+    }
+
+    if constexpr (Config::kRepeatM == 2) {
+        return Config::kBlockWarpsM > Config::kBlockWarpsN && Config::kUnrollK == 2;
+    }
+
+    if constexpr (Config::kRepeatM == 4) {
+        return Config::kBlockWarpsM == Config::kBlockWarpsN && Config::kUnrollK == 2;
+    }
+
+    return false;
+}
+
+template <typename Config>
+constexpr bool resolve_a_wsgr(
+    const int64_t K,
+    const int a_wsgr_mode)
+{
+    if (a_wsgr_mode == kAWsgrOn) {
+        return true;
+    }
+    if (a_wsgr_mode == kAWsgrOff) {
+        return false;
+    }
+    return should_enable_a_wsgr_by_heuristic<Config>(K);
+}
+
+template <typename Config>
+void launch_scaled_mm_configured(
     const half* const a,
     const uint8_t* const b_prepacked,
     const bfloat16_t* const scale,
@@ -409,59 +454,81 @@ extern "C" bool launch_scaled_mm(
     const int64_t K,
     const int has_scale,
     const int has_bias,
-    const int block_warps_m,
-    const int block_warps_n,
-    const int unroll_k,
-    const int repeat_m,
-    const int repeat_n,
     const int b_dtype,
+    const int a_wsgr_mode,
     hipStream_t stream)
 {
-    const auto launch = [&](const auto tag) -> void {
-        constexpr int kBlockWarpsM = decltype(tag)::kBlockWarpsM;
-        constexpr int kBlockWarpsN = decltype(tag)::kBlockWarpsN;
-        constexpr int kUnrollK = decltype(tag)::kUnrollK;
-        constexpr int kRepeatM = decltype(tag)::kRepeatM;
-        constexpr int kRepeatN = decltype(tag)::kRepeatN;
-        constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
-        constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
+    constexpr int kBlockWarpsM = Config::kBlockWarpsM;
+    constexpr int kBlockWarpsN = Config::kBlockWarpsN;
+    constexpr int kUnrollK = Config::kUnrollK;
+    constexpr int kRepeatM = Config::kRepeatM;
+    constexpr int kRepeatN = Config::kRepeatN;
+    constexpr int kBlockM = kWmmaM * kBlockWarpsM * kRepeatM;
+    constexpr int kBlockN = kWmmaN * kBlockWarpsN * kRepeatN;
 
-        constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
-        const dim3 block(kThreadsPerBlock, 1, 1);
-        const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
+    const bool enable_a_wsgr = resolve_a_wsgr<Config>(K, a_wsgr_mode);
 
-        const bool use_fp8_e5m2 = (b_dtype == 1);
-        if (use_fp8_e5m2) {
+    constexpr int kThreadsPerBlock = kWaveSize * kBlockWarpsM * kBlockWarpsN;
+    const dim3 block(kThreadsPerBlock, 1, 1);
+    const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
+
+    const bool use_fp8_e5m2 = (b_dtype == 1);
+    if (use_fp8_e5m2) {
+        if (enable_a_wsgr) {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true>),
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
                 has_scale, has_bias);
         } else {
             hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false>),
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true>),
                 grid, block, 0, stream,
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
                 has_scale, has_bias);
         }
-    };
+    } else {
+        if (enable_a_wsgr) {
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false>),
+                grid, block, 0, stream,
+                a, b_prepacked, scale, bias, c,
+                M, N, K,
+                has_scale, has_bias);
+        } else {
+            hipLaunchKernelGGL(
+                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false>),
+                grid, block, 0, stream,
+                a, b_prepacked, scale, bias, c,
+                M, N, K,
+                has_scale, has_bias);
+        }
+    }
+}
 
+template <typename DispatchFn>
+bool dispatch_scaled_mm_config(
+    DispatchFn&& dispatch,
+    const int block_warps_m,
+    const int block_warps_n,
+    const int unroll_k,
+    const int repeat_m,
+    const int repeat_n)
+{
     const auto try_launch = [&](const auto tag) -> bool {
         if (block_warps_m == decltype(tag)::kBlockWarpsM &&
             block_warps_n == decltype(tag)::kBlockWarpsN &&
             unroll_k == decltype(tag)::kUnrollK &&
             repeat_m == decltype(tag)::kRepeatM &&
             repeat_n == decltype(tag)::kRepeatN) {
-            launch(tag);
+            dispatch(tag);
             return true;
         }
         return false;
     };
 
-    // Autotune configs
-    // Format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)
     return
         try_launch(ConfigTag<1, 1, 2, 1, 2>{}) ||
         try_launch(ConfigTag<1, 1, 4, 1, 2>{}) ||
@@ -492,6 +559,72 @@ extern "C" bool launch_scaled_mm(
         try_launch(ConfigTag<4, 2, 2, 2, 4>{}) ||
         try_launch(ConfigTag<4, 2, 4, 2, 4>{}) ||
         false;
+}
+
+extern "C" bool launch_scaled_mm_tuning_mode(
+    const half* const a,
+    const uint8_t* const b_prepacked,
+    const bfloat16_t* const scale,
+    const bfloat16_t* const bias,
+    bfloat16_t* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int has_scale,
+    const int has_bias,
+    const int block_warps_m,
+    const int block_warps_n,
+    const int unroll_k,
+    const int repeat_m,
+    const int repeat_n,
+    const int b_dtype,
+    const int a_wsgr_mode,
+    hipStream_t stream)
+{
+    return dispatch_scaled_mm_config(
+        [&](const auto tag) {
+            launch_scaled_mm_configured<decltype(tag)>(
+                a, b_prepacked, scale, bias, c,
+                M, N, K,
+                has_scale, has_bias,
+                b_dtype,
+                a_wsgr_mode,
+                stream);
+        },
+        block_warps_m,
+        block_warps_n,
+        unroll_k,
+        repeat_m,
+        repeat_n);
+}
+
+extern "C" bool launch_scaled_mm(
+    const half* const a,
+    const uint8_t* const b_prepacked,
+    const bfloat16_t* const scale,
+    const bfloat16_t* const bias,
+    bfloat16_t* const c,
+    const int64_t M,
+    const int64_t N,
+    const int64_t K,
+    const int has_scale,
+    const int has_bias,
+    const int block_warps_m,
+    const int block_warps_n,
+    const int unroll_k,
+    const int repeat_m,
+    const int repeat_n,
+    const int b_dtype,
+    hipStream_t stream)
+{
+    return launch_scaled_mm_tuning_mode(
+        a, b_prepacked, scale, bias, c,
+        M, N, K,
+        has_scale, has_bias,
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
+        b_dtype,
+        kAWsgrAuto,
+        stream);
 }
 
 #ifndef NO_PYTORCH
