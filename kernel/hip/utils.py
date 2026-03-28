@@ -132,7 +132,15 @@ def _config_compatible(cfg, M, N, K):
     block_m = 16 * warps_m * repeat_m
     block_n = 16 * warps_n * repeat_n
     chunk_k = 16 * unroll_k
-    return M % block_m == 0 and N % block_n == 0 and K % chunk_k == 0
+
+    if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
+        return False
+
+    is_large = K >= 3072 and min(M, N) >= 3072 and max(M, N) >= 4096
+    if is_large and (block_m < 64 or block_n < 64):
+        return False
+
+    return True
 
 
 def _size_hint(value: int) -> int:
