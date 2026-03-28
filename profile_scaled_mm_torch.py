@@ -18,7 +18,6 @@ def main():
     parser.add_argument("--iters", type=int, default=10, help="Number of iterations to profile")
     args = parser.parse_args()
 
-    torch.manual_seed(0)
     device = "cuda"
     m = n = k = args.N
 

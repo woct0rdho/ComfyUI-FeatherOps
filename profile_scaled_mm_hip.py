@@ -20,7 +20,6 @@ def main():
     parser.add_argument("--config", type=str, default="1,8,4,8,2", help="Specific config to use, e.g. 1,8,4,8,2")
     args = parser.parse_args()
 
-    torch.manual_seed(0)
     device = "cuda"
     m = n = k = args.N
 

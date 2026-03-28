@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/benchmark_scaled_mm_hip_libtorch"
+BUILD_DIR="$SCRIPT_DIR/build"
+BIN="$BUILD_DIR/benchmark_scaled_mm_hip_libtorch"
 KERNEL_SRC="$SCRIPT_DIR/../kernel/hip/hip_kernel.cu"
 BENCH_SRC="$SCRIPT_DIR/benchmark_scaled_mm_hip_libtorch.cpp"
 
@@ -14,14 +15,16 @@ TORCH_LIBS="-ltorch -ltorch_cpu -ltorch_hip -lc10 -lc10_hip"
 
 CLANGXX="$ROCM_PATH/lib/llvm/bin/clang++"
 
+mkdir -p "$BUILD_DIR"
+
 "$CLANGXX" \
   -x hip \
   --offload-arch=gfx1151 \
   --rocm-path="$ROCM_PATH" \
   -I"$ROCM_PATH/include" \
   -L"$ROCM_PATH/lib" \
-  $TORCH_INCLUDES \
-  $TORCH_LIB_PATHS \
+  "$TORCH_INCLUDES" \
+  "$TORCH_LIB_PATHS" \
   -D__HIP_PLATFORM_AMD__ \
   -DNO_PYTORCH \
   -O3 \
@@ -29,7 +32,7 @@ CLANGXX="$ROCM_PATH/lib/llvm/bin/clang++"
   "$KERNEL_SRC" \
   "$BENCH_SRC" \
   -lamdhip64 \
-  $TORCH_LIBS \
+  "$TORCH_LIBS" \
   -o "$BIN"
 
 echo "Built $BIN"

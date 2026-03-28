@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -209,6 +211,14 @@ int main(int argc, char** argv)
 
     const float total_ms = std::accumulate(timings_ms.begin(), timings_ms.end(), 0.0f);
     const float avg_ms = total_ms / static_cast<float>(timings_ms.size());
+    const double sq_diff_sum = std::accumulate(
+        timings_ms.begin(), timings_ms.end(), 0.0,
+        [avg_ms](double acc, float elapsed_ms)
+        {
+            const double diff = static_cast<double>(elapsed_ms) - static_cast<double>(avg_ms);
+            return acc + diff * diff;
+        });
+    const double std_ms = std::sqrt(sq_diff_sum / static_cast<double>(timings_ms.size()));
     const float min_ms = *std::min_element(timings_ms.begin(), timings_ms.end());
     const float max_ms = *std::max_element(timings_ms.begin(), timings_ms.end());
 
@@ -222,6 +232,7 @@ int main(int argc, char** argv)
               << " unroll_k=" << opts.unroll_k << " repeat_m=" << opts.repeat_m << " repeat_n=" << opts.repeat_n << "\n";
     std::cout << "  memory footprint: " << (matrix_bytes_total / (1024.0 * 1024.0)) << " MiB\n";
     std::cout << "  avg ms: " << avg_ms << "\n";
+    std::cout << "  std ms: " << std_ms << "\n";
     std::cout << "  min ms: " << min_ms << "\n";
     std::cout << "  max ms: " << max_ms << "\n";
     std::cout << "  avg TFLOP/s: " << avg_tflops << "\n";
