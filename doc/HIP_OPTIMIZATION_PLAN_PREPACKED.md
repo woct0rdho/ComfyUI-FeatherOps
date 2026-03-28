@@ -2,9 +2,9 @@
 
 ## Scope and metric
 
-- Target kernel family: prepacked B (fp8 bytes), winner track around `1,8,2,2,8,2`.
+- Target kernel family: prepacked B (fp8 bytes), winner track centered on `1,8,2,2,8,2`.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Primary metric: benchmark GFLOPS (kernel runtime); profile kernel-time is diagnostic only.
+- Primary metric: benchmark TFLOPS (kernel runtime); profile kernel-time is diagnostic only.
 - Keep rule:
   - correctness passes,
   - `N=8192` does not regress,
@@ -15,22 +15,22 @@
 - Data path kept: prepacked B as fp8 bytes in `(K/16, N, 16)`.
 - Best autotune config: `1,8,2,2,8,2` (no-swizzle).
 - Latest full benchmark (`benchmark_scaled_mm_hip.py`):
-  - `N=8192`: `hip_prepacked ~40.5k`, `hip ~36.2k`, `torch_compiled ~32.4k` GFLOPS.
-- Thermal note: gains under ~2% are treated as noise unless repeated.
+  - `N=8192`: `hip_prepacked 40.5`, `hip 36.2`, `torch_compiled 32.4` TFLOPS.
+- Thermal note: gains under 2% are treated as noise unless repeated.
 
 ## Current Bottleneck Model
 
 From target-kernel-only profiling (`P11-B6a`, forced `1,8,2,2,8,2`, `N=8192`):
 
-- Avg kernel time: `27.755 ms` (~`39.61 TFLOPS`).
+- Avg kernel time: `27.755 ms` (`39.61 TFLOPS`).
 - Theoretical peak (59.4 TFLOPS) lower-bound time: `18.510 ms`.
-- Gap to peak-time bound: `+9.245 ms` (~`+49.9%`).
+- Gap to peak-time bound: `+9.245 ms` (`+49.9%`).
 - Bandwidth sanity:
   - bytes floor (A fp16 + B fp8 + C fp16): `335.5 MB`,
   - bandwidth floor @ 200 GB/s: `1.678 ms`,
   - arithmetic intensity very high; this path is not DRAM-bandwidth-limited.
 - Instruction mix (target kernel):
-  - VALU ~58.2%, LDS ~13.6%, OTHER ~28.3% (`SQ_WAVE32_INSTS` basis).
+  - VALU 58.2%, LDS 13.6%, OTHER 28.3% (`SQ_WAVE32_INSTS` basis).
 
 Interpretation:
 
@@ -54,7 +54,7 @@ Interpretation:
 
 | ID | Keep? | Change | Key Result | Why |
 |---|---|---|---|---|
-| P0/P1 | REJECT | fp16-prepack transport variants | ~24k class | bandwidth/traffic regression |
+| P0/P1 | REJECT | fp16-prepack transport variants | 24 TFLOPS | bandwidth/traffic regression |
 | P3 | KEEP | fp8-byte prepack path | major recovery | restored transport efficiency |
 | P4a | REJECT | `kStages=4` overlap | strong regression | occupancy/resource loss |
 | P4b | KEEP | add `1,8,2,2,8,2` | major gain | better decode/work balance |
@@ -63,11 +63,11 @@ Interpretation:
 | P9a | REJECT | tile `1,16,2,2,16,1` | regression | poorer efficiency |
 | P9b | KEEP | compile-time swizzle specialization | small gain | safe positive change |
 | P9c | REJECT | stage4 overlap retry | strong regression | repeated non-viable direction |
-| P10b | KEEP | signfold conversion + perm pair-build | ~40k class | best robust conversion path |
+| P10b | KEEP | signfold conversion + perm pair-build | 40 TFLOPS | best robust conversion path |
 | P10c | REJECT | exp-only conversion approx | fails all configs | too inaccurate |
 | P10d | REJECT | spread-multiply pair-build | fails all configs | not bit-exact (carry coupling) |
-| P11-A | KEEP | epilogue ablation + pmc + asm counts | epilogue ~0.35% | bottleneck remains decode/issue |
-| P11-B1 | REJECT | mask/shift pair-build replacement | `N=8192` ~38.6k | clear perf regression |
+| P11-A | KEEP | epilogue ablation + pmc + asm counts | epilogue 0.35% | bottleneck remains decode/issue |
+| P11-B1 | REJECT | mask/shift pair-build replacement | `N=8192` 38.6 TFLOPS | clear perf regression |
 | P11-B2a/B2b/B2c | REJECT | low-risk decode/WMMA scheduling tweaks | no robust gain | benchmark flat/down, profile worse |
 | P11-B3a | REJECT | compute-only `s_setprio` | strong regression | priority scope wrong |
 | P11-B3b/B3c | REJECT | asymmetric A/B-only priority | correctness fail | unstable correctness |
@@ -79,14 +79,14 @@ Interpretation:
 | P11-B6d | REJECT | remove load-phase `s_setprio` | no robust gain | slightly worse forced metric |
 | P11-B6e | REJECT | lazy decode at `rm==0` | no robust gain | profile worse |
 | P11-B6f | REJECT | add config `1,8,1,2,8,2` | NaN correctness | exposed `kStages > kUnrollK` stage-write issue |
-| P11-B6g | REJECT | fix stage-write issue then re-test `1,8,1,2,8,2` | ~38.7k forced | finer chunking loses to control overhead |
+| P11-B6g | REJECT | fix stage-write issue then re-test `1,8,1,2,8,2` | 38.7 TFLOPS forced | finer chunking loses to control overhead |
 
 ## Durable Findings
 
 - fp8-byte transport is mandatory; fp16-prepack paths were large regressions.
 - `1,8,2,2,8,2` no-swizzle is the strongest robust winner at large N.
 - Stage4 overlap direction is non-viable on this hardware/kernel family.
-- Epilogue is a minor contributor (no-scale/no-bias gave only ~`+0.35%`).
+- Epilogue is a minor contributor (no-scale/no-bias gave only `+0.35%`).
 - Conversion approximation slack is small (aggressive approximations fail gate).
 - Removing `v_perm` alone does not guarantee speedup; replacement ops can cancel gains.
 - Forced-config cache pitfall is real (`_get_forced_config` cache must be cleared in same-process A/B scripts).
@@ -116,7 +116,7 @@ Objective: quantify remaining overlap ceiling before any new invasive code chang
   - `comm_only`
   - `comp_only`
 - Use `N=8192`, forced config, and collect:
-  - benchmark GFLOPS,
+  - benchmark TFLOPS,
   - profile kernel time,
   - target-kernel PMCs (`SQ_*`, `LDSBankConflict`, `L2CacheHit`, `VALUInsts`).
 - Derived metrics:
