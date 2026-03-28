@@ -11,7 +11,7 @@
 
 ## Current Bottleneck Analysis
 
-### PMC profiling (per-SIMD averages, N=8192, baseline = 36134 GFLOPS)
+### PMC profiling (per-SIMD averages, N=8192, baseline = 36.134 TFLOPS)
 
 | Counter | Value | % of total |
 |---|---|---|
@@ -20,13 +20,13 @@
 | SQ_INSTS_LDS | 35,940,394 | 36.8% |
 | SQ_INSTS_SALU | 4,734,686 | 4.8% |
 | SQ_INSTS_FLAT | 1,039,678 | 1.1% |
-| Other (waitcnt, barrier, branch) | ~21,133,596 | 21.6% |
+| Other (waitcnt, barrier, branch) | 21,133,596 | 21.6% |
 
 ### Issue model
 
 - LDS cannot dual-issue (VOPD is VALU-only, ISA §7.6). Each LDS op = 1 full issue cycle.
 - VALU can dual-issue via VOPD -> effective cost ~half.
-- Effective issue-cycle breakdown: **LDS ~48%**, VALU ~23%, Other ~29%.
+- Effective issue-cycle breakdown: **LDS 48%**, VALU 23%, Other 29%.
 - **LDS is the dominant bottleneck.**
 
 ### ASM-verified main loop breakdown (config 2,4,2,2,4,4, kContigFastPath=true)
@@ -47,15 +47,15 @@ Precise instruction counts from ASM (`.LBB7_8` through `.LBB7_16`):
 | | `v_add_nc_u32` | 16 | fp8->fp16 |
 | | `v_mov_b16` | 9 | fp8->fp16 |
 | | `v_lshrrev_b32` | 8 | fp8->fp16 |
-| **Address VALU** | mul/mad/add_co/etc | ~14 | A+B global addr |
+| **Address VALU** | mul/mad/add_co/etc | 14 | A+B global addr |
 | **Global loads** | `global_load_b128` | 10 | A prefetch (8) + B prefetch (2) |
 | **Waits** | `s_waitcnt` | 82 | 64 d16 WAW + 18 other |
 
 **Key findings:**
 - B LDS reads (128 ops) = **66% of all LDS ops** (192 total)
 - Conversion VALU (~121 ops) fills LDS stall slots - effectively free
-- Address calc VALU is only ~14 ops in the hot loop (negligible)
-- The ~305 addr calc from whole-function static analysis is mostly prologue/epilogue
+- Address calc VALU is only 14 ops in the hot loop (negligible)
+- The 305 addr calc from whole-function static analysis is mostly prologue/epilogue
 - All A/B read addresses use precomputed base registers (v175, v176) with compile-time offsets - no per-iteration address calc in compute phase
 
 ### B read d16 WAW hazard pattern
@@ -96,18 +96,18 @@ Compiler hides these waits by interleaving conversion VALU. E.8 proved eliminati
 
 ## Performance History
 
-| Change | N=8192 GFLOPS | % of peak | Delta |
+| Change | N=8192 TFLOPS | % of peak | Delta |
 |---|---|---|---|
-| Step24: removed coarse preload barrier | 28780 | 48.5% | - |
-| Step33: split preload order A then B | 30336 | 51.1% | +5.4% |
-| Step42: compile-time contig fastpath | 30846 | 51.9% | +1.7% |
-| Step65: selective s_setprio | 32404 | 54.6% | +5.0% |
-| StepB12: A phys/inv mapping + WSGR A-store | 34404 | 57.9% | +6.2% |
-| StepC04: C-shuffle physical row mapping | 34747 | 58.5% | +1.0% |
-| + packed fp8->fp16 conversion (fp8x4_to_half2x2) | 35485 | 59.7% | +2.1% |
-| + register-tiled compute | **36134** | **60.8%** | +1.8% |
+| Step24: removed coarse preload barrier | 28.780 | 48.5% | - |
+| Step33: split preload order A then B | 30.336 | 51.1% | +5.4% |
+| Step42: compile-time contig fastpath | 30.846 | 51.9% | +1.7% |
+| Step65: selective s_setprio | 32.404 | 54.6% | +5.0% |
+| StepB12: A phys/inv mapping + WSGR A-store | 34.404 | 57.9% | +6.2% |
+| StepC04: C-shuffle physical row mapping | 34.747 | 58.5% | +1.0% |
+| + packed fp8->fp16 conversion (fp8x4_to_half2x2) | 35.485 | 59.7% | +2.1% |
+| + register-tiled compute | **36.134** | **60.8%** | +1.8% |
 
-Beats `torch_compiled` (31494) at N=8192 by +14.7%.
+Beats `torch_compiled` (31.494 TFLOPS) at N=8192 by +14.7%.
 
 Note: benchmarks affected by thermal throttling; gains <2% should be interpreted with caution.
 
@@ -129,7 +129,7 @@ E.2 profile: LDS dropped 69% (35.9M -> 11.2M), VALU increased 28% (34.9M -> 44.7
 
 ### 4. Address calc is negligible in the hot loop
 
-ASM analysis shows only ~14 address calc VALU per main loop iteration. The compiler precomputes base addresses (v175 for B, v176 for A) and uses compile-time offsets. The ~305 addr calc from whole-function static analysis is mostly prologue/epilogue/C-shuffle. **Direction F is not viable.**
+ASM analysis shows only 14 address calc VALU per main loop iteration. The compiler precomputes base addresses (v175 for B, v176 for A) and uses compile-time offsets. The 305 addr calc from whole-function static analysis is mostly prologue/epilogue/C-shuffle. **Direction F is not viable.**
 
 ### 5. V_PK_* instructions are NOT VOPD-eligible
 
@@ -171,7 +171,7 @@ Requires kStages>=4 -> 50KB LDS -> occupancy=1 -> -20%.
 
 ### Direction F: Reduce address calc VALU - REJECTED
 
-ASM analysis shows only ~14 addr calc VALU in hot loop. Not a bottleneck (insight #4).
+ASM analysis shows only 14 addr calc VALU in hot loop. Not a bottleneck (insight #4).
 
 ### Direction I: Reduce s_waitcnt overhead - REJECTED
 
@@ -210,7 +210,7 @@ E.8 proved waits are already hidden by compiler interleaving (insight #2).
 
 ### Fresh baseline
 
-Profiled at N=8192, 20 iters. Benchmark: **35,057 GFLOPS** (59.0% of peak).
+Profiled at N=8192, 20 iters. Benchmark: **35.057 TFLOPS** (59.0% of peak).
 
 | Counter | Value | % of total |
 |---|---|---|
@@ -219,12 +219,12 @@ Profiled at N=8192, 20 iters. Benchmark: **35,057 GFLOPS** (59.0% of peak).
 | SQ_INSTS_LDS | 30,870,137 | 36.2% |
 | SQ_INSTS_SALU | 2,824,395 | 3.3% |
 | SQ_INSTS_FLAT | 887,399 | 1.0% |
-| Other (waitcnt, barrier, branch) | ~19,436,000 | 22.8% |
+| Other (waitcnt, barrier, branch) | 19,436,000 | 22.8% |
 | Bank conflict rate | 6.45% | (3.07M / 47.6M) |
 
-Effective issue-cycle breakdown: **LDS ~48%**, VALU ~24%, Other ~28%.
+Effective issue-cycle breakdown: **LDS 48%**, VALU 24%, Other 28%.
 
-VALU has ~50% headroom (dual-issues via VOPD).
+VALU has 50% headroom (dual-issues via VOPD).
 
 ### Direction H: Tile config `(2,4,2,2,8,2)` - REJECTED
 
@@ -254,7 +254,7 @@ Insight #8 shows the kernel's LDS/VALU/WMMA scheduling is tightly coupled - redu
 
 ## Profiling Quick Reference
 
-rocprofv3 on gfx1151: max ~6 PMC counters per run (more causes crash). Use two runs:
+rocprofv3 on gfx1151: max 6 PMC counters per run (more causes crash). Use two runs:
 - Run 1: `SQ_BUSY_CYCLES SQ_INSTS_LDS SQ_INSTS_TEX_LOAD SQ_INSTS_VALU SQ_WAVES SQ_WAVE_CYCLES`
 - Run 2: `SQ_INSTS_FLAT SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_TEX_STORE SQ_INSTS_WAVE32_VALU SQ_WAVE32_INSTS`
 
@@ -275,7 +275,7 @@ Compile single config with `-save-temps` (edit `_CONFIGS` and dispatch table to 
 hipcc -save-temps [flags] -c kernel/hip/hip_kernel.hip -o /tmp/out.o
 # GPU ASM: hip_kernel-hip-amdgcn-amd-amdhsa-gfx1151.s
 # Hot kernel: kContigFastPath=true variant (Lb0ELb1E in mangled name)
-# Config 2,4,2,2,4,4: Li2ELi4ELi2ELi2ELi4ELi4ELb0ELb1E (lines ~36919-38617)
+# Config 2,4,2,2,4,4: Li2ELi4ELi2ELi2ELi4ELi4ELb0ELb1E (lines 36919-38617)
 ```
 
 ## ISA Notes
@@ -296,7 +296,7 @@ hipcc -save-temps [flags] -c kernel/hip/hip_kernel.hip -o /tmp/out.o
 
 ## File References
 
-- `kernel/hip/hip_kernel.cu` - Main kernel (**baseline, 36134 GFLOPS**)
+- `kernel/hip/hip_kernel.cu` - Main kernel (**baseline, 36.134 TFLOPS**)
 - `kernel/hip/hip_kernel.py` - Python wrapper, JIT, autotune
 - `test_scaled_mm_hip.py` - Correctness test (all configs x 5 sizes)
 - `benchmark_scaled_mm_hip.py` - Full benchmark (N=128..8192)

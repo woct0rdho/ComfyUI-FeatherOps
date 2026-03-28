@@ -30,8 +30,8 @@ Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_...
 ```
 
 - Expected steady-state performance from earlier full benchmark runs:
-  - native C++ path: about `37-38 TFLOPS`
-  - FeatherOps fast-layout Python wrapper: about `36-37 TFLOPS`
+  - native C++ path: `32-38 TFLOPS`, highly sensitive to thermal throttling
+  - FeatherOps fast-layout Python wrapper: `31-37 TFLOPS`
 - Single-iteration `rocprofv3` runs are useful for kernel metadata only. Their timing is not representative.
 
 ## Source Of Truth
@@ -112,14 +112,14 @@ Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_...
   - deeper K pipeline: `64` instead of `32`
   - fewer waves per block: `4` instead of `8`
   - narrower N tile: `128x96` instead of `128x256`
-  - higher register pressure: about `256 VGPR` instead of about `192 VGPR`
+  - higher register pressure: `256 VGPR` instead of `192 VGPR`
 
 ## Historical Pitfall That Still Matters
 
 - Old symptom:
   - native or standalone hipBLASLt path picked `1112`
   - Torch extension path picked `1002`
-  - extension performance stayed around `26-28 TFLOPS`
+  - extension performance stayed at `26-28 TFLOPS`
 
 - Root cause:
   - the extension was compiled against local `rocm-libraries` hipBLASLt headers
@@ -132,7 +132,7 @@ Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_...
   - build the extension only against the installed system headers that match the loaded system library
 
 - Result:
-  - the FeatherOps fast-layout wrapper can dispatch the target kernel and recover the expected `~36-37 TFLOPS`
+  - the FeatherOps fast-layout wrapper can dispatch the target kernel and recover the expected `36-37 TFLOPS`
 
 - Important note:
   - current logs show the chosen solution uses `0 MiB` workspace at runtime

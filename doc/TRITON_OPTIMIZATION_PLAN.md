@@ -36,9 +36,9 @@
   - Step13 perPhase/maxPhase follow-up was rejected (no spill, but clear regression); local Triton is reverted to Step11 vec2.
   - Previous failed compiler-path attempts (Step08/Step09) remain reverted.
 - Best current fixed-config metric (`N=8192`):
-  - Triton: `45.028 ms` (`24418.396 GFLOPS`) from repeat run
-  - HIP: `30.932 ms` (`35545.538 GFLOPS`) from repeat run
-  - Gap: Triton is ~`1.46x` slower in time
+  - Triton: `45.028 ms` (`24.418 TFLOPS`) from repeat run
+  - HIP: `30.932 ms` (`35.546 TFLOPS`) from repeat run
+  - Gap: Triton is `1.46x` slower in time
 
 ## Stable Findings (carry forward)
 
@@ -68,7 +68,7 @@
 ## Compiler Knob Status (do not repeat without new precondition)
 
 - `TRITON_HIP_USE_IN_THREAD_TRANSPOSE=1`:
-  - severe regression (`180.352 ms`, `6096.469 GFLOPS`)
+  - severe regression (`180.352 ms`, `6.096 TFLOPS`)
   - log: `triton_hip_compare_fixed_step01/benchmark_triton_inthread_transpose.log`
 - `TRITON_HIP_USE_BLOCK_PINGPONG=1`:
   - compile failure at `TritonAMDGPUBlockPingpong`
@@ -132,7 +132,7 @@ Conclusion:
 
 - Change: use direct `fp8e4m3fn_to_fp16(b)` call in loop; keep control structure.
 - metric: Triton `47.171 ms` (repeat `47.071 ms`).
-- Profiling: Triton median ~`48.164 ms`; static counters unchanged from Step04.
+- Profiling: Triton median `48.164 ms`; static counters unchanged from Step04.
 - Why kept: small positive fixed-config gain, no counter regression.
 - Artifacts: `triton_hip_compare_fixed_step08/*`.
 
@@ -145,7 +145,7 @@ Conclusion:
   - `VGPR: 216 -> 256` (rocprof kernel metadata), `private_segment_fixed_size: 0 -> 596`.
   - Scratch instructions introduced (`scratch_store`/`scratch_load`), static `v_perm_b32` rose `128 -> 320`.
   - TTGIR B shared layout changed from `#shared1 vec=1 order=[1,0]` to `vec=16 order=[0,1]`.
-- Reject reason: layout forcing caused register-pressure/spill collapse and ~`3.9x` Triton time regression.
+- Reject reason: layout forcing caused register-pressure/spill collapse and `3.9x` Triton time regression.
 - Action taken: reverted `LowerLoops.cpp` patch in `~/triton`, rebuilt wheel, reinstalled local Triton.
 - Artifacts: `triton_hip_compare_fixed_step09/*`.
 
@@ -158,7 +158,7 @@ Conclusion:
   - `VGPR: 216 -> 256`; scratch/private segment still present (`scratch_size=128`, private segment fixed size `128`).
   - Static `v_perm_b32` stayed high at `320` (vs Step07 `128`), scratch ops reduced vs Step08 but not eliminated.
   - TTGIR B shared layout became `#shared1 vec=1 order=[0,1]`.
-- Reject reason: despite improving over Step08, it remains ~`2.0x` slower than Step07 and violates no-spill guardrails.
+- Reject reason: despite improving over Step08, it remains `2.0x` slower than Step07 and violates no-spill guardrails.
 - Action taken: reverted `LowerLoops.cpp` patch in `~/triton`, rebuilt wheel, reinstalled local Triton.
 - Artifacts: `triton_hip_compare_fixed_step10/*`.
 
