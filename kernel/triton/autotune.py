@@ -1,7 +1,7 @@
 import os
 from itertools import product
 from math import sqrt
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 import triton
@@ -27,7 +27,7 @@ else:
 SMEM_SIZE = triton.runtime.driver.active.utils.get_device_properties(torch.cuda.current_device())["max_shared_mem"]
 
 
-def _get_forced_triton_config() -> triton.Config | None:
+def _get_forced_triton_config() -> Optional[triton.Config]:
     """
     Optional one-config override to make Triton and HIP fixed-config comparisons easy.
     Format:

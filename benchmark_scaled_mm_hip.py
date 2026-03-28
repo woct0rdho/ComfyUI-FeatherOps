@@ -26,7 +26,7 @@ provider_names = list(providers)
             line_arg="provider",
             line_vals=provider_names,
             line_names=provider_names,
-            ylabel="GFLOPS",
+            ylabel="TFLOPS",
             plot_name="scaled_mm_hip",
             args={},
         )
@@ -58,7 +58,7 @@ def benchmark(N, provider):
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=100, rep=1000, quantiles=quantiles)
 
-    perf = lambda ms: 2 * N**3 / ms * 1e-6
+    perf = lambda ms: 2 * N**3 / ms * 1e-9
     print("N", N, "provider", provider, "end", perf(ms))
     return perf(ms), perf(max_ms), perf(min_ms)
 

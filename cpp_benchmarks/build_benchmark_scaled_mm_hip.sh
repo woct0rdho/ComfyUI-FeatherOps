@@ -2,11 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/benchmark_scaled_mm_hip"
+BUILD_DIR="$SCRIPT_DIR/build"
+BIN="$BUILD_DIR/benchmark_scaled_mm_hip"
 KERNEL_SRC="$SCRIPT_DIR/../kernel/hip/hip_kernel.cu"
 BENCH_SRC="$SCRIPT_DIR/benchmark_scaled_mm_hip.cpp"
 
 CLANGXX="$ROCM_PATH/lib/llvm/bin/clang++"
+
+mkdir -p "$BUILD_DIR"
 
 "$CLANGXX" \
   -x hip \
