@@ -57,12 +57,14 @@ class FeatherOps(manual_cast):
                     self.weight = nn.Parameter(weight, requires_grad=False)
 
                 if weight_scale is not None:
-                    self.weight_scale = weight_scale
+                    # Currently the kernel only supports bf16 scale
+                    self.weight_scale = weight_scale.to(torch.bfloat16)
             else:
                 missing_keys.append(weight_key)
 
             if bias is not None:
-                self.bias = nn.Parameter(bias, requires_grad=False)
+                # Currently the kernel only supports bf16 bias
+                self.bias = nn.Parameter(bias.to(torch.bfloat16), requires_grad=False)
             else:
                 self.bias = None
 
@@ -97,15 +99,15 @@ class FeatherOps(manual_cast):
             x_shape_orig = x.shape
             x = x.reshape(-1, x_shape_orig[-1])
 
-            # Currently the kernel only supports fp16 x, bf16 scale/bias/out
+            # Currently the kernel only supports fp16 x and bf16 out
             x_fp16 = x.to(torch.float16)
 
             # Temporarily clear weight_function so cast_bias_weight does not apply patches to prepacked weight
             saved_weight_function = self.weight_function
             self.weight_function = []
 
-            weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=torch.bfloat16, offloadable=True)
-            scale = self.weight_scale.to(device=x.device, dtype=torch.bfloat16) if self.weight_scale is not None else None
+            weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=self.bias.dtype, offloadable=True)
+            scale = self.weight_scale.to(device=x.device) if self.weight_scale is not None else None
 
             y = scaled_mm_hip(x_fp16, weight, scale, bias, out_dtype=torch.bfloat16)
 
