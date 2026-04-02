@@ -17,7 +17,7 @@ torch_convert_compiled = torch.compile(torch_convert, fullgraph=True, dynamic=Fa
 providers = {
     "torch": torch_convert,
     "torch_compiled": torch_convert_compiled,
-    "triton_asm": convert_bf16_to_fp16,
+    "triton_asm": bf16_to_fp16,
 }
 provider_names = list(providers)
 

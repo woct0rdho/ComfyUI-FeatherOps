@@ -1,9 +1,8 @@
 import functools
 import inspect
 import os
-import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import torch._inductor.kernel.custom_op as inductor_custom_op

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import torch
-from torch._inductor import config
 
 from kernel.hip.hip_kernel import _CONFIGS, prepack_b_for_scaled_mm, scaled_mm_hip, scaled_mm_hip_configured
 from kernel.naive import scaled_mm_naive
