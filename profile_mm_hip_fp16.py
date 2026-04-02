@@ -3,7 +3,6 @@
 import argparse
 
 import torch
-from torch._inductor import config
 
 from kernel.hip.hip_kernel_fp16 import mm_hip_fp16_configured, prepack_b_for_mm_fp16
 
