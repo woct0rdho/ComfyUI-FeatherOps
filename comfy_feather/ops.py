@@ -106,7 +106,8 @@ class FeatherOps(manual_cast):
             saved_weight_function = self.weight_function
             self.weight_function = []
 
-            weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=self.bias.dtype, offloadable=True)
+            bias_dtype = self.bias.dtype if self.bias is not None else None
+            weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True)
             scale = self.weight_scale.to(device=x.device) if self.weight_scale is not None else None
 
             y = scaled_mm_hip(x_fp16, weight, scale, bias, out_dtype=torch.bfloat16)
