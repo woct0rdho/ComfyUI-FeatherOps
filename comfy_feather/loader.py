@@ -14,7 +14,7 @@ class FeatherUNetLoader:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "ops": (["feather", "debug"],),
-                "model_type": (["qwen", "default"],),
+                "model_type": (["qwen", "wan", "default"],),
             }
         }
 
@@ -36,6 +36,15 @@ class FeatherUNetLoader:
                 # Modules with time embedding vector as input
                 "img_mod",
                 "txt_mod",
+            ]
+        elif model_type == "wan":
+            FeatherOps.excluded_names = [
+                # Non-repeating modules
+                "patch_embedding",
+                "text_embedding",
+                "time_embedding",
+                "time_projection",
+                "head",
             ]
         else:
             FeatherOps.excluded_names = []
