@@ -59,6 +59,6 @@ Note on torch.compile: Recently ComfyUI introduced comfy-aimdo but it does not w
 ## TODO
 
 * See what we can do with a fp16 @ fp16 kernel. Tensile is good at tuning parameters, but we still need an HIP kernel to better understand low-level behaviors such as how to utilize the hardware scheduler. We need better profiling or even a simulator to investigate it
-* Besides the matmul op, see what we can do with the attention op. Currently the AMD Triton kernel in the FlashAttention repo reaches 20 TFLOPS on Strix Halo, which is still far from the theoretical roofline
+* Besides the matmul op, see what we can do with the attention op. Currently the Triton kernel in AITER reaches 24 TFLOPS on Strix Halo, which is still far from the theoretical roofline
 * Better fp8e5m2 quantization. For now I just directly cast fp16/bf16 weights to fp8e5m2, and we can implement grid search of the scale and blockwise quantization for better quality
 * Support more models in ComfyUI. We need to exclude modules outside the transformer backbone, and mat-vec multiplications
