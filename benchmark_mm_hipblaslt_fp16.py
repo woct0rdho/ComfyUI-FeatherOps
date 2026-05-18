@@ -5,15 +5,23 @@ import gc
 import torch
 import triton
 
-from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16_colmajor, to_col_major
+from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16
 from kernel.naive import scaled_mm_naive
+
+torch._dynamo.config.recompile_limit = 64
 
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
 providers = {
-    "torch": scaled_mm_naive,
-    "torch_compiled": scaled_mm_naive_compiled,
-    "hipblaslt": mm_hipblaslt_fp16_colmajor,
+    "torch_eager_TT": scaled_mm_naive,
+    "torch_eager_TN": scaled_mm_naive,
+    "torch_eager_NN": scaled_mm_naive,
+    "torch_compiled_TT": scaled_mm_naive_compiled,
+    "torch_compiled_TN": scaled_mm_naive_compiled,
+    "torch_compiled_NN": scaled_mm_naive_compiled,
+    "hipblaslt_TT": mm_hipblaslt_fp16,
+    "hipblaslt_TN": mm_hipblaslt_fp16,
+    "hipblaslt_NN": mm_hipblaslt_fp16,
 }
 provider_names = list(providers)
 
@@ -47,15 +55,20 @@ def benchmark(N, provider):
     scale = torch.ones(N, device=device, dtype=torch.float32)
     bias = torch.randn(N, device=device, dtype=out_dtype)
 
-    a_col = to_col_major(a)
-    b_col = to_col_major(b)
-
-    if provider in {"torch", "torch_compiled"}:
-        fn = lambda: providers[provider](a, b, scale, bias, out_dtype)
-    elif provider == "hipblaslt":
-        fn = lambda: providers[provider](a_col, b_col, scale, bias, out_dtype, solution_index=-2)
+    if "TT" in provider:
+        pass
+    elif "TN" in provider:
+        b = b.T
+    elif "NN" in provider:
+        a = a.T
+        b = b.T
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
+
+    if "hipblaslt" in provider:
+        fn = lambda: providers[provider](a, b, scale, bias, out_dtype, solution_index=-2)
+    else:
+        fn = lambda: providers[provider](a, b, scale, bias, out_dtype, bias_dim=0)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=100, rep=1000, quantiles=quantiles)

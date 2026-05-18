@@ -115,7 +115,43 @@ hipblasLtEpilogue_t get_epilogue(const bool has_bias, const bool use_relu)
     return has_bias ? HIPBLASLT_EPILOGUE_BIAS : HIPBLASLT_EPILOGUE_DEFAULT;
 }
 
-void mm_hipblaslt_fp16_colmajor(
+struct MatrixLayout {
+    hipblasOperation_t op;
+    int cache_value;
+    const char* name;
+};
+
+MatrixLayout detect_matrix_layout(const torch::stable::Tensor& tensor, const char* const name)
+{
+    const int64_t rows = tensor.size(0);
+    const int64_t cols = tensor.size(1);
+    const int64_t stride0 = tensor.stride(0);
+    const int64_t stride1 = tensor.stride(1);
+
+    const bool n_layout = stride0 == 1 && stride1 == rows;
+    const bool t_layout = stride1 == 1 && stride0 == cols;
+
+    STD_TORCH_CHECK(n_layout || t_layout,
+                    name,
+                    " must be contiguous in hipBLASLt N layout (stride(0) == 1 and stride(1) == rows) "
+                    "or T layout (stride(1) == 1 and stride(0) == cols); got shape (",
+                    rows,
+                    ", ",
+                    cols,
+                    ") and strides (",
+                    stride0,
+                    ", ",
+                    stride1,
+                    ")");
+
+    if(n_layout)
+    {
+        return {HIPBLAS_OP_N, 0, "N"};
+    }
+    return {HIPBLAS_OP_T, 1, "T"};
+}
+
+void mm_hipblaslt_fp16(
     const torch::stable::Tensor& a,
     const torch::stable::Tensor& b,
     const std::optional<torch::stable::Tensor>& scale,
@@ -149,12 +185,10 @@ void mm_hipblaslt_fp16_colmajor(
     STD_TORCH_CHECK(d.size(0) == M, "d.shape[0] must equal a.shape[0]");
     STD_TORCH_CHECK(d.size(1) == N, "d.shape[1] must equal b.shape[1]");
 
-    STD_TORCH_CHECK(a.stride(0) == 1, "a must be column-major contiguous (stride(0) == 1)");
-    STD_TORCH_CHECK(b.stride(0) == 1, "b must be column-major contiguous (stride(0) == 1)");
-    STD_TORCH_CHECK(d.stride(0) == 1, "d must be column-major contiguous (stride(0) == 1)");
-    STD_TORCH_CHECK(a.stride(1) == M, "a must be column-major contiguous");
-    STD_TORCH_CHECK(b.stride(1) == K, "b must be column-major contiguous");
-    STD_TORCH_CHECK(d.stride(1) == M, "d must be column-major contiguous");
+    const MatrixLayout a_layout = detect_matrix_layout(a, "a");
+    const MatrixLayout b_layout = detect_matrix_layout(b, "b");
+    STD_TORCH_CHECK(d.stride(0) == 1, "d must be hipBLASLt N-layout (column-major) contiguous (stride(0) == 1)");
+    STD_TORCH_CHECK(d.stride(1) == M, "d must be hipBLASLt N-layout (column-major) contiguous (stride(1) == d.shape[0])");
 
     if(scale.has_value())
     {
@@ -164,7 +198,7 @@ void mm_hipblaslt_fp16_colmajor(
         STD_TORCH_CHECK(scale_t.get_device_index() == device_index, "scale must be on the same device as a");
         STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::Float, "scale vector must be float32");
         STD_TORCH_CHECK(scale_t.dim() == 1, "scale vector must be 1D");
-        STD_TORCH_CHECK(scale_t.numel() == M, "scale vector must have M elements for the column-major fast path");
+        STD_TORCH_CHECK(scale_t.numel() == M, "scale vector must have M elements for the hipBLASLt output rows");
         STD_TORCH_CHECK(scale_t.stride(0) == 1, "scale vector must be contiguous");
     }
 
@@ -176,7 +210,7 @@ void mm_hipblaslt_fp16_colmajor(
         STD_TORCH_CHECK(bias_t.get_device_index() == device_index, "bias must be on the same device as a");
         STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::Half, "bias must be float16");
         STD_TORCH_CHECK(bias_t.dim() == 1, "bias must be 1D");
-        STD_TORCH_CHECK(bias_t.numel() == M, "bias must have M elements for the column-major fast path");
+        STD_TORCH_CHECK(bias_t.numel() == M, "bias must have M elements for the hipBLASLt output rows");
         STD_TORCH_CHECK(bias_t.stride(0) == 1, "bias must be contiguous");
     }
 
@@ -216,8 +250,8 @@ void mm_hipblaslt_fp16_colmajor(
 
     hipblaslt_ext::Gemm gemm(
         ctx.handle,
-        HIPBLAS_OP_N,
-        HIPBLAS_OP_N,
+        a_layout.op,
+        b_layout.op,
         HIP_R_16F,
         HIP_R_16F,
         HIP_R_16F,
@@ -251,7 +285,7 @@ void mm_hipblaslt_fp16_colmajor(
         inputs.setBias(bias_ptr);
     }
 
-    check_hipblaslt(gemm.setProblem(M, N, K, 1, epilogue, inputs), "hipblaslt_ext::Gemm::setProblem(colmajor)");
+    check_hipblaslt(gemm.setProblem(M, N, K, 1, epilogue, inputs), "hipblaslt_ext::Gemm::setProblem");
 
     const AlgoCacheKey cache_key{
         device_index,
@@ -261,7 +295,7 @@ void mm_hipblaslt_fp16_colmajor(
         scale.has_value(),
         bias.has_value(),
         use_relu,
-        1,
+        (a_layout.cache_value << 1) | b_layout.cache_value,
         static_cast<int>(solution_index),
     };
 
@@ -292,7 +326,7 @@ void mm_hipblaslt_fp16_colmajor(
             auto cached_algo = it->second;
             if(initialize_if_supported(cached_algo))
             {
-                check_hipblaslt(gemm.run(stream), "hipblaslt_ext::Gemm::run(colmajor)");
+                check_hipblaslt(gemm.run(stream), "hipblaslt_ext::Gemm::run");
                 const hipError_t launch_err = hipGetLastError();
                 STD_TORCH_CHECK(launch_err == hipSuccess, "hipBLASLt launch failed: ", hipGetErrorString(launch_err));
                 return;
@@ -310,15 +344,15 @@ void mm_hipblaslt_fp16_colmajor(
             std::vector<hipblasLtMatmulHeuristicResult_t> all_algos;
             check_hipblaslt(hipblaslt_ext::getAllAlgos(ctx.handle,
                                                        hipblaslt_ext::GemmType::HIPBLASLT_GEMM,
-                                                       HIPBLAS_OP_N,
-                                                       HIPBLAS_OP_N,
+                                                       a_layout.op,
+                                                       b_layout.op,
                                                        HIP_R_16F,
                                                        HIP_R_16F,
                                                        HIP_R_16F,
                                                        HIP_R_16F,
                                                        HIPBLAS_COMPUTE_32F,
                                                        all_algos),
-                            "hipblaslt_ext::getAllAlgos(colmajor)");
+                            "hipblaslt_ext::getAllAlgos");
 
             for(const auto& candidate : all_algos)
             {
@@ -341,9 +375,9 @@ void mm_hipblaslt_fp16_colmajor(
         {
             std::vector<hipblasLtMatmulHeuristicResult_t> heuristic_algos;
             check_hipblaslt(gemm.algoGetHeuristic(kAutoTuneHeuristicCount, pref, heuristic_algos),
-                            "hipblaslt_ext::Gemm::algoGetHeuristic(colmajor autotune)");
+                            "hipblaslt_ext::Gemm::algoGetHeuristic(autotune)");
             STD_TORCH_CHECK(!heuristic_algos.empty(),
-                            "hipBLASLt returned no heuristic results for auto-tuning the column-major path");
+                            "hipBLASLt returned no heuristic results for auto-tuning the requested layout");
 
             float best_ms = 1e9f;
             hipblasLtMatmulAlgo_t best_algo;
@@ -366,13 +400,13 @@ void mm_hipblaslt_fp16_colmajor(
                             break;
                         }
                     }
-                    
+
                     if (!warmup_failed) {
                         if (hipStreamSynchronize(stream) != hipSuccess) {
                             warmup_failed = true;
                         }
                     }
-                    
+
                     if (warmup_failed) {
                         // Clear all pending errors
                         while (hipGetLastError() != hipSuccess) {}
@@ -417,7 +451,7 @@ void mm_hipblaslt_fp16_colmajor(
                     std::lock_guard<std::mutex> lock(g_context_mutex);
                     g_algo_cache[cache_key] = best_algo;
                     initialized = true;
-                    printf("hipBLASLt auto-tuning complete for M=%ld, N=%ld, K=%ld: best solution_index=%d (%.3f ms)\n", M, N, K, hipblaslt_ext::getIndexFromAlgo(best_algo), best_ms / 10.0f);
+                    printf("hipBLASLt auto-tuning complete for M=%ld, N=%ld, K=%ld, layout=%s%s: best solution_index=%d (%.3f ms)\n", M, N, K, a_layout.name, b_layout.name, hipblaslt_ext::getIndexFromAlgo(best_algo), best_ms / 10.0f);
                 }
             }
         }
@@ -426,8 +460,8 @@ void mm_hipblaslt_fp16_colmajor(
     if(!initialized)
     {
         std::vector<hipblasLtMatmulHeuristicResult_t> heuristics;
-        check_hipblaslt(gemm.algoGetHeuristic(16, pref, heuristics), "hipblaslt_ext::Gemm::algoGetHeuristic(colmajor)");
-        STD_TORCH_CHECK(!heuristics.empty(), "hipBLASLt returned no heuristic results for column-major path");
+        check_hipblaslt(gemm.algoGetHeuristic(16, pref, heuristics), "hipblaslt_ext::Gemm::algoGetHeuristic");
+        STD_TORCH_CHECK(!heuristics.empty(), "hipBLASLt returned no heuristic results for the requested layout");
 
         for(const auto& heuristic : heuristics)
         {
@@ -443,10 +477,10 @@ void mm_hipblaslt_fp16_colmajor(
     }
 
     STD_TORCH_CHECK(initialized,
-                    "hipBLASLt failed to initialize any heuristic algorithm for the column-major path, last status ",
+                    "hipBLASLt failed to initialize any heuristic algorithm for the requested layout, last status ",
                     static_cast<int>(last_status));
 
-    check_hipblaslt(gemm.run(stream), "hipblaslt_ext::Gemm::run(colmajor)");
+    check_hipblaslt(gemm.run(stream), "hipblaslt_ext::Gemm::run");
 
     const hipError_t launch_err = hipGetLastError();
     STD_TORCH_CHECK(launch_err == hipSuccess, "hipBLASLt launch failed: ", hipGetErrorString(launch_err));
@@ -457,7 +491,7 @@ void mm_hipblaslt_fp16_colmajor(
 STABLE_TORCH_LIBRARY(feather_ops, m)
 {
     m.def(
-        "mm_hipblaslt_fp16_colmajor("
+        "mm_hipblaslt_fp16("
         "Tensor a, "
         "Tensor b, "
         "Tensor? scale, "
@@ -471,5 +505,5 @@ STABLE_TORCH_LIBRARY(feather_ops, m)
 
 STABLE_TORCH_LIBRARY_IMPL(feather_ops, CUDA, m)
 {
-    m.impl("mm_hipblaslt_fp16_colmajor", TORCH_BOX(&mm_hipblaslt_fp16_colmajor));
+    m.impl("mm_hipblaslt_fp16", TORCH_BOX(&mm_hipblaslt_fp16));
 }
