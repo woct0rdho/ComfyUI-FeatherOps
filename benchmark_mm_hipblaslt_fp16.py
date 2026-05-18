@@ -3,24 +3,24 @@
 import gc
 
 import torch
+import torch.nn.functional as F
 import triton
 
 from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16
 from kernel.naive import scaled_mm_naive
 
-torch._dynamo.config.recompile_limit = 64
-
-scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
-
 providers = {
-    "torch_eager_TT": scaled_mm_naive,
-    "torch_eager_TN": scaled_mm_naive,
-    "torch_eager_NN": scaled_mm_naive,
-    "torch_compiled_TT": scaled_mm_naive_compiled,
-    "torch_compiled_TN": scaled_mm_naive_compiled,
-    "torch_compiled_NN": scaled_mm_naive_compiled,
+    "torch_mm_TT": scaled_mm_naive,
+    "torch_mm_TN": scaled_mm_naive,
+    "torch_mm_NT": scaled_mm_naive,
+    "torch_mm_NN": scaled_mm_naive,
+    "torch_linear_TT": F.linear,
+    "torch_linear_TN": F.linear,
+    "torch_linear_NT": F.linear,
+    "torch_linear_NN": F.linear,
     "hipblaslt_TT": mm_hipblaslt_fp16,
     "hipblaslt_TN": mm_hipblaslt_fp16,
+    "hipblaslt_NT": mm_hipblaslt_fp16,
     "hipblaslt_NN": mm_hipblaslt_fp16,
 }
 provider_names = list(providers)
@@ -59,16 +59,22 @@ def benchmark(N, provider):
         pass
     elif "TN" in provider:
         b = b.T
+    elif "NT" in provider:
+        a = a.T
     elif "NN" in provider:
         a = a.T
         b = b.T
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 
-    if "hipblaslt" in provider:
+    if "mm" in provider:
+        fn = lambda: providers[provider](a, b, scale, bias, out_dtype, bias_dim=0)
+    elif "linear" in provider:
+        fn = lambda: providers[provider](a, b.T, bias)
+    elif "hipblaslt" in provider:
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype, solution_index=-2)
     else:
-        fn = lambda: providers[provider](a, b, scale, bias, out_dtype, bias_dim=0)
+        raise RuntimeError(f"Unknown provider: {provider}")
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=100, rep=1000, quantiles=quantiles)
