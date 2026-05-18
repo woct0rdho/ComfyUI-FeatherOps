@@ -78,6 +78,11 @@ cur_dir = os.path.dirname(os.path.abspath(__file__))
 load_hipblaslt_stable_extension("mm_hipblaslt_fp16_ext", cur_dir, "hipblaslt_kernel_fp16.cu")
 
 
+def _is_hipblaslt_n_or_t_layout(x: torch.Tensor) -> bool:
+    rows, cols = x.shape
+    return (x.stride(0) == 1 and x.stride(1) == rows) or (x.stride(1) == 1 and x.stride(0) == cols)
+
+
 def _validate_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
     if out_dtype != torch.float16:
         raise RuntimeError("hipBLASLt fp16 wrapper only supports out_dtype=torch.float16")
@@ -89,13 +94,13 @@ def _validate_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
         raise RuntimeError("a and b must be 2D")
     if a.shape[1] != b.shape[0]:
         raise RuntimeError(f"incompatible matmul shapes: {tuple(a.shape)} x {tuple(b.shape)}")
-    if a.stride(0) != 1 or b.stride(0) != 1:
-        raise RuntimeError("a and b must be column-major contiguous with stride(0) == 1")
-    if a.stride(1) != a.shape[0] or b.stride(1) != b.shape[0]:
-        raise RuntimeError("a and b must be column-major contiguous to match the 40 TFLOPS hipBLASLt path")
+    if not _is_hipblaslt_n_or_t_layout(a):
+        raise RuntimeError(f"a must be contiguous in hipBLASLt N or T layout; got strides {a.stride()}")
+    if not _is_hipblaslt_n_or_t_layout(b):
+        raise RuntimeError(f"b must be contiguous in hipBLASLt N or T layout; got strides {b.stride()}")
 
 
-@torch.library.custom_op("feather_ops_internal::mm_hipblaslt_fp16_colmajor", mutates_args=())
+@torch.library.custom_op("feather_ops_internal::mm_hipblaslt_fp16", mutates_args=())
 def _op(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -107,7 +112,7 @@ def _op(
     solution_index: int,
 ) -> torch.Tensor:
     out = torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=out_dtype)
-    torch.ops.feather_ops.mm_hipblaslt_fp16_colmajor.default(
+    torch.ops.feather_ops.mm_hipblaslt_fp16.default(
         a,
         b,
         scale,
@@ -134,7 +139,7 @@ def _(
     return torch.empty_strided((a.shape[0], b.shape[1]), (1, a.shape[0]), device=a.device, dtype=out_dtype)
 
 
-def mm_hipblaslt_fp16_colmajor(
+def mm_hipblaslt_fp16(
     a: torch.Tensor,
     b: torch.Tensor,
     scale: Optional[torch.Tensor],
