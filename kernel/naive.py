@@ -26,10 +26,13 @@ def scaled_mm_naive(
     c = c.to(out_dtype)
     if scale is not None:
         scale = scale.to(c.dtype)
-        if bias_dim == 0:
-            c *= scale[:, None]
+        if scale.dim() == 0:
+            c *= scale
         else:
-            c *= scale[None, :]
+            if bias_dim == 0:
+                c *= scale[:, None]
+            else:
+                c *= scale[None, :]
     if bias is not None:
         bias = bias.to(c.dtype)
         if bias_dim == 0:

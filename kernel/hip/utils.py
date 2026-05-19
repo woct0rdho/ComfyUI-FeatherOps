@@ -1,22 +1,12 @@
-import functools
-import inspect
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 import torch
-import torch._inductor.kernel.custom_op as inductor_custom_op
 import triton
-from packaging import version
 from torch._inductor.kernel.custom_op import CustomOpConfig
-from torch._inductor.select_algorithm import realize_inputs
+from torch.fx.experimental.symbolic_shapes import optimization_hint
 from torch.utils.cpp_extension import _import_module_from_library, load
-
-try:
-    # torch <= 2.11
-    from torch.fx.experimental.symbolic_shapes import hint_int
-except ImportError:
-    hint_int = int
 
 
 def get_rocm_lib_dirs() -> list[str]:
@@ -104,28 +94,6 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
     Path(ninja_log).touch(exist_ok=True)
 
 
-def patch_inductor_custom_op_autotune_realize_inputs():
-    if version.parse(torch.__version__) >= version.parse("2.11"):
-        return
-
-    if getattr(inductor_custom_op.autotune_custom_op, "_featherops_realize_inputs_patch", False):
-        return
-
-    original_autotune_custom_op = inductor_custom_op.autotune_custom_op
-    signature = inspect.signature(original_autotune_custom_op)
-
-    @functools.wraps(original_autotune_custom_op)
-    def wrapped_autotune_custom_op(*args: Any, **kwargs: Any):
-        bound = signature.bind_partial(*args, **kwargs)
-        inputs = bound.arguments.get("inputs")
-        if inputs is not None:
-            bound.arguments["inputs"] = realize_inputs(*inputs)
-        return original_autotune_custom_op(*bound.args, **bound.kwargs)
-
-    wrapped_autotune_custom_op._featherops_realize_inputs_patch = True
-    inductor_custom_op.autotune_custom_op = wrapped_autotune_custom_op
-
-
 def _config_compatible(cfg, M, N, K):
     warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
     block_m = 16 * warps_m * repeat_m
@@ -146,7 +114,7 @@ def _size_hint(value: int) -> int:
     try:
         return int(value)
     except TypeError:
-        return hint_int(value)
+        return optimization_hint(value)
 
 
 def generate_autotune_configs(

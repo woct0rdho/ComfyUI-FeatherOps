@@ -15,7 +15,7 @@ It's a pity that AMD RDNA3/3.5 GPUs do not have faster int8 matmul than fp16, bu
 ## Implementation details
 
 * `kernel/hip/hip_kernel.cu` is the kernel used in ComfyUI. Other kernels are for experiments and not used in ComfyUI
-* `kernel/hip/hip_kernel.py` contains a lot of boilerplate to support torch.compile in torch 2.10, which can be reduced in torch 2.11
+* `kernel/hip/hip_kernel.py` is the Python wrapper of the kernel
 * `comfy_feather/` contains all ComfyUI-related code
 
 The kernel is written in HIP, with intrinsics and asm when needed, without abstraction levels like CK, Tensile, or Triton.
@@ -43,10 +43,11 @@ Benchmarks on Strix Halo, when the matrices are large: (The results may change w
 ## Use in ComfyUI
 
 1. Install the rocm-sdk-devel wheel from TheRock, and set the paths
-2. git clone this repo to `ComfyUI/custom_nodes/`
-3. Run `python test_scaled_mm_hip.py` to test the correctness
-4. In ComfyUI, use `FeatherUNetLoader` node to load the model, which converts fp16/bf16 model to fp8e5m2 with the prepacked layout
-5. Replace the text encode node with `FeatherCLIPTextEncodePadded`, which pads the tokens to a multiple of 16
+2. Install torch >= 2.12 from TheRock
+3. git clone this repo to `ComfyUI/custom_nodes/`
+4. Run `python test_scaled_mm_hip.py` to test the correctness
+5. In ComfyUI, use `FeatherUNetLoader` node to load the model, which converts fp16/bf16 model to fp8e5m2 with the prepacked layout
+6. Replace the text encode node with `FeatherCLIPTextEncodePadded`, which pads the tokens to a multiple of 16
 
 Besides the text token count, it also requires the image token count (`width / 16 * height / 16`) to be a multiple of an M block size. The image token count should be a multiple of 128 for best speed, and the text token count can be a multiple of 16 if the prompt is short.
 
