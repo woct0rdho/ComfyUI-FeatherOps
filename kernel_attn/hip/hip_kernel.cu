@@ -630,7 +630,7 @@ extern "C" bool launch_attn_fp16_fp8kv(
         const dim3 block(kWaveSize * kNW);
         const dim3 grid(b, h, Tr);
 
-        if constexpr (kBr == 128 && kBc == 32 && kNW == 16) {
+        if constexpr (kBr == 128 && kBc == 32 && (kNW == 16 || kNW == 8)) {
             if (d == 128) {
                 const int sram_sz = kBr * kBc * sizeof(half_bits_t) + 2 * kBr * sizeof(float);
 
