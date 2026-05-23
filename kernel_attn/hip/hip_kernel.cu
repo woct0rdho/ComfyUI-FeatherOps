@@ -175,65 +175,6 @@ __device__ void mul_A_BT(
     }
 }
 
-// C += A @ B, where A is fp16 P [Br, Bc] and B is fp8e5m2 V [Bc, d].
-template <int N_WAVES>
-__device__ void mul_add_A_B(
-    const half_bits_t* __restrict__ const A,
-    const fp8e5m2_t* __restrict__ const B,
-    half_bits_t* __restrict__ const C,
-    const int lda,
-    const int ldb,
-    const int ldc,
-    const int m,
-    const int n,
-    const int k)
-{
-    fp16x16_t fragA[2];
-    fp16x16_t fragB[2];
-
-    const int wave_id = threadIdx.x / kWaveSize;
-    const int lane_id = threadIdx.x % kWaveSize;
-    const int wmma_lane = lane_id % 16;
-
-    const int max_wave = ((m * n) / (kWmmaM * kWmmaN) + N_WAVES - 1) / N_WAVES;
-    for (int wave_off = 0; wave_off < max_wave; ++wave_off) {
-        const int wave_xy = wave_id + wave_off * N_WAVES;
-        const int wave_x = wave_xy % (n / kWmmaN);
-        const int wave_y = wave_xy / (n / kWmmaN);
-
-        const int blk_x = wave_x * kWmmaN;
-        const int blk_y = wave_y * kWmmaM;
-
-        if ((blk_x < n) && (blk_y < m)) {
-            fp32x8_t fragACC = {0, 0, 0, 0, 0, 0, 0, 0};
-
-            for (int i = 0; i < k; i += kWmmaK * 2) {
-                fragA[0] = HALF16((A + (blk_y * lda + i))[wmma_lane * lda]);
-                #pragma unroll
-                for (int k_idx = 0; k_idx < 16; ++k_idx) {
-                    fragB[0][k_idx] = fp8e5m2_to_half_bits(B[(i + k_idx) * ldb + blk_x + wmma_lane]);
-                }
-
-                fragA[1] = HALF16((A + (blk_y * lda + i + kWmmaK))[wmma_lane * lda]);
-                #pragma unroll
-                for (int k_idx = 0; k_idx < 16; ++k_idx) {
-                    fragB[1][k_idx] = fp8e5m2_to_half_bits(B[(i + kWmmaK + k_idx) * ldb + blk_x + wmma_lane]);
-                }
-
-                fragACC = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fragA[0], fragB[0], fragACC);
-                fragACC = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fragA[1], fragB[1], fragACC);
-            }
-
-            for (int ele = 0; ele < 8; ++ele) {
-                const int r = ele * 2 + (lane_id / 16);
-                const float old_val = half_bits_to_fp32((C + (blk_y * ldc + blk_x))[r * ldc + wmma_lane]);
-                const float new_val = old_val + fragACC[ele];
-                (C + (blk_y * ldc + blk_x))[r * ldc + wmma_lane] = fp32_to_half_bits(new_val);
-            }
-        }
-    }
-}
-
 template <int N_WAVES, int N_TILES>
 __device__ void rescale_mul_add_A_B_reg(
     const half_bits_t* __restrict__ const A,
@@ -334,7 +275,6 @@ fwd_kernel_reg_o_d128(
     half_bits_t* __restrict__ const o,
     const int Tr,
     const int Tc,
-    const int d,
     const int64_t q_stride0,
     const int64_t q_stride1,
     const int64_t q_stride2,
@@ -447,156 +387,6 @@ fwd_kernel_reg_o_d128(
     store_O_reg<N_WAVES, kRegTiles>(fragO, o + q_offset + (Tr_i * Br) * ld_q, ld_q, inv_l, Br, kD);
 }
 
-template <int Br, int Bc, int N_WAVES>
-__global__ void __launch_bounds__(kWaveSize * N_WAVES)
-fwd_kernel(
-    const half_bits_t* __restrict__ const q,
-    const fp8e5m2_t* __restrict__ const k,
-    const fp8e5m2_t* __restrict__ const v,
-    half_bits_t* __restrict__ const o,
-    const int Tr,
-    const int Tc,
-    const int d,
-    const int64_t q_stride0,
-    const int64_t q_stride1,
-    const int64_t q_stride2,
-    const int64_t kv_stride0,
-    const int64_t kv_stride1,
-    const int64_t kv_stride2,
-    const float scale)
-{
-    const int q_offset = blockIdx.x * q_stride0 + blockIdx.y * q_stride1;
-    const int kv_offset = blockIdx.x * kv_stride0 + blockIdx.y * kv_stride1;
-
-    const int ld_q = q_stride2;
-    const int ld_kv = kv_stride2;
-
-    const int Tr_i = blockIdx.z;
-    if (Tr_i >= Tr) return;
-
-    const int tx = threadIdx.x;
-
-    extern __shared__ half_bits_t sram[];
-    half_bits_t* __restrict__ const Si = &sram[0];
-    half_bits_t* __restrict__ const Oi = &sram[Br * Bc];
-
-    if (tx < Br) {
-        #pragma unroll 4
-        for (int i = 0; i < d; i += 16) {
-            fp16x16_t zero = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-            HALF16W(Oi[tx * d + i]) = zero;
-        }
-    }
-    __syncthreads();
-
-    const half_bits_t* __restrict__ const Qi = q + q_offset + (Tr_i * Br) * ld_q;
-
-    float row_max_old = -INFINITY;
-    float l_i = 0;
-
-    for (int j = 0; j < Tc; ++j) {
-        const fp8e5m2_t* __restrict__ const Kj = k + kv_offset + (j * Bc) * ld_kv;
-        const fp8e5m2_t* __restrict__ const Vj = v + kv_offset + (j * Bc) * ld_kv;
-
-        float row_max_new = -INFINITY;
-        float row_sum = 0;
-        float rowmax_diff_exp = 0;
-
-        mul_A_BT<N_WAVES>(Qi, Kj, Si, ld_q, ld_kv, Bc, Br, Bc, d, scale);
-        __syncthreads();
-
-        if (tx < Br) {
-            float val32 = row_max_new;
-            #pragma unroll 2
-            for (int i = 0; i < Bc; i += 16) {
-                fp16x16_t val = HALF16(Si[(tx * Bc) + i]);
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    val32 = fmaxf(val32, half_bits_to_fp32(val[j_idx]));
-                }
-            }
-            row_max_new = val32;
-
-            row_max_new = fmaxf(row_max_old, row_max_new);
-            rowmax_diff_exp = exp2f(row_max_old - row_max_new);
-            row_max_old = row_max_new;
-
-            #pragma unroll 4
-            for (int i = 0; i < Bc; i += 16) {
-                fp16x16_t val = HALF16(Si[(tx * Bc) + i]);
-                fp32x16_t val_f32;
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    val_f32[j_idx] = half_bits_to_fp32(val[j_idx]);
-                }
-
-                val_f32 = val_f32 - row_max_new;
-
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    val_f32[j_idx] = exp2f(val_f32[j_idx]);
-                }
-
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    row_sum += val_f32[j_idx];
-                }
-
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    val[j_idx] = fp32_to_half_bits(val_f32[j_idx]);
-                }
-
-                HALF16W(Si[(tx * Bc) + i]) = val;
-            }
-            l_i = rowmax_diff_exp * l_i + row_sum;
-
-            #pragma unroll 4
-            for (int i = 0; i < d; i += 16) {
-                fp16x16_t val = HALF16(Oi[(tx * d) + i]);
-                fp32x16_t val_f32;
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    val_f32[j_idx] = half_bits_to_fp32(val[j_idx]);
-                }
-
-                val_f32 *= rowmax_diff_exp;
-
-                #pragma unroll
-                for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                    val[j_idx] = fp32_to_half_bits(val_f32[j_idx]);
-                }
-
-                HALF16W(Oi[(tx * d) + i]) = val;
-            }
-        }
-        __syncthreads();
-
-        mul_add_A_B<N_WAVES>(Si, Vj, Oi, Bc, ld_kv, d, Br, d, Bc);
-        __syncthreads();
-    }
-
-    if (tx < Br) {
-        for (int i = 0; i < d; i += 16) {
-            fp16x16_t val = HALF16(Oi[(tx * d) + i]);
-            fp32x16_t val_f32;
-            #pragma unroll
-            for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                val_f32[j_idx] = half_bits_to_fp32(val[j_idx]);
-            }
-
-            val_f32 = val_f32 / l_i;
-
-            #pragma unroll
-            for (int j_idx = 0; j_idx < 16; ++j_idx) {
-                val[j_idx] = fp32_to_half_bits(val_f32[j_idx]);
-            }
-
-            HALF16W((o + q_offset + (Tr_i * Br) * ld_q)[tx * ld_q + i]) = val;
-        }
-    }
-}
-
 template <int Br, int Bc, int NW>
 struct ConfigTag {
     static constexpr int kBr = Br;
@@ -626,10 +416,13 @@ extern "C" bool launch_attn_fp16_fp8kv(
     const int N_WAVES,
     hipStream_t stream)
 {
+    if (d != 128) return false;
+
     const auto launch = [&](const auto tag) -> void {
         constexpr int kBr = decltype(tag)::kBr;
         constexpr int kBc = decltype(tag)::kBc;
         constexpr int kNW = decltype(tag)::kN_WAVES;
+        static_assert(kBr == 128 && kBc == 32 && (kNW == 16 || kNW == 8));
 
         const int Tr = n / kBr;
         const int Tc = n_kv / kBc;
@@ -637,30 +430,14 @@ extern "C" bool launch_attn_fp16_fp8kv(
         const dim3 block(kWaveSize * kNW);
         const dim3 grid(b, h, Tr);
 
-        if constexpr (kBr == 128 && kBc == 32 && (kNW == 16 || kNW == 8)) {
-            if (d == 128) {
-                const int kSiStride = kBc + 8;
-                const int sram_sz = kBr * kSiStride * sizeof(half_bits_t) + 2 * kBr * sizeof(float);
-
-                hipLaunchKernelGGL(
-                    (fwd_kernel_reg_o_d128<kBr, kBc, kNW>),
-                    grid, block, sram_sz, stream,
-                    q, k, v, o,
-                    Tr, Tc, d,
-                    q_stride0, q_stride1, q_stride2,
-                    kv_stride0, kv_stride1, kv_stride2,
-                    scale * 1.4426950408889634f);
-                return;
-            }
-        }
-
-        const int sram_sz = kBr * kBc * sizeof(half_bits_t) + kBr * d * sizeof(half_bits_t);
+        const int kSiStride = kBc + 8;
+        const int sram_sz = kBr * kSiStride * sizeof(half_bits_t) + 2 * kBr * sizeof(float);
 
         hipLaunchKernelGGL(
-            (fwd_kernel<kBr, kBc, kNW>),
+            (fwd_kernel_reg_o_d128<kBr, kBc, kNW>),
             grid, block, sram_sz, stream,
             q, k, v, o,
-            Tr, Tc, d,
+            Tr, Tc,
             q_stride0, q_stride1, q_stride2,
             kv_stride0, kv_stride1, kv_stride2,
             scale * 1.4426950408889634f);
@@ -677,18 +454,8 @@ extern "C" bool launch_attn_fp16_fp8kv(
     };
 
     return
-        try_launch(ConfigTag<64, 64, 16>{}) ||
-        try_launch(ConfigTag<64, 64, 8>{}) ||
-        try_launch(ConfigTag<64, 128, 16>{}) ||
-        try_launch(ConfigTag<128, 64, 16>{}) ||
-        try_launch(ConfigTag<128, 64, 8>{}) ||
         try_launch(ConfigTag<128, 32, 16>{}) ||
         try_launch(ConfigTag<128, 32, 8>{}) ||
-        try_launch(ConfigTag<64, 32, 16>{}) ||
-        try_launch(ConfigTag<32, 64, 8>{}) ||
-        try_launch(ConfigTag<64, 32, 8>{}) ||
-        try_launch(ConfigTag<32, 32, 8>{}) ||
-        try_launch(ConfigTag<16, 32, 2>{}) ||
         false;
 }
 
@@ -757,7 +524,7 @@ void attn_fp16_fp8kv(
 
     STD_TORCH_CHECK(n % Br == 0, "n must be a multiple of Br");
     STD_TORCH_CHECK(n_kv % Bc == 0, "n_kv must be a multiple of Bc");
-    STD_TORCH_CHECK(d % 32 == 0, "d must be a multiple of 32");
+    STD_TORCH_CHECK(d == 128, "d must be 128");
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
 
@@ -842,7 +609,7 @@ void quantize_kv_e5m2(
 
     STD_TORCH_CHECK(k.stride(3) == 1, "k.stride(3) must be 1");
     STD_TORCH_CHECK(v.stride(3) == 1, "v.stride(3) must be 1");
-    STD_TORCH_CHECK(d % 4 == 0, "d must be a multiple of 4 for packed quantization");
+    STD_TORCH_CHECK(d == 128, "d must be 128");
     STD_TORCH_CHECK(k.stride(0) % 4 == 0 && k.stride(1) % 4 == 0 && k.stride(2) % 4 == 0, "k strides must be multiples of 4 for packed quantization");
     STD_TORCH_CHECK(v.stride(0) % 4 == 0 && v.stride(1) % 4 == 0 && v.stride(2) % 4 == 0, "v strides must be multiples of 4 for packed quantization");
     STD_TORCH_CHECK(k_fp8.stride(0) == h * n_kv * d && k_fp8.stride(1) == n_kv * d && k_fp8.stride(2) == d && k_fp8.stride(3) == 1, "k_fp8 must be contiguous");
@@ -922,7 +689,7 @@ void attn_fp16_fp8kv_prepacked(
 
     STD_TORCH_CHECK(n % Br == 0, "n must be a multiple of Br");
     STD_TORCH_CHECK(n_kv % Bc == 0, "n_kv must be a multiple of Bc");
-    STD_TORCH_CHECK(d % 32 == 0, "d must be a multiple of 32");
+    STD_TORCH_CHECK(d == 128, "d must be 128");
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
 

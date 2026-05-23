@@ -5,8 +5,12 @@ from torch._inductor.kernel.custom_op import register_custom_op_autotuning
 
 from kernel.hip.utils import load_hip_stable_extension
 
-from .utils import CONFIGS as _CONFIGS
 from .utils import generate_autotune_configs, get_compatible_config, old_autotune
+
+_CONFIGS = [
+    (128, 32, 16),
+    (128, 32, 8),
+]
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 load_hip_stable_extension("attn_hip_ext", cur_dir, "hip_kernel.cu")
