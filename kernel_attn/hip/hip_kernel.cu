@@ -44,32 +44,20 @@ __device__ __forceinline__ half_bits_t fp32_to_half_bits(const float f)
 
 __device__ __forceinline__ fp8e5m2_t half_bits_to_fp8e5m2(const half_bits_t h)
 {
-    const uint16_t sign = (h >> 8) & 0x80u;
-    uint16_t exp = (h >> 10) & 0x1fu;
-    uint16_t mant = h & 0x03ffu;
+    const half_bits_t rounded = h + 0x007fu + ((h >> 8) & 1u);
+    return static_cast<fp8e5m2_t>(rounded >> 8);
+}
 
-    if (exp == 0) {
-        return static_cast<fp8e5m2_t>(sign);
-    }
-
-    if (exp == 0x1fu) {
-        return static_cast<fp8e5m2_t>(sign | 0x7cu | (mant ? 0x01u : 0x00u));
-    }
-
-    uint16_t mant2 = mant >> 8;
-    const uint16_t rem = mant & 0x00ffu;
-    if (rem > 0x80u || (rem == 0x80u && (mant2 & 1u))) {
-        ++mant2;
-        if (mant2 == 4u) {
-            mant2 = 0;
-            ++exp;
-            if (exp >= 0x1fu) {
-                exp = 0x1fu;
-            }
-        }
-    }
-
-    return static_cast<fp8e5m2_t>(sign | (exp << 2) | mant2);
+__device__ __forceinline__ uint32_t half_bits4_to_fp8e5m2x4(const uint64_t h4)
+{
+    const half_bits_t h0 = static_cast<half_bits_t>(h4);
+    const half_bits_t h1 = static_cast<half_bits_t>(h4 >> 16);
+    const half_bits_t h2 = static_cast<half_bits_t>(h4 >> 32);
+    const half_bits_t h3 = static_cast<half_bits_t>(h4 >> 48);
+    return static_cast<uint32_t>(half_bits_to_fp8e5m2(h0)) |
+           (static_cast<uint32_t>(half_bits_to_fp8e5m2(h1)) << 8) |
+           (static_cast<uint32_t>(half_bits_to_fp8e5m2(h2)) << 16) |
+           (static_cast<uint32_t>(half_bits_to_fp8e5m2(h3)) << 24);
 }
 
 __device__ __forceinline__ half_bits_t fp8e5m2_to_half_bits(const fp8e5m2_t x)
@@ -117,19 +105,21 @@ __global__ void quantize_kv_e5m2_kernel(
     const int64_t v_stride1,
     const int64_t v_stride2)
 {
-    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
+    const int base = (static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x) * 4;
+    if (base >= total) return;
 
-    const int d_idx = idx % d;
-    const int n_idx = (idx / d) % n_kv;
-    const int h_idx = (idx / (d * n_kv)) % h;
-    const int b_idx = idx / (d * n_kv * h);
+    const int d_idx = base % d;
+    const int n_idx = (base / d) % n_kv;
+    const int h_idx = (base / (d * n_kv)) % h;
+    const int b_idx = base / (d * n_kv * h);
 
     const int64_t k_off = static_cast<int64_t>(b_idx) * k_stride0 + static_cast<int64_t>(h_idx) * k_stride1 + static_cast<int64_t>(n_idx) * k_stride2 + d_idx;
     const int64_t v_off = static_cast<int64_t>(b_idx) * v_stride0 + static_cast<int64_t>(h_idx) * v_stride1 + static_cast<int64_t>(n_idx) * v_stride2 + d_idx;
 
-    k_fp8[idx] = half_bits_to_fp8e5m2(k[k_off]);
-    v_fp8[idx] = half_bits_to_fp8e5m2(v[v_off]);
+    const uint64_t k_h4 = reinterpret_cast<const uint64_t*>(k + k_off)[0];
+    const uint64_t v_h4 = reinterpret_cast<const uint64_t*>(v + v_off)[0];
+    reinterpret_cast<uint32_t*>(k_fp8 + base)[0] = half_bits4_to_fp8e5m2x4(k_h4);
+    reinterpret_cast<uint32_t*>(v_fp8 + base)[0] = half_bits4_to_fp8e5m2x4(v_h4);
 }
 
 // C = A @ B^T, where A is fp16 Q [Br, d] and B is fp8e5m2 K [Bc, d].
@@ -759,6 +749,8 @@ void attn_fp16_fp8kv(
     STD_TORCH_CHECK(q.stride(3) == 1, "q.stride(3) must be 1");
     STD_TORCH_CHECK(k.stride(3) == 1, "k.stride(3) must be 1");
     STD_TORCH_CHECK(v.stride(3) == 1, "v.stride(3) must be 1");
+    STD_TORCH_CHECK(k.stride(0) % 4 == 0 && k.stride(1) % 4 == 0 && k.stride(2) % 4 == 0, "k strides must be multiples of 4 for packed quantization");
+    STD_TORCH_CHECK(v.stride(0) % 4 == 0 && v.stride(1) % 4 == 0 && v.stride(2) % 4 == 0, "v strides must be multiples of 4 for packed quantization");
     STD_TORCH_CHECK(o.stride(0) == q.stride(0) && o.stride(1) == q.stride(1) && o.stride(2) == q.stride(2) && o.stride(3) == 1, "o must have q-compatible contiguous-last-dim strides");
     STD_TORCH_CHECK(k_fp8.stride(0) == h * n_kv * d && k_fp8.stride(1) == n_kv * d && k_fp8.stride(2) == d && k_fp8.stride(3) == 1, "k_fp8 must be contiguous");
     STD_TORCH_CHECK(v_fp8.stride(0) == h * n_kv * d && v_fp8.stride(1) == n_kv * d && v_fp8.stride(2) == d && v_fp8.stride(3) == 1, "v_fp8 must be contiguous");
@@ -782,7 +774,7 @@ void attn_fp16_fp8kv(
 
     const int total_kv = static_cast<int>(b * h * n_kv * d);
     const int threads = 256;
-    const int blocks = (total_kv + threads - 1) / threads;
+    const int blocks = ((total_kv / 4) + threads - 1) / threads;
     hipLaunchKernelGGL(
         quantize_kv_e5m2_kernel,
         dim3(blocks), dim3(threads), 0, stream,
@@ -850,6 +842,9 @@ void quantize_kv_e5m2(
 
     STD_TORCH_CHECK(k.stride(3) == 1, "k.stride(3) must be 1");
     STD_TORCH_CHECK(v.stride(3) == 1, "v.stride(3) must be 1");
+    STD_TORCH_CHECK(d % 4 == 0, "d must be a multiple of 4 for packed quantization");
+    STD_TORCH_CHECK(k.stride(0) % 4 == 0 && k.stride(1) % 4 == 0 && k.stride(2) % 4 == 0, "k strides must be multiples of 4 for packed quantization");
+    STD_TORCH_CHECK(v.stride(0) % 4 == 0 && v.stride(1) % 4 == 0 && v.stride(2) % 4 == 0, "v strides must be multiples of 4 for packed quantization");
     STD_TORCH_CHECK(k_fp8.stride(0) == h * n_kv * d && k_fp8.stride(1) == n_kv * d && k_fp8.stride(2) == d && k_fp8.stride(3) == 1, "k_fp8 must be contiguous");
     STD_TORCH_CHECK(v_fp8.stride(0) == h * n_kv * d && v_fp8.stride(1) == n_kv * d && v_fp8.stride(2) == d && v_fp8.stride(3) == 1, "v_fp8 must be contiguous");
 
@@ -866,7 +861,7 @@ void quantize_kv_e5m2(
 
     const int total_kv = static_cast<int>(b * h * n_kv * d);
     const int threads = 256;
-    const int blocks = (total_kv + threads - 1) / threads;
+    const int blocks = ((total_kv / 4) + threads - 1) / threads;
     hipLaunchKernelGGL(
         quantize_kv_e5m2_kernel,
         dim3(blocks), dim3(threads), 0, stream,
