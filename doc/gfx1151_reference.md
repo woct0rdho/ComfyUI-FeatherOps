@@ -100,7 +100,7 @@ PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, an
 
 ### Running PC Sampling
 
-Use `$ROCM_PATH/bin/rocprofv3` (not the one in the venv `bin/`, which loads stock libraries without gfx1151 PC sampling support). Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling, while host-trap is software-driven and can have sampling skid.
+Use `$ROCM_PATH/bin/rocprofv3`, not the one in the venv `bin/`, and not the one in `~/rocm-systems/build/`, to ensure all libraries are correctly loaded. Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling, while host-trap is software-driven and can have sampling skid.
 
 For Host-Trap (Time-based):
 ```bash
@@ -206,8 +206,6 @@ Running thread tracing:
 $ROCM_PATH/bin/rocprofv3 --att -d <out_dir> -o <prefix> -- python <script>.py
 ```
 
-Use a rocprofv3 binary and ROCProfiler libraries from the same local/custom stack. If running directly from the local build tree, make sure its `lib/` and `lib/rocprofiler-sdk/` directories resolve before any stock/venv ROCProfiler libraries.
-
 For detailed traces on gfx1151, prefer the triple-buffer path when available:
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
@@ -226,8 +224,7 @@ The current clean gfx1151 triple-buffer path was validated with one shader engin
 - If the target kernel is not the first dispatch (e.g. random generation or copy kernels run first), inspect `ui_output_agent_*/code.json` to find the correct traced dispatch.
 - `--kernel-include-regex <regex>` also applies to thread-trace data and is useful for excluding helper kernels from the decoded output.
 - On gfx10/11, `--att-simd-select` is a SIMD ID (`0x0..0x3`), not a bitmask. `0x0` is a good starting choice on gfx1151.
-- If a run exits successfully but the selected CU/SIMD saw no target wave, current local tooling warns `ATT decode produced no target CU/SIMD wave instruction records` and emits zero-hit disassembly for occupancy-reported kernels. Older builds may instead leave `stats_*.csv` as only a header and `code.json` as `code: null`. In either case, retry with a larger workload or a different `--att-target-cu`/`--att-simd-select` for instruction timing data.
-- Older local builds could abort before the workload with `Configuration request occurred outside of valid rocprofiler configuration period` when rocprofv3 was configured twice. Use a build with the duplicate-configure guard, or rebuild the local ROCProfiler stack before diagnosing ATT itself.
+- If a run exits successfully but the selected CU/SIMD saw no target wave, current local tooling warns `ATT decode produced no target CU/SIMD wave instruction records` and emits zero-hit disassembly for occupancy-reported kernels. Retry with a larger workload or a different `--att-target-cu`/`--att-simd-select` for instruction timing data.
 - A safer reduced-scope single-buffer command is:
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
@@ -250,7 +247,6 @@ $ROCM_PATH/bin/rocprofv3 \
 ```
 - Smaller `--att-buffer-size` values are valid (minimum 1 MB), but if you see `Thread trace buffer full!`, the trace is partial and you should increase the buffer or reduce trace scope/workload.
 - If you use `--att-consecutive-kernels`, rocprofv3 switches to device-mode ATT. In that mode, `--att-serialize-all` is invalid and setup fails with error 19 (`INVALID_ARGUMENT`).
-- `--att-triple-buffer --selected-regions` is routed correctly in the current stack. Older builds could incorrectly conflict with forced consecutive-kernel mode.
 - For new kernels or if a full-size trace causes a reset, first try a smaller problem size (e.g. `N=2048` or `N=4096`) and the reduced-scope or triple-buffer command above before attempting `N=8192`.
 - `--att-no-detail` is validated on this machine as a low-volume fallback. Detailed FP16 `N=8192` with triple-buffering is validated for artifact/stats generation on this machine with 1 MiB and 16 MiB ATT buffers, but `Wave incomplete` means some per-wave trace timelines can still be partial.
 - `Wave incomplete` means the decoder saw a wave start but did not see its matching `WAVE_END` token before the captured trace ended. This is a partial-tail warning, not the same as `Data Lost` or `Thread trace buffer full!`.
@@ -259,7 +255,7 @@ $ROCM_PATH/bin/rocprofv3 \
 Outputs:
 - `stats_*.csv`: Aggregated latency, stall, and idle cycle counts for every instruction in the kernel.
 - `*.att`: Raw SQTT binary trace data.
-- In triple-buffer mode, multiple chunks for one dispatch append to the same `.att` file. Older builds could truncate earlier chunks.
+- In triple-buffer mode, multiple chunks for one dispatch append to the same `.att` file.
 - `ui_output_agent_*/`: Directory containing per-wave JSON files (e.g. `se0_sm0_sl0_wv0.json`), `code.json`, and occupancy/timeline metadata.
 - In `--att-no-detail` mode, `code.json` is expected to contain `"code": null` and `stats_*.csv` may contain only the header row. The useful outputs are `occupancy.json`, `wstates*.json`, `realtime.json`, and the wave-slot JSON files.
 

@@ -50,7 +50,7 @@ def main():
         (8192, 8192, 8192),
     ]
 
-    print(f"Testing fp8e5m2 mixed precision HIP kernel ({len(_CONFIGS)} configs across {len(test_sizes)} matrix sizes)\n")
+    print(f"Testing HIP fp8e5m2 mixed precision kernel ({len(_CONFIGS)} configs across {len(test_sizes)} matrix sizes)\n")
     print("Config format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)")
     print("=" * 80)
 
