@@ -38,14 +38,14 @@ Latest benchmark CSV: `attn_hip.csv`.
 
 | S | AITER TFLOPS | HIP TFLOPS | HIP Prepacked TFLOPS | HIP/AITER | AITER ms | HIP ms | HIP Prepacked ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1024 | 22.283698 | 10.568325 | 12.201548 | 47.4% | 0.578 | 1.219 | 1.056 |
-| 2048 | 27.373071 | 11.787876 | 12.597967 | 43.1% | 1.883 | 4.372 | 4.091 |
-| 4096 | 27.470231 | 12.451936 | 13.024492 | 45.3% | 7.505 | 16.555 | 15.829 |
-| 8192 | 27.514484 | 12.561168 | 12.659433 | 45.7% | 29.970 | 65.649 | 65.139 |
+| 1024 | 22.242193 | 12.525824 | 14.578468 | 56.3% | 0.579 | 1.029 | 0.884 |
+| 2048 | 27.350404 | 15.489495 | 16.885610 | 56.6% | 1.884 | 3.327 | 3.052 |
+| 4096 | 27.106026 | 16.533739 | 17.479504 | 61.0% | 7.606 | 12.469 | 11.794 |
+| 8192 | 27.237810 | 16.309928 | 16.655114 | 59.9% | 30.275 | 50.560 | 49.514 |
 
 Interpretation:
-- The HIP kernel is `2.1x` slower at `S=1024` and about `2.2x` slower at larger S.
-- HIP TFLOPS is still much flatter than AITER from `S=1024` to `8192`, but A4-B lifted the large-S plateau from about `10 TFLOPS` to about `12.5 TFLOPS`.
+- The HIP kernel is `1.8x` slower at `S=1024` and about `1.6-1.7x` slower at larger S.
+- HIP TFLOPS is still flatter than AITER from `S=1024` to `8192`, but A4-B/A4-C lifted the large-S plateau from about `10 TFLOPS` to about `16-17 TFLOPS`.
 - The large-S gap is too large for tuning-only polish; the current algorithm structure likely dominates.
 - Internal K/V quantization is `O(BHSD)`, while attention is `O(BHS^2D)`, so quantization cannot explain the `S=4096` and `8192` gap by itself. It can still matter at `S=1024` and must be decomposed.
 - A standalone V-transposed prepack prototype was tested, rejected, and removed from the code. See A3/A6 notes for the historical measurements.
@@ -61,7 +61,7 @@ Interpretation:
   - every K/V tile does QK WMMA, `__syncthreads`, scalar-ish row softmax, `__syncthreads`, PV WMMA, `__syncthreads`.
 - The softmax update is mostly assigned to `tx < Br`, so only one thread per row performs max, exp, sum, probability conversion, and output rescale over full row fragments.
 - The output accumulator is repeatedly rounded through fp16 in LDS after each K/V tile; this is both a performance cost and an accuracy compromise.
-- The specialized A4-B path for `(Br=128, Bc=32, N_WAVES=16, D=128)` keeps the output accumulator in fp32 registers and stores only `Si`, `alpha`, and final `inv_l` in LDS.
+- The specialized A4-B/A4-C path for `(Br=128, Bc=32, N_WAVES in {8, 16}, D=128)` keeps the output accumulator in fp32 registers and stores only `Si`, `alpha`, and final `inv_l` in LDS.
 - K loads for QK are naturally row-major and contiguous over `D`.
 - V loads for PV are currently hostile to coalescing: the WMMA fragment needs 16 tokens for a fixed output-dim lane, but row-major V means those 16 fp8 bytes are separated by `D=128` bytes. A standalone `[B,H,D,S]` VT prepack did not help enough; revisit V packing only as part of a new forward structure.
 
@@ -125,9 +125,9 @@ Decision for now:
 | A1 | KEEP infra | decompose benchmark into quantize-only, fwd-prepacked-only, and end-to-end | `S=4096`: quant `0.60 ms`, prepacked fwd `21.59 ms`, end-to-end `21.76 ms` | quantization is not the large-S bottleneck |
 | A2 | KEEP | tile sweep around AITER RDNA shape, especially `Br=128`, `Bc=32`, `N_WAVES=8/16` | end-to-end `S=4096` improved `9.53 -> 9.95 TFLOPS`, `S=8192` improved `9.71 -> 9.85 TFLOPS` | small but real primary-metric gain; no large-S regression |
 | A3 | REJECT | V fp8 transposed/tile-packed prepack path | `S=4096`: row prepacked `21.59 ms`, VT prepacked `22.19 ms`; VT prepack `2.54 ms` vs row `0.60 ms` | simple `[B,H,D,S]` V transpose did not overcome current forward bottlenecks; code path removed |
-| A4 | KEEP partial | register-resident online softmax/PV prototype for fixed `Br=128`, `Bc=32`, `D=128` | A4-B register-output path lifts `S=4096` HIP from `9.95` to `12.45 TFLOPS` and prepacked from `9.82` to `13.02 TFLOPS`; full score-tile rewrite still pending | remove LDS score/prob/output round trips |
+| A4 | KEEP partial | register-resident online softmax/PV prototype for fixed `Br=128`, `Bc=32`, `D=128` | A4-C 8-wave register-output path lifts `S=4096` HIP to `16.53 TFLOPS` and prepacked to `17.48 TFLOPS`; full score-tile rewrite still pending | remove LDS score/prob/output round trips |
 | A5 | TODO | HND vs NHD stride/layout benchmark | pending | decide public layout strategy |
-| A6 | KEEP findings | profile kept or surprising variants with generated-code inspection, PC sampling, or thread tracing | AITER/HIP `S=4096` kernel traces captured with `rocprofv3`; PMCs/PC sampling still future work | explain wins/regressions before further tuning |
+| A6 | KEEP findings | profile kept or surprising variants with generated-code inspection, PC sampling, bank-conflict PMCs, or thread tracing | AITER/HIP `S=4096` kernel traces captured with `rocprofv3`; bank-conflict profile/ablation is next | explain wins/regressions before further tuning |
 | A7 | TODO | optional Sage-inspired K smoothing or scale-bearing quantization experiment | pending | accuracy/headroom only after core fwd is faster |
 
 ## Next Steps
@@ -253,6 +253,33 @@ Decision for now:
   - The remaining gap to AITER is still about `2.1-2.2x`, so A4-C should target the remaining `Si` LDS score/probability round trip and serial row softmax.
   - This result supports the structural direction: using more registers and less LDS wins on gfx1151 even before fully matching AITER's tensor-register online-softmax structure.
 
+#### A4-C: 8-Wave Register-Output Variant
+
+- Status: kept.
+- Change:
+  - extend the A4-B register-output path to `(Br=128, Bc=32, N_WAVES=8, D=128)`;
+  - keep the 16-wave variant available, but let autotune choose between both existing configs;
+  - this matches AITER's 256-thread workgroup shape more closely while each wave holds more output fragments in registers.
+- Correctness: `/home/wd/venv_torch/bin/python test_attn_hip.py` passed `12/12` configs.
+- Benchmark: `/home/wd/venv_torch/bin/python benchmark_attn_hip.py`.
+- Autotune result: `(128, 32, 8)` selected for `hip` and `hip_prepacked` at every target size.
+- Main benchmark results:
+  - `S=1024`: HIP `12.525824 TFLOPS`, prepacked `14.578468 TFLOPS`;
+  - `S=2048`: HIP `15.489495 TFLOPS`, prepacked `16.885610 TFLOPS`;
+  - `S=4096`: HIP `16.533739 TFLOPS`, prepacked `17.479504 TFLOPS`;
+  - `S=8192`: HIP `16.309928 TFLOPS`, prepacked `16.655114 TFLOPS`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1676 ms`, prepacked fwd `0.8853 ms`, end-to-end `1.0348 ms`;
+  - `S=2048`: quant kernel `0.3179 ms`, prepacked fwd `3.0435 ms`, end-to-end `3.3219 ms`;
+  - `S=4096`: quant kernel `0.5970 ms`, prepacked fwd `11.9459 ms`, end-to-end `12.4869 ms`;
+  - `S=8192`: quant kernel `1.1390 ms`, prepacked fwd `50.5253 ms`, end-to-end `51.0373 ms`.
+- Interpretation:
+  - The 8-wave version is clearly better than the 16-wave register-output path despite higher per-wave register pressure.
+  - The result confirms the workgroup-thread count was part of the post-A4-B bottleneck; fewer waves with more register-resident output per wave better match gfx1151 and AITER's RDNA default.
+  - The remaining large-S gap to AITER is now roughly `1.6-1.7x` for end-to-end HIP and `1.55-1.65x` for prepacked fwd.
+  - Next structural target remains the `Si` LDS round trip and row softmax distribution.
+  - Before rewriting `Si`, profile LDS bank conflicts against AITER and use ablations to locate whether conflicts come from QK score stores, row-softmax `Si` read/write, or PV fragment loads.
+
 ### A5: Layout Experiment
 
 - Add an NHD wrapper or benchmark provider that passes explicit strides to the same kernel logic.
@@ -273,7 +300,8 @@ Decision for now:
   - is the stall dominated by global V loads, LDS traffic, VALU softmax/exp, barriers, or WMMA under-issue;
   - did V prepack convert strided memory into coalesced loads;
   - did register pressure reduce occupancy enough to erase online-attention gains;
-  - are `exp2f` and fp16/fp32 conversions generating unexpected code.
+  - are `exp2f` and fp16/fp32 conversions generating unexpected code;
+  - does AITER have lower or zero LDS bank conflicts, and if so which exact LDS access pattern in our kernel is responsible for the difference.
 
 #### A6-A: AITER Kernel-Trace Baseline
 
@@ -322,6 +350,37 @@ Decision for now:
   - Stop pursuing standalone VT prepack as A3.
   - Build A4 around a specialized `Br=128`, `Bc=32`, `D=128`, non-causal, full-block kernel that keeps online softmax state and output accumulators out of LDS as much as possible.
 
+#### A6-C: LDS Bank Conflict Profile and Swizzle Design
+
+- Status: TODO.
+- Goal:
+  - measure LDS bank conflict rate for AITER and the current HIP A4-C path at the same logical workload, starting with `B=1`, `H=24`, `S=4096`, `D=128`;
+  - if AITER reports zero or negligible bank conflicts, treat zero/negligible conflicts as the target for the HIP path too;
+  - do not assume row-major `Si` is acceptable just because A4-C improved throughput.
+- Initial profiler command shape:
+  - AITER: use `/home/wd/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/bin/rocprofv3 --kernel-trace --stats --pmc LDSBankConflict ... -- /home/wd/venv_torch/bin/python tmp_attn_fp8kv_analysis/profile_attn_aiter.py -N 4096 --iters 5 --warmup 2`;
+  - HIP: use the same profiler binary and PMC with `tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_configured --iters 5 --warmup 2 --config 128,32,8`;
+  - collect kernel duration, `LDSBankConflict`, VGPR, LDS size, and generated kernel name in the same ledger row.
+- Normalize/interpretation:
+  - compare raw `LDSBankConflict` for the dominant fwd kernels first;
+  - if extra LDS counters are available, also normalize by LDS instructions/accesses so a shorter kernel is not mistaken for a lower conflict rate;
+  - if counter availability differs by ROCProfiler build, record that explicitly rather than mixing profiler versions.
+- HIP ablations to locate conflict source:
+  - full A4-C kernel as baseline;
+  - QK + row-softmax only: keep `mul_A_BT` and `Si` softmax read/write, skip PV and final output;
+  - PV-only synthetic path: pre-fill or generate a stable probability tile in `Si`, skip QK and softmax, run only the PV fragment-load/update path;
+  - softmax-only path: exercise row-wise `Si` vector read/write without WMMA to isolate the `tx < Br` access pattern;
+  - scalar-row path: isolate `alpha`/`inv_l` LDS traffic to verify it is not the measured conflict source.
+- Swizzle design candidates:
+  - start with a minimal padded `Si` row stride to test whether the current `Bc=32` row stride causes same-bank row starts;
+  - then test an AITER-like phase/swizzled layout for the `Si` tile that preserves efficient row softmax reads while improving PV dot-operand LDS reads;
+  - inspect generated ISA for `ds_load`/`ds_store` width and address pattern after each layout change.
+- Keep rule for swizzle experiments:
+  - correctness must still pass `/home/wd/venv_torch/bin/python test_attn_hip.py`;
+  - `S=4096` and `S=8192` benchmark must improve or stay flat;
+  - `LDSBankConflict` must move materially toward AITER's rate;
+  - if conflicts drop but runtime regresses, reject the swizzle and document whether the cost was address arithmetic, poorer vectorization, or register pressure.
+
 ### A7: Sage-Inspired Accuracy/Quantization Follow-Ups
 
 - Only run after a faster fwd baseline exists.
@@ -346,7 +405,9 @@ Decision for now:
 
 ## Durable Findings
 
-- The current attention kernel is structurally behind AITER by about `2.8-2.9x` at large S.
+- The pre-A4 baseline was structurally behind AITER by about `2.8-2.9x` at large S.
+- A4-B/A4-C reduced the large-S gap from about `2.8-2.9x` to about `1.6-1.7x`; the current path is still structurally behind AITER but no longer dominated by the output-accumulator LDS round trip.
+- The current bank-conflict rate is unknown after A4-C. It must be measured against AITER before choosing between a pure register-score rewrite and an intermediate `Si` swizzle/padding design.
 - The high-priority issues are not likely fixed by only changing autotune order:
   - full score/probability materialization in LDS;
   - repeated output accumulator materialization in fp16 LDS;
