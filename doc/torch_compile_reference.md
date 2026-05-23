@@ -73,7 +73,7 @@ Launch/resources (from `kernels` table):
 - `vgpr_count = 256`, `sgpr_count = 128`
 - min/avg/max duration: `37.657 ms / 40.186 ms / 41.316 ms`
 
-Occupancy implication (using `GFX1151_REFERENCE.md` limits):
+Occupancy implication (using `gfx1151_reference.md` limits):
 - Wave size is 32; `workgroup_x=128` => 4 waves/workgroup.
 - VGPR-limited waves/SIMD: `floor(1536 / 256) = 6`.
 - LDS-limited workgroups/WGP: `floor(128KB / 17408) = 7` => `floor(7 * 4 / 4) = 7` waves/SIMD from LDS.
