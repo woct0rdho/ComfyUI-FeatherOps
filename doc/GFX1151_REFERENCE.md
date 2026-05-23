@@ -37,10 +37,11 @@ waves_by_lds_per_simd = floor(workgroups_by_lds * waves_per_workgroup / 4)
 occupancy_per_simd = min(waves_by_vgpr, waves_by_lds_per_simd, 16) / 16
 ```
 
-- Example 1: `192 VGPR allocated per wave` -> `floor(1536/192) = 8 waves per SIMD` -> `50%` occupancy limit by VGPR.
-- Example 2: `65536 bytes LDS per workgroup` and `4 waves per workgroup` -> `floor(131072/65536) = 2 workgroups per WGP` -> `floor(2 * 4 / 4) = 2 waves per SIMD` -> `12.5%` occupancy limit by LDS.
+Examples:
+- `192 VGPR allocated per wave` -> `floor(1536/192) = 8 waves per SIMD` -> `50%` occupancy limit by VGPR.
+- `65536 bytes LDS per workgroup` and `4 waves per workgroup` -> `floor(131072/65536) = 2 workgroups per WGP` -> `floor(2 * 4 / 4) = 2 waves per SIMD` -> `12.5%` occupancy limit by LDS.
 
-*Note on LDS capacity:* A WGP has **128 KB** of physical LDS (64 KB per CU). However, the architecture restricts a single workgroup to allocating a maximum of **64 KB**. Therefore, tools like rocminfo and sysfs will report 64 KB (the software allocation limit per-workgroup, which corresponds to the per-CU physical size), but a WGP can physically fit two such 64 KB workgroups simultaneously. Occupancy bottlenecks on LDS only when the combined LDS requests of all active workgroups exceed the 128 KB per-WGP limit.
+Note on LDS capacity: A WGP has **128 KB** of physical LDS (64 KB per CU). However, the architecture restricts a single workgroup to allocating a maximum of **64 KB**. Therefore, tools like rocminfo and sysfs will report 64 KB (the software allocation limit per-workgroup, which corresponds to the per-CU physical size), but a WGP can physically fit two such 64 KB workgroups simultaneously. Occupancy bottlenecks on LDS only when the combined LDS requests of all active workgroups exceed the 128 KB per-WGP limit.
 
 ## WMMA Facts
 
@@ -69,7 +70,8 @@ rocprofv3 --kernel-trace --stats \
 
 To restrict output to the target kernel, use a kernel filter:
 ```bash
-rocprofv3 --kernel-trace --stats --pmc LDSBankConflict \
+rocprofv3 --kernel-trace --stats \
+  --pmc LDSBankConflict \
   --kernel-include-regex <kernel_regex> \
   -d <out_dir> -o <prefix> -- python <script>.py
 ```
@@ -86,11 +88,11 @@ Known usable counters in this project:
 - `L2CacheHit`
 - `VALUInsts`
 
-Known pitfalls:
+Pitfalls:
 - Error 38 for unsupported/overpacked counter sets.
 - JIT and lock-file issues can make profiling look hung.
-- Profile overhead changes wall-time; use benchmark scripts for performance decisions.
-- If a counter-collection run produces no DB, first verify the output directory was actually created; on gfx1151, the above `L2CacheHit + VALUInsts + LDSBankConflict` combination does work.
+- Profile overhead changes wall-time. Use benchmark scripts for performance decisions.
+- If a counter-collection run produces no DB, first verify the output directory was actually created. On gfx1151, the above `L2CacheHit + VALUInsts + LDSBankConflict` combination does work.
 
 ## PC Sampling
 
@@ -98,47 +100,47 @@ PC sampling is available on gfx1151 using a custom-built amdgpu driver, ROCr, an
 
 ### Running PC Sampling
 
-Use `$ROCM_PATH/bin/rocprofv3` directly (not the venv wrapper, which loads stock libraries without GFX11 PC sampling support). Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling.
+Use `$ROCM_PATH/bin/rocprofv3` (not the one in the venv `bin/`, which loads stock libraries without gfx1151 PC sampling support). Both `host_trap` and `stochastic` methods are supported. Stochastic provides precise zero-skid instruction sampling, while host-trap is software-driven and can have sampling skid.
 
-**For Host-Trap (Time-based):**
+For Host-Trap (Time-based):
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
   --pc-sampling-method host_trap \
   --pc-sampling-unit time \
   --pc-sampling-interval 5000 \
-  -d <out_dir> \
-  -o <prefix> \
-  -- python <script>.py
+  -d <out_dir> -o <prefix> -- python <script>.py
 ```
+
 - `--pc-sampling-interval 5000`: scan interval in microseconds (5ms).
 
-**For Stochastic (Cycle-based):**
+For Stochastic (Cycle-based):
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
   --pc-sampling-method stochastic \
   --pc-sampling-unit cycles \
   --pc-sampling-interval 1048576 \
-  -d <out_dir> \
-  -o <prefix> \
-  -- python <script>.py
+  -d <out_dir> -o <prefix> -- python <script>.py
 ```
-- **Important:** GFX11.5 hardware stochastic sampling *only* supports `cycles` (not `time`), and the interval *must* be a power of 2 (e.g., `1048576` cycles). Using `time` or non-power-of-2 intervals will result in a "configuration is not supported" error.
-- Default output is SQLite (rocpd format) with a `rocpd_pc_sampling` table
-  containing columns: `timestamp`, `exec_mask`, `dispatch_id`, `instruction`,
-  `instruction_comment`, `correlation_id`.
-- Add `-f csv` for CSV output instead (columns match the DB schema).
-- rocprofv3 decodes PCs to instruction text directly (no manual
-  PC-to-disassembly mapping needed).
+
+- GFX11.5 hardware stochastic sampling only supports `cycles` (not `time`), and the interval must be a power of 2 (e.g., `1048576` cycles). Using `time` or non-power-of-2 intervals will result in a "configuration is not supported" error.
+- Default output is SQLite (rocpd format). Current rocpd schema version remains `4` for internal PC-sampling output.
+- `rocpd_pc_sampling` contains common sample columns plus `method`: `method`, `timestamp`, `exec_mask`, `dispatch_id`, `instruction`, `instruction_comment`, `correlation_id`.
+- `method` is either `host_trap` or `stochastic`, so mixed-method databases are unambiguous.
+- Stochastic rocpd rows also include the same decoded fields exposed by stochastic CSV: `wave_issued_instruction`, `instruction_type`, `stall_reason`, and `wave_count`. These columns are null for host-trap rows.
+- Add `-f csv` for CSV output when a flat text artifact is easier to inspect.
+- rocprofv3 decodes PCs to instruction text directly (no manual PC-to-disassembly mapping needed).
+- gfx1151 stochastic metadata uses the local KFD IOCTL v1.5/gc12-style layout: raw instruction type comes from `SQ_PERF_SNAPSHOT_DATA[5:2]`, stall reason from `[8:6]`, sampling-lock error from bit 14, wave count from `SQ_PERF_SNAPSHOT_DATA1[5:0]`, and arbiter issue/stall state from `DATA1[24:9]`.
+- Conditional branch samples preserve the raw hardware branch taken/not-taken outcome. Decoded `s_cbranch*` text alone should not be treated as proof that the branch was taken.
 
 ### Interpreting PC Sampling Data
 
-A critical architectural detail of PC sampling is that it records the instruction the program counter (PC) is currently pointing to, which is the instruction **waiting to be issued**. It does *not* necessarily record instructions currently executing in the pipeline.
+For stochastic PC sampling, a critical architectural detail is that it records the instruction the program counter (PC) is currently pointing to, which is the instruction **waiting to be issued**. It does not necessarily record instructions currently executing in the pipeline. Host-trap PC sampling can also report nearby instructions because it is interrupt/skid based.
 
-If an instruction has a high sample count, it means the sequencer spent a long time stalled trying to *issue* that instruction, not necessarily that the instruction took a long time to compute.
+If an instruction has a high sample count, it means the sequencer spent a long time stalled trying to issue that instruction, not necessarily that the instruction took a long time to compute.
 
-**Canonical Examples:**
-1. **Instruction Fetch Stalls (e.g., `v_perm_b32`):** A `v_wmma` executes in 32 cycles, while a `v_perm_b32` executes in 1 cycle. However, if you use inline 32-bit literal constants (e.g., `0x30c020c`), the `v_perm_b32` becomes a massive 96-bit (3 DWORD) instruction. When the sequencer tries to fetch these massive instructions for multiple concurrent waves, it chokes the instruction fetch frontend. The PC freezes, pointing at the `v_perm` instruction for dozens of cycles waiting for instruction memory. Thus, `v_perm_b32` will incorrectly appear to take more "time" than `v_wmma` in the PC trace. It's actually an *instruction fetch stall*.
-2. **Structural Queue Stalls (e.g., `ds_load_b128`):** A wave issuing `ds_load_b128` requests 512 bytes of LDS data. The LDS unit can process 128 bytes/cycle, so one load takes 4 cycles. If 8 resident waves constantly fire these massive loads, the internal LDS memory instruction queue becomes fully saturated. The sequencer is structurally blocked from issuing further LDS instructions. During this wait, the PC is frozen pointing at the blocked `ds_load`, resulting in massive sample counts. This is a *queue-full stall*, not execution time.
+Examples:
+- Instruction Fetch Stalls (e.g., `v_perm_b32`): A `v_wmma` executes in 32 cycles, while a `v_perm_b32` executes in 1 cycle. However, if you use inline 32-bit literal constants (e.g., `0x30c020c`), the `v_perm_b32` becomes a massive 96-bit (3 DWORD) instruction. When the sequencer tries to fetch these massive instructions for multiple concurrent waves, it chokes the instruction fetch frontend. The PC freezes, pointing at the `v_perm` instruction for dozens of cycles waiting for instruction memory. Thus, `v_perm_b32` will incorrectly appear to take more "time" than `v_wmma` in the PC trace. It's actually an instruction fetch stall.
+- Structural Queue Stalls (e.g., `ds_load_b128`): A wave issuing `ds_load_b128` requests 512 bytes of LDS data. The LDS unit can process 128 bytes/cycle, so one load takes 4 cycles. If 8 resident waves constantly fire these massive loads, the internal LDS memory instruction queue becomes fully saturated. The sequencer is structurally blocked from issuing further LDS instructions. During this wait, the PC is frozen pointing at the blocked `ds_load`, resulting in massive sample counts. This is a queue-full stall, not execution time.
 
 ### Querying the DB
 
@@ -177,41 +179,56 @@ FROM rocpd_pc_sampling GROUP BY instruction ORDER BY cnt DESC LIMIT 20;
 
 ### Typical Sample Counts
 
-At `--pc-sampling-interval 5000` with 200 iterations of an N=8192 matmul
-(~7s wall time):
-- Old SQ_IND driver: ~570K samples (reads all active waves per scan)
-- Host-trap driver (mainline): ~10K samples (traps one wave per SIMD/slot per SQ_CMD)
+At `--pc-sampling-interval 5000` with 200 iterations of an N=8192 matmul (~7s wall time):
+- Old `SQ_IND` driver: ~570K samples (reads all active waves per scan)
+- Host-trap driver (mainline): ~10K samples (traps one wave per SIMD/slot per `SQ_CMD`)
 
-### Kernel dmesg Verification
+### Optional Kernel dmesg Verification
+
+Some debug driver builds log PC-sampling worker activity. Production or quieter builds may not emit these lines.
 
 ```bash
 dmesg | grep pcs
-# Expected: "pcs: thread started interval_us=5000 vmid=N"
-# Expected: "pcs: thread exiting, sent NNN traps"
+# Possible debug output: "pcs: thread started interval_us=5000 vmid=N"
+# Possible debug output: "pcs: thread exiting, sent NNN traps"
 ```
 
 ### Overlap Measurement (Alternative)
 
-When PC sampling is not available (e.g. stock driver), overlap can be
-estimated by controlled mode decomposition (`full`, `no_overlap`,
-`comm_only`, `comp_only`). See experiment P6-A/P6-B in the e5m2
-optimization plan for details.
+When PC sampling is not available (e.g. stock driver), overlap can be estimated by controlled mode decomposition (`full`, `no_overlap`, `comm_only`, `comp_only`). See experiment P6-A/P6-B in the e5m2 optimization plan for details.
 
 ## Thread Tracing
 
-Thread tracing captures per-wave instruction execution timelines. It is supported on gfx1151 and does not require a custom kernel (works with mainline driver).
+Thread tracing captures per-wave instruction execution timelines. The current gfx1151 support is in userspace AQLprofile/ROCProfiler. No direct SQTT/ATT kernel register-programming change is required.
 
-**Running thread tracing:**
+Running thread tracing:
 ```bash
 $ROCM_PATH/bin/rocprofv3 --att -d <out_dir> -o <prefix> -- python <script>.py
 ```
 
-Useful gfx1151-specific notes:
-- By default, it only traces the FIRST dispatch of each kernel. If your script loops over the kernel multiple times, only the first instance is captured, so reduce `N_ITER` when possible.
+Use a rocprofv3 binary and ROCProfiler libraries from the same local/custom stack. If running directly from the local build tree, make sure its `lib/` and `lib/rocprofiler-sdk/` directories resolve before any stock/venv ROCProfiler libraries.
+
+For detailed traces on gfx1151, prefer the triple-buffer path when available:
+```bash
+$ROCM_PATH/bin/rocprofv3 \
+  --att \
+  --att-triple-buffer \
+  --att-buffer-size 0x100000 \
+  --att-target-cu 1 \
+  --att-simd-select 0x0 \
+  --att-shader-engine-mask 0x1 \
+  -d <out_dir> -o <prefix> -- python <script>.py
+```
+
+The current clean gfx1151 triple-buffer path was validated with one shader engine and reduced scope. FP16 `N=8192` detailed traces with target CU 1, SIMD 0, shader-engine mask `0x1`, and 1 MiB or 16 MiB ATT buffers produce decoded stats and `.att` files without `SQTT data out of bounds`, `Thread trace buffer full!`, GPU reset, or VM fault. The large `N=8192` trace can still report `Wave incomplete`, so treat per-wave timelines as partial when that warning appears.
+
+- By default, it only traces the first dispatch of each kernel. If your script loops over the kernel multiple times, only the first instance is captured, so reduce `N_ITER` when possible.
 - If the target kernel is not the first dispatch (e.g. random generation or copy kernels run first), inspect `ui_output_agent_*/code.json` to find the correct traced dispatch.
 - `--kernel-include-regex <regex>` also applies to thread-trace data and is useful for excluding helper kernels from the decoded output.
-- On gfx10+/gfx11, `--att-simd-select` is a SIMD ID (`0x0..0x3`), not a bitmask. `0x0` is a good starting choice on gfx1151.
-- A safer reduced-scope command is:
+- On gfx10/11, `--att-simd-select` is a SIMD ID (`0x0..0x3`), not a bitmask. `0x0` is a good starting choice on gfx1151.
+- If a run exits successfully but the selected CU/SIMD saw no target wave, current local tooling warns `ATT decode produced no target CU/SIMD wave instruction records` and emits zero-hit disassembly for occupancy-reported kernels. Older builds may instead leave `stats_*.csv` as only a header and `code.json` as `code: null`. In either case, retry with a larger workload or a different `--att-target-cu`/`--att-simd-select` for instruction timing data.
+- Older local builds could abort before the workload with `Configuration request occurred outside of valid rocprofiler configuration period` when rocprofv3 was configured twice. Use a build with the duplicate-configure guard, or rebuild the local ROCProfiler stack before diagnosing ATT itself.
+- A safer reduced-scope single-buffer command is:
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
   --att \
@@ -221,7 +238,7 @@ $ROCM_PATH/bin/rocprofv3 \
   --att-shader-engine-mask 0x1 \
   -d <out_dir> -o <prefix> -- python <script>.py
 ```
-- For large or unstable kernels on gfx1151, prefer no-detail ATT first:
+- For unknown or unstable kernels on gfx1151, prefer no-detail ATT first:
 ```bash
 $ROCM_PATH/bin/rocprofv3 \
   --att \
@@ -233,23 +250,27 @@ $ROCM_PATH/bin/rocprofv3 \
 ```
 - Smaller `--att-buffer-size` values are valid (minimum 1 MB), but if you see `Thread trace buffer full!`, the trace is partial and you should increase the buffer or reduce trace scope/workload.
 - If you use `--att-consecutive-kernels`, rocprofv3 switches to device-mode ATT. In that mode, `--att-serialize-all` is invalid and setup fails with error 19 (`INVALID_ARGUMENT`).
-- For unstable kernels or if a full-size trace causes a reset, first try a smaller problem size (e.g. `N=2048` or `N=4096`) and the reduced-scope command above before attempting `N=8192`.
-- `--att-no-detail` is validated on this machine: it can still emit `Thread trace buffer full!`, but it avoids the `N=8192` detailed-trace reset seen on the FP16 kernel.
+- `--att-triple-buffer --selected-regions` is routed correctly in the current stack. Older builds could incorrectly conflict with forced consecutive-kernel mode.
+- For new kernels or if a full-size trace causes a reset, first try a smaller problem size (e.g. `N=2048` or `N=4096`) and the reduced-scope or triple-buffer command above before attempting `N=8192`.
+- `--att-no-detail` is validated on this machine as a low-volume fallback. Detailed FP16 `N=8192` with triple-buffering is validated for artifact/stats generation on this machine with 1 MiB and 16 MiB ATT buffers, but `Wave incomplete` means some per-wave trace timelines can still be partial.
+- `Wave incomplete` means the decoder saw a wave start but did not see its matching `WAVE_END` token before the captured trace ended. This is a partial-tail warning, not the same as `Data Lost` or `Thread trace buffer full!`.
+- If you see `SQTT data out of bounds` on gfx1151 finalization, verify that you are using a build with the gfx115x write-pointer offset fix. Valid hardware `SQ_THREAD_TRACE_WPTR` offsets are multiplied by 32 and used directly when within buffer capacity.
 
-**Outputs:**
+Outputs:
 - `stats_*.csv`: Aggregated latency, stall, and idle cycle counts for every instruction in the kernel.
 - `*.att`: Raw SQTT binary trace data.
+- In triple-buffer mode, multiple chunks for one dispatch append to the same `.att` file. Older builds could truncate earlier chunks.
 - `ui_output_agent_*/`: Directory containing per-wave JSON files (e.g. `se0_sm0_sl0_wv0.json`), `code.json`, and occupancy/timeline metadata.
 - In `--att-no-detail` mode, `code.json` is expected to contain `"code": null` and `stats_*.csv` may contain only the header row. The useful outputs are `occupancy.json`, `wstates*.json`, `realtime.json`, and the wave-slot JSON files.
 
 ### Analyzing Thread Trace Data
 
-You can load the `.att` file or the `ui_output_agent_*/` directory into the **ROCprof Compute Viewer** to visualize the overlap between memory operations (LDS/Global) and compute (WMMA) on a timeline.
+For human, you can load the `.att` file or the `ui_output_agent_*/` directory into ROCprof Compute Viewer to visualize the overlap between memory operations (LDS/Global) and compute (WMMA) on a timeline.
 
-Alternatively, you can write python scripts using `matplotlib` and `pandas` to programmatically plot the timeline directly from the `wave_*.json` and `code.json` pairs.
+For AI, you can write python scripts to analyze the `wave_*.json` and `code.json` pairs. You can plot the timeline using matplotlib, and use your visual ability to assess it.
 
-**Important Pitfalls to Remember:**
-1. **Single-Wave Perspective:** A trace timeline only plots the execution of *one specific wave* on *one specific SIMD*. If you see a massive sync stall (e.g. `s_waitcnt vmcnt`), that single wave is indeed completely stalled.
-2. **Macro-Level Hiding (Occupancy):** Do not confuse a single-wave stall with global GPU starvation. For example, a single wave might spend 60% of its time stalled on global memory (`vmcnt`), but if occupancy is 8 waves per SIMD, the hardware scheduler seamlessly context-switches to the other 7 resident waves. This allows the physical Vector ALUs (Matrix Cores) to remain busy computing `v_wmma` instructions for other waves, hiding the latency globally and achieving high TFLOPS (e.g., ~75% utilization).
-3. **Internal Bottleneck (The "FP Convert Tax"):** To find the true *internal* kernel bottleneck, calculate the ratio of instructions executed *within the active math loop phase* (ignoring the global wait stalls). For instance, unpacking fp8 data on RDNA3.5 requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma`. If this unpacking takes 23% of the math pipeline time, your maximum possible WMMA utilization is hard-capped at 77%.
-4. **SQTT Profiling Overhead:** Thread tracing (`--att`) forces the hardware sequencer (SQ) to stall instruction issue when its internal trace token FIFO fills up, waiting for trace data to be written to VRAM (`SQ_STALL_EN` and `SPI_STALL_EN`). This stuttering loop artificially inflates the wall-clock cycles between instructions. Therefore, if you manually calculate WMMA utilization from trace data (e.g., `total_wmma_busy_cycles / total_trace_duration_cycles`), the result (e.g., ~30%) will be drastically lower than the true benchmarked utilization (e.g., ~75%) because the trace duration is heavily inflated by profiling stalls.
+Pitfalls:
+- Single-Wave Perspective: A trace timeline only plots the execution of one specific wave on one specific SIMD. If you see a massive sync stall (e.g. `s_waitcnt vmcnt`), that single wave is indeed completely stalled.
+- Macro-Level Hiding (Occupancy): Do not confuse a single-wave stall with global GPU starvation. For example, a single wave might spend 60% of its time stalled on global memory (`vmcnt`), but if occupancy is 8 waves per SIMD, the hardware scheduler seamlessly context-switches to the other 7 resident waves. This allows the physical Vector ALUs (Matrix Cores) to remain busy computing `v_wmma` instructions for other waves, hiding the latency globally and achieving high TFLOPS (e.g., ~75% utilization).
+- Internal Bottleneck (The "FP Convert Tax"): To find the true internal kernel bottleneck, calculate the ratio of instructions executed within the active math loop phase (ignoring the global wait stalls). For instance, unpacking fp8 data on RDNA3.5 requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma`. If this unpacking takes 23% of the math pipeline time, your maximum possible WMMA utilization is hard-capped at 77%.
+- SQTT Profiling Overhead: Thread tracing (`--att`) forces the hardware sequencer (SQ) to stall instruction issue when its internal trace token FIFO fills up, waiting for trace data to be written to VRAM (`SQ_STALL_EN` and `SPI_STALL_EN`). This stuttering loop artificially inflates the wall-clock cycles between instructions. Therefore, if you manually calculate WMMA utilization from trace data (e.g., `total_wmma_busy_cycles / total_trace_duration_cycles`), the result (e.g., ~30%) will be drastically lower than the true benchmarked utilization (e.g., ~75%) because the trace duration is heavily inflated by profiling stalls.
