@@ -354,6 +354,7 @@ fwd_kernel_reg_o_d128(
     const float scale)
 {
     constexpr int kD = 128;
+    constexpr int kSiStride = Bc + 8;
     constexpr int kRegTiles = ((Br * kD) / (kWmmaM * kWmmaN) + N_WAVES - 1) / N_WAVES;
 
     const int q_offset = blockIdx.x * q_stride0 + blockIdx.y * q_stride1;
@@ -369,7 +370,7 @@ fwd_kernel_reg_o_d128(
 
     extern __shared__ half_bits_t sram[];
     half_bits_t* __restrict__ const Si = &sram[0];
-    float* __restrict__ const alpha = reinterpret_cast<float*>(Si + Br * Bc);
+    float* __restrict__ const alpha = reinterpret_cast<float*>(Si + Br * kSiStride);
     float* __restrict__ const inv_l = alpha + Br;
 
     fp32x8_t fragO[kRegTiles];
@@ -392,14 +393,14 @@ fwd_kernel_reg_o_d128(
         float row_sum = 0;
         float rowmax_diff_exp = 0;
 
-        mul_A_BT<N_WAVES>(Qi, Kj, Si, ld_q, ld_kv, Bc, Br, Bc, kD, scale);
+        mul_A_BT<N_WAVES>(Qi, Kj, Si, ld_q, ld_kv, kSiStride, Br, Bc, kD, scale);
         __syncthreads();
 
         if (tx < Br) {
             float val32 = row_max_new;
             #pragma unroll 2
             for (int i = 0; i < Bc; i += 16) {
-                fp16x16_t val = HALF16(Si[(tx * Bc) + i]);
+                fp16x16_t val = HALF16(Si[(tx * kSiStride) + i]);
                 #pragma unroll
                 for (int j_idx = 0; j_idx < 16; ++j_idx) {
                     val32 = fmaxf(val32, half_bits_to_fp32(val[j_idx]));
@@ -413,7 +414,7 @@ fwd_kernel_reg_o_d128(
 
             #pragma unroll 4
             for (int i = 0; i < Bc; i += 16) {
-                fp16x16_t val = HALF16(Si[(tx * Bc) + i]);
+                fp16x16_t val = HALF16(Si[(tx * kSiStride) + i]);
                 fp32x16_t val_f32;
                 #pragma unroll
                 for (int j_idx = 0; j_idx < 16; ++j_idx) {
@@ -437,14 +438,14 @@ fwd_kernel_reg_o_d128(
                     val[j_idx] = fp32_to_half_bits(val_f32[j_idx]);
                 }
 
-                HALF16W(Si[(tx * Bc) + i]) = val;
+                HALF16W(Si[(tx * kSiStride) + i]) = val;
             }
             l_i = rowmax_diff_exp * l_i + row_sum;
             alpha[tx] = rowmax_diff_exp;
         }
         __syncthreads();
 
-        rescale_mul_add_A_B_reg<N_WAVES, kRegTiles>(Si, Vj, alpha, fragO, Bc, ld_kv, Br, kD, Bc);
+        rescale_mul_add_A_B_reg<N_WAVES, kRegTiles>(Si, Vj, alpha, fragO, kSiStride, ld_kv, Br, kD, Bc);
         __syncthreads();
     }
 
@@ -648,7 +649,8 @@ extern "C" bool launch_attn_fp16_fp8kv(
 
         if constexpr (kBr == 128 && kBc == 32 && (kNW == 16 || kNW == 8)) {
             if (d == 128) {
-                const int sram_sz = kBr * kBc * sizeof(half_bits_t) + 2 * kBr * sizeof(float);
+                const int kSiStride = kBc + 8;
+                const int sram_sz = kBr * kSiStride * sizeof(half_bits_t) + 2 * kBr * sizeof(float);
 
                 hipLaunchKernelGGL(
                     (fwd_kernel_reg_o_d128<kBr, kBc, kNW>),
