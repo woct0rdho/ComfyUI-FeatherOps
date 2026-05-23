@@ -17,11 +17,13 @@ using half_bits_t = uint16_t;
 using fp8e5m2_t = uint8_t;
 
 typedef uint16_t fp16x16_t __attribute__((ext_vector_type(16)));
+typedef uint32_t uint32x4_t __attribute__((ext_vector_type(4)));
 typedef float fp32x8_t __attribute__((ext_vector_type(8)));
 typedef float fp32x16_t __attribute__((ext_vector_type(16)));
 
 #define HALF16(pointer) (reinterpret_cast<const fp16x16_t*>(&(pointer))[0])
 #define HALF16W(pointer) (reinterpret_cast<fp16x16_t*>(&(pointer))[0])
+#define U32X4(pointer) (reinterpret_cast<const uint32x4_t*>(&(pointer))[0])
 
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
@@ -75,14 +77,28 @@ __device__ __forceinline__ half_bits_t fp8e5m2_to_half_bits(const fp8e5m2_t x)
     return static_cast<half_bits_t>(x) << 8;
 }
 
+__device__ __forceinline__ void fp8e5m2x4_to_half2x2(
+    const uint32_t p,
+    uint32_t& out_lo,
+    uint32_t& out_hi)
+{
+    out_lo = __builtin_amdgcn_perm(0u, p, 0x010c000cu);
+    out_hi = __builtin_amdgcn_perm(0u, p, 0x030c020cu);
+}
+
 __device__ __forceinline__ fp16x16_t load_e5m2x16_as_fp16(const fp8e5m2_t* __restrict__ const p)
 {
-    fp16x16_t out;
+    union {
+        fp16x16_t h;
+        uint32_t u32[8];
+    } out;
+    const uint32x4_t packed = U32X4(p[0]);
+
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        out[i] = fp8e5m2_to_half_bits(p[i]);
+    for (int i = 0; i < 4; ++i) {
+        fp8e5m2x4_to_half2x2(packed[i], out.u32[i * 2], out.u32[i * 2 + 1]);
     }
-    return out;
+    return out.h;
 }
 
 __global__ void quantize_kv_e5m2_kernel(
