@@ -479,6 +479,30 @@ Decision for now:
   - static branch count drops from `7` to `1` in the inspected quantizer symbol range;
   - quantizer VGPR metadata increases from about `21` to `26`, but runtime improves, so this is acceptable.
 
+#### A7-C: Packed `u16x2` + `perm` Quantization
+
+- Status: rejected and reverted.
+- Change tested:
+  - rewrite `half_bits4_to_fp8e5m2x4` to use packed `uint16x2_t` lane arithmetic for the branchless RNE step;
+  - use one `__builtin_amdgcn_perm` to stitch the two packed 16-bit results back into fp8x4 bytes;
+  - keep the same four-at-a-time quantization launch shape and correctness gate.
+- Correctness: `python test_attn_hip.py` passed `2/2` configs.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `17.169430 TFLOPS`, prepacked `20.518013 TFLOPS`;
+  - `S=2048`: HIP `22.523227 TFLOPS`, prepacked `24.028999 TFLOPS`;
+  - `S=4096`: HIP `22.436747 TFLOPS`, prepacked `23.491267 TFLOPS`;
+  - `S=8192`: HIP `22.008821 TFLOPS`, prepacked `22.368198 TFLOPS`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1522 ms`, end-to-end `0.7479 ms`;
+  - `S=2048`: quant kernel `0.2815 ms`, end-to-end `2.2884 ms`;
+  - `S=4096`: quant kernel `0.4512 ms`, end-to-end `9.1921 ms`;
+  - `S=8192`: quant kernel `0.7853 ms`, end-to-end `37.9199 ms`.
+- Rejection reason:
+  - the packed vector form did not materially reduce quant time versus the scalar branchless RNE version;
+  - end-to-end HIP regressed slightly at the target sizes, so the extra packing logic was not worth keeping.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the branchless scalar RNE baseline. Per protocol, no benchmark/profile was run after the revert.
+
 ### A8: Shape-Specialized Cleanup
 
 - Status: rejected and reverted.

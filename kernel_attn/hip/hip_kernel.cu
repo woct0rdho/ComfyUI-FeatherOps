@@ -256,7 +256,8 @@ __device__ void store_O_reg(
         const int blk_x = wave_x * kWmmaN;
         const int blk_y = wave_y * kWmmaM;
 
-        if ((blk_x < n) && (blk_y < m)) {
+        __builtin_assume((blk_x < n) && (blk_y < m));
+        {
             #pragma unroll
             for (int ele = 0; ele < 8; ++ele) {
                 const int r = ele * 2 + (lane_id / 16);
