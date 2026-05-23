@@ -38,14 +38,14 @@ Latest benchmark CSV: `attn_hip.csv`.
 
 | S | AITER TFLOPS | HIP TFLOPS | HIP Prepacked TFLOPS | HIP/AITER | AITER ms | HIP ms | HIP Prepacked ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1024 | 22.126897 | 13.720099 | 16.452199 | 62.0% | 0.582 | 0.939 | 0.783 |
-| 2048 | 27.281882 | 18.079397 | 19.902636 | 66.3% | 1.889 | 2.851 | 2.589 |
-| 4096 | 27.408821 | 18.418717 | 19.548234 | 67.2% | 7.522 | 11.193 | 10.546 |
-| 8192 | 27.308256 | 18.570807 | 18.972084 | 68.0% | 30.196 | 44.405 | 43.465 |
+| 1024 | 22.206809 | 17.142909 | 21.126201 | 77.2% | 0.580 | 0.752 | 0.610 |
+| 2048 | 26.918666 | 21.987428 | 24.316010 | 81.7% | 1.915 | 2.344 | 2.120 |
+| 4096 | 27.158958 | 22.175404 | 23.854425 | 81.6% | 7.591 | 9.296 | 8.643 |
+| 8192 | 27.421504 | 21.874637 | 22.315050 | 79.8% | 30.073 | 37.698 | 36.954 |
 
 Interpretation:
-- The HIP kernel is `1.6x` slower at `S=1024` and about `1.45-1.5x` slower at larger S.
-- HIP TFLOPS is still flatter than AITER from `S=1024` to `8192`, but A4-B/A4-C plus A9-A lifted the large-S plateau from about `10 TFLOPS` to about `18-19 TFLOPS`.
+- The HIP kernel is about `1.2-1.3x` slower than AITER on large S after padded `Si` stride.
+- HIP TFLOPS is still flatter than AITER from `S=1024` to `8192`, but A4-B/A4-C plus A9-A plus padded `Si` stride lifted the large-S plateau from about `10 TFLOPS` to about `22-24 TFLOPS`.
 - The large-S gap is too large for tuning-only polish; the current algorithm structure likely dominates.
 - Internal K/V quantization is `O(BHSD)`, while attention is `O(BHS^2D)`, so quantization cannot explain the `S=4096` and `8192` gap by itself. It can still matter at `S=1024` and must be decomposed.
 - A standalone V-transposed prepack prototype was tested, rejected, and removed from the code. See A3/A6 notes for the historical measurements.
@@ -62,6 +62,7 @@ Interpretation:
 - The softmax update is mostly assigned to `tx < Br`, so only one thread per row performs max, exp, sum, probability conversion, and output rescale over full row fragments.
 - The output accumulator is repeatedly rounded through fp16 in LDS after each K/V tile; this is both a performance cost and an accuracy compromise.
 - The specialized A4-B/A4-C path for `(Br=128, Bc=32, N_WAVES in {8, 16}, D=128)` keeps the output accumulator in fp32 registers and stores only `Si`, `alpha`, and final `inv_l` in LDS.
+- The specialized path now pads `Si` row stride from `Bc=32` to `40` half elements to avoid LDS bank conflicts.
 - K loads for QK are naturally row-major and contiguous over `D`.
 - V loads for PV are currently hostile to coalescing: the WMMA fragment needs 16 tokens for a fixed output-dim lane, but row-major V means those 16 fp8 bytes are separated by `D=128` bytes. A standalone `[B,H,D,S]` VT prepack did not help enough; revisit V packing only as part of a new forward structure.
 - For kept shape-specialized paths, prefer divisibility-only contracts and remove boundary / partial-block special handling whenever possible; keep the generic fallback separate if the public API still needs it.
@@ -128,9 +129,9 @@ Decision for now:
 | A3 | REJECT | V fp8 transposed/tile-packed prepack path | `S=4096`: row prepacked `21.59 ms`, VT prepacked `22.19 ms`; VT prepack `2.54 ms` vs row `0.60 ms` | simple `[B,H,D,S]` V transpose did not overcome current forward bottlenecks; code path removed |
 | A4 | KEEP partial | register-resident online softmax/PV prototype for fixed `Br=128`, `Bc=32`, `D=128` | A4-C 8-wave register-output path lifts `S=4096` HIP to `16.53 TFLOPS` and prepacked to `17.48 TFLOPS`; full score-tile rewrite still pending | remove LDS score/prob/output round trips |
 | A5 | TODO | HND vs NHD stride/layout benchmark | pending | decide public layout strategy |
-| A6 | KEEP findings | profile kept or surprising variants with generated-code inspection, PC sampling, bank-conflict PMCs, or thread tracing | AITER/HIP `S=4096` kernel traces captured with `rocprofv3`; bank-conflict profile/ablation is next | explain wins/regressions before further tuning |
+| A6 | KEEP findings | profile kept or surprising variants with generated-code inspection, PC sampling, bank-conflict PMCs, or thread tracing | padded `Si` stride removes HIP `LDSBankConflict` and lifts `S=4096` prepacked to `23.85 TFLOPS` | explain wins/regressions before further tuning |
 | A7 | TODO | optional Sage-inspired K smoothing or scale-bearing quantization experiment | pending | accuracy/headroom only after core fwd is faster |
-| A8 | TODO | shape-specialized cleanup and boundary removal | pending | keep only divisibility-asserted fast paths for fixed target shapes |
+| A8 | REJECT | shape-specialized cleanup and boundary removal | boundary removal on the fixed fast path regressed because the compile-time specialization raised VGPR pressure and lowered throughput | keep only divisibility-asserted fast paths for fixed target shapes |
 | A9 | KEEP partial | perm-based `fp8e5m2x4_to_half2x2` decode | A9-A lifts `S=4096` prepacked to `19.55 TFLOPS`; V-side strided fp8 loads still scalarized | reduce conversion overhead if the combined tolerance gate still passes |
 | A10 | KEEP findings | 128-bit load/store audit | Q/global and LDS tile movement use 128-bit ops; strided fp8 V loads and final output stores are narrower | verify hot-path reads/writes stay at the widest legal vector width |
 
@@ -389,7 +390,36 @@ Decision for now:
   - AITER `attn_fwd` at `S=4096` has `0.0` average `LDSBankConflict`, avg `7492.884 us`, `32768` LDS bytes, and `224` VGPRs;
   - HIP A4-C before A9-A has `65.753` average `LDSBankConflict` (`460.271` total over 7 fwd dispatches), avg `12134.075 us`, `9216` LDS bytes, and `200` VGPRs;
   - HIP A9-A keeps the same bank-conflict count (`65.753` average) while reducing avg fwd profile duration to `10375.665 us` and VGPRs to `192`;
-  - the conflict delta versus AITER is real, but the raw count is small relative to the remaining runtime gap, so swizzle work should follow the remaining fp8/V-load audit rather than preempt it.
+  - padding `Si` row stride to `Bc + 8` removes the conflict count completely and improves runtime materially.
+
+#### A6-D: Padded `Si` Stride
+
+- Status: kept.
+- Change:
+  - only on `fwd_kernel_reg_o_d128`, set `kSiStride = Bc + 8` for the score/probability tile;
+  - use the padded stride in QK stores, row softmax, and PV reads;
+  - dynamic LDS increases from `9216` to `11264` bytes for the kept `(128,32,8)` fast path.
+- Correctness: `~/venv_torch/bin/python test_attn_hip.py` passed `12/12` configs.
+- Benchmark: `~/venv_torch/bin/python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `17.142909 TFLOPS`, prepacked `21.126201 TFLOPS`;
+  - `S=2048`: HIP `21.987428 TFLOPS`, prepacked `24.316010 TFLOPS`;
+  - `S=4096`: HIP `22.175404 TFLOPS`, prepacked `23.854425 TFLOPS`;
+  - `S=8192`: HIP `21.874637 TFLOPS`, prepacked `22.315050 TFLOPS`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1666 ms`, prepacked fwd `0.6130 ms`, end-to-end `0.7542 ms`;
+  - `S=2048`: quant kernel `0.3173 ms`, prepacked fwd `2.1054 ms`, end-to-end `2.3524 ms`;
+  - `S=4096`: quant kernel `0.5979 ms`, prepacked fwd `8.7996 ms`, end-to-end `9.3883 ms`;
+  - `S=8192`: quant kernel `1.1398 ms`, prepacked fwd `37.4236 ms`, end-to-end `38.1249 ms`.
+- Profile: `~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/bin/rocprofv3 --kernel-trace --stats --pmc LDSBankConflict ... -- ~/venv_torch/bin/python tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_configured --iters 5 --warmup 2 --config 128,32,8`.
+- Profile findings:
+  - `fwd_kernel_reg_o_d128<128,32,8>` average duration `8788.344 us`;
+  - `LDSBankConflict` average `0.0`, total `0.0`, matching AITER's zero-conflict baseline;
+  - LDS size `11264` bytes, VGPR `192`, scratch `0`.
+- ISA findings:
+  - static instruction count remains about `1996`, effectively unchanged from A9-A;
+  - static selected memory/decode counts are unchanged: `48` `global_load_b128`, `48` `global_load_d16_u8`, `48` `global_load_d16_hi_u8`, `36` `ds_load_b128`, and `128` `v_perm_b32`;
+  - the speedup is from avoiding bank conflicts in the existing LDS traffic, not from changing global V-load width.
 
 ### A7: Sage-Inspired Accuracy/Quantization Follow-Ups
 
@@ -402,14 +432,22 @@ Decision for now:
 
 ### A8: Shape-Specialized Cleanup
 
-- Only do this on the kept fixed-shape fast paths, not on a generic fallback.
-- Remove boundary / non-divisible special handling whenever the target family is known to be divisible.
-- Assert the required divisibility at kernel entry, like the current `kernel_attn/hip/hip_kernel.cu` path already does for `n % Br`, `n_kv % Bc`, and `d % 32`.
-- Keep the code path simple enough that the compiler can fully specialize the full-block fast path.
-- Keep rule:
-  - correctness must still pass the combined tolerance gate;
-  - `S=4096` and `S=8192` benchmark must improve or stay flat;
-  - do not reintroduce boundary branches unless a real public-shape need forces them.
+- Status: rejected and reverted.
+- Change tested:
+  - remove the `blk_x` / `blk_y` boundary guards from the fixed `fwd_kernel_reg_o_d128` fast path;
+  - make the fixed `Br=128`, `Bc=32`, `D=128` path compile-time full-tile only while leaving the generic fallback path guarded.
+- Correctness: `~/venv_torch/bin/python test_attn_hip.py` passed `12/12` configs.
+- Benchmark: `~/venv_torch/bin/python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `13.289322 TFLOPS`, prepacked `16.092992 TFLOPS`;
+  - `S=2048`: HIP `15.968934 TFLOPS`, prepacked `17.394867 TFLOPS`;
+  - `S=4096`: HIP `16.762173 TFLOPS`, prepacked `17.818590 TFLOPS`;
+  - `S=8192`: HIP `16.804797 TFLOPS`, prepacked `17.177785 TFLOPS`.
+- Rejection reason:
+  - the compile-time `FULL_TILES` split shrank static control flow, but the fixed 8-wave symbol grew to about `256` VGPRs and lost about `1.73 TFLOPS` at `S=4096` compared with A9-A;
+  - the 8-wave kernel still has the same `global_load_d16_u8` / `global_load_d16_hi_u8` V-side pressure, so the structural removal did not attack the real bottleneck;
+  - the 16-wave variant remains the autotune winner on the regressed code path, showing the change made the preferred 8-wave fast path worse instead of better.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed A9-A baseline. Per protocol, no test/benchmark/profile was run after the revert.
 
 ### A9: Perm-Based FP8 Decode
 
@@ -429,8 +467,8 @@ Decision for now:
   - add `fp8e5m2x4_to_half2x2` using `__builtin_amdgcn_perm`;
   - use four packed 32-bit chunks in `load_e5m2x16_as_fp16` for contiguous fp8 K fragments;
   - leave the strided V fp8 path unchanged for this step.
-- Correctness: `/home/wd/venv_torch/bin/python test_attn_hip.py` passed `12/12` configs.
-- Benchmark: `/home/wd/venv_torch/bin/python benchmark_attn_hip.py`.
+- Correctness: `~/venv_torch/bin/python test_attn_hip.py` passed `12/12` configs.
+- Benchmark: `~/venv_torch/bin/python benchmark_attn_hip.py`.
 - Main benchmark results:
   - `S=1024`: HIP `13.720099 TFLOPS`, prepacked `16.452199 TFLOPS`;
   - `S=2048`: HIP `18.079397 TFLOPS`, prepacked `19.902636 TFLOPS`;
@@ -465,6 +503,27 @@ Decision for now:
   - final output stores are scalar half stores (`global_store_b16` / `global_store_d16_hi_b16`), but AITER also emits scalar output stores, so this is not the first target;
   - next width-focused experiment should target V-side fp8 access/decode rather than forcing output stores to 128-bit.
 
+#### A10-A: V Tile Transpose to LDS
+
+- Status: rejected and reverted.
+- Change tested:
+  - preload each `Bc x D` row-major fp8 V tile once per K/V block;
+  - convert it to fp16 in LDS as transposed `[D,Bc]`;
+  - read PV fragments from contiguous LDS rows with `HALF16` instead of repeated strided global fp8 byte loads.
+- Correctness: `~/venv_torch/bin/python test_attn_hip.py` passed `12/12` configs.
+- Benchmark: `~/venv_torch/bin/python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `9.117587 TFLOPS`, prepacked `10.356332 TFLOPS`;
+  - `S=2048`: HIP `10.890340 TFLOPS`, prepacked `11.633517 TFLOPS`;
+  - `S=4096`: HIP `11.625828 TFLOPS`, prepacked `12.107011 TFLOPS`;
+  - `S=8192`: HIP `11.941535 TFLOPS`, prepacked `12.126874 TFLOPS`.
+- Rejection reason:
+  - the change removes the static `global_load_d16_u8` / `global_load_d16_hi_u8` V-side pattern, but replaces it with a per-K/V-tile transpose loop, scalar LDS stores, extra `v_perm_b32`, and a larger dynamic LDS footprint (`9216 -> 17408` bytes);
+  - autotune switches from `(128,32,8)` to `(128,32,16)`, indicating the 8-wave version lost its previous advantage;
+  - generated code for the rejected 8-wave symbol has about `1750` static instructions, `151` VGPRs, `130` static `v_perm_b32`, `48` `ds_load_b128`, `18` `ds_store_b16`, and only `1` static `global_load_b32`; the static code is shorter, but dynamic transpose/preload work dominates;
+  - generated code for the rejected 16-wave symbol has about `1126` static instructions, `115` VGPRs, and `66` static `v_perm_b32`, but runtime remains far below A9-A.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed A9-A baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
 ## Non-Negotiable Run Protocol
 
 1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
@@ -483,7 +542,7 @@ Decision for now:
 - The pre-A4 baseline was structurally behind AITER by about `2.8-2.9x` at large S.
 - A4-B/A4-C reduced the large-S gap from about `2.8-2.9x` to about `1.6-1.7x`; the current path is still structurally behind AITER but no longer dominated by the output-accumulator LDS round trip.
 - A9-A further reduced the large-S gap to about `1.45-1.5x` by shrinking the contiguous K fp8 decode path.
-- AITER reports zero `LDSBankConflict` for `S=4096`; HIP A9-A reports `65.753` average per fwd dispatch. This is real but likely secondary to the remaining strided V fp8 path.
+- Padded `Si` stride further reduced the large-S gap to about `1.2-1.3x` and removed HIP `LDSBankConflict` (`65.753 -> 0.0` average per fwd dispatch at `S=4096`).
 - The 128-bit audit shows Q/global and LDS tile movement are already wide; the next memory-width target is V-side fp8 access/decode, not output stores.
 - The high-priority issues are not likely fixed by only changing autotune order:
   - full score/probability materialization in LDS;
