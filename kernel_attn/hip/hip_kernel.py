@@ -43,6 +43,46 @@ def _(
 attn_hip_configured = _configured_op
 
 
+def quantize_kv_e5m2_out(k: torch.Tensor, v: torch.Tensor, k_fp8: torch.Tensor, v_fp8: torch.Tensor) -> None:
+    torch.ops.feather_attn_fp16.quantize_kv_e5m2.default(k, v, k_fp8, v_fp8)
+
+
+def quantize_kv_e5m2(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    k_fp8 = torch.empty(k.shape, device=k.device, dtype=torch.float8_e5m2)
+    v_fp8 = torch.empty(v.shape, device=v.device, dtype=torch.float8_e5m2)
+    quantize_kv_e5m2_out(k, v, k_fp8, v_fp8)
+    return k_fp8, v_fp8
+
+
+@torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_prepacked_configured", mutates_args=())
+def _prepacked_configured_op(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    br: int,
+    bc: int,
+    n_waves: int,
+) -> torch.Tensor:
+    out = torch.empty_like(q)
+    torch.ops.feather_attn_fp16.attn_fp16_fp8kv_prepacked.default(q, k_fp8, v_fp8, out, br, bc, n_waves)
+    return out
+
+
+@_prepacked_configured_op.register_fake
+def _(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    v_fp8: torch.Tensor,
+    br: int,
+    bc: int,
+    n_waves: int,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+attn_hip_prepacked_configured = _prepacked_configured_op
+
+
 @torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_autotuned", mutates_args=())
 def _autotuned_op(
     q: torch.Tensor,
@@ -84,3 +124,14 @@ def attn_hip(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 
     best_cfg = old_autotune(b, h, n, n_kv, d, _CONFIGS, run_fn, "attn_fp16_fp8kv")
     return _configured_op(q, k, v, *best_cfg)
+
+
+def attn_hip_prepacked(q: torch.Tensor, k_fp8: torch.Tensor, v_fp8: torch.Tensor) -> torch.Tensor:
+    b, h, n, d = q.shape
+    n_kv = k_fp8.shape[2]
+
+    def run_fn(cfg):
+        return _prepacked_configured_op(q, k_fp8, v_fp8, *cfg)
+
+    best_cfg = old_autotune(b, h, n, n_kv, d, _CONFIGS, run_fn, "attn_fp16_fp8kv_prepacked")
+    return _prepacked_configured_op(q, k_fp8, v_fp8, *best_cfg)

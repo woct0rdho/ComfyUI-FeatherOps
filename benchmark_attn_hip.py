@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 
+import csv
 import gc
 
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
-from kernel_attn.hip.hip_kernel import attn_hip
+from kernel_attn.hip.hip_kernel import (
+    attn_hip,
+    attn_hip_prepacked,
+    quantize_kv_e5m2,
+    quantize_kv_e5m2_out,
+)
 
 BATCH = 1
 HEADS = 24
@@ -36,7 +42,7 @@ providers = {
     "aiter": aiter_attn,
     "hip": attn_hip,
 }
-provider_names = list(providers)
+provider_names = ["aiter", "hip", "hip_prepacked"]
 
 
 @triton.testing.perf_report(
@@ -68,10 +74,19 @@ def benchmark(N, provider):
         q = torch.randn((BATCH, HEADS, N, HEAD_DIM), device=device, dtype=torch.float16)
         k = torch.randn((BATCH, HEADS, N, HEAD_DIM), device=device, dtype=torch.float16)
         v = torch.randn((BATCH, HEADS, N, HEAD_DIM), device=device, dtype=torch.float16)
+    elif provider == "hip_prepacked":
+        q = torch.randn((BATCH, HEADS, N, HEAD_DIM), device=device, dtype=torch.float16)
+        k = torch.randn((BATCH, HEADS, N, HEAD_DIM), device=device, dtype=torch.float16)
+        v = torch.randn((BATCH, HEADS, N, HEAD_DIM), device=device, dtype=torch.float16)
+        k_fp8, v_fp8 = quantize_kv_e5m2(k, v)
+        torch.cuda.synchronize()
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 
-    fn = lambda: providers[provider](q, k, v)
+    if provider == "hip_prepacked":
+        fn = lambda: attn_hip_prepacked(q, k_fp8, v_fp8)
+    else:
+        fn = lambda: providers[provider](q, k, v)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=25, rep=100, quantiles=quantiles)
@@ -81,6 +96,60 @@ def benchmark(N, provider):
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
+def _bench_ms(fn):
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, warmup=25, rep=100, quantiles=quantiles)
+    return ms, min_ms, max_ms
+
+
+def benchmark_decomposed():
+    rows = []
+    device = "cuda"
+
+    for n in SEQ_LENS:
+        print("N", n, "decomposed begin")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        q = torch.randn((BATCH, HEADS, n, HEAD_DIM), device=device, dtype=torch.float16)
+        k = torch.randn((BATCH, HEADS, n, HEAD_DIM), device=device, dtype=torch.float16)
+        v = torch.randn((BATCH, HEADS, n, HEAD_DIM), device=device, dtype=torch.float16)
+        k_fp8 = torch.empty(k.shape, device=k.device, dtype=torch.float8_e5m2)
+        v_fp8 = torch.empty(v.shape, device=v.device, dtype=torch.float8_e5m2)
+
+        quantize_kv_e5m2_out(k, v, k_fp8, v_fp8)
+        torch.cuda.synchronize()
+
+        # Trigger eager autotune before the measured decomposition runs.
+        attn_hip(q, k, v)
+        attn_hip_prepacked(q, k_fp8, v_fp8)
+        torch.cuda.synchronize()
+
+        quant_kernel_ms, _, _ = _bench_ms(lambda: quantize_kv_e5m2_out(k, v, k_fp8, v_fp8))
+        quant_alloc_ms, _, _ = _bench_ms(lambda: quantize_kv_e5m2(k, v))
+        prepacked_ms, _, _ = _bench_ms(lambda: attn_hip_prepacked(q, k_fp8, v_fp8))
+        end_to_end_ms, _, _ = _bench_ms(lambda: attn_hip(q, k, v))
+
+        attn_tflops = lambda ms: 4 * BATCH * HEADS * n**2 * HEAD_DIM / ms * 1e-9
+        row = {
+            "N": n,
+            "quant_kernel_ms": quant_kernel_ms,
+            "quant_alloc_ms": quant_alloc_ms,
+            "hip_prepacked_ms": prepacked_ms,
+            "hip_end_to_end_ms": end_to_end_ms,
+            "hip_prepacked_TFLOPS": attn_tflops(prepacked_ms),
+            "hip_end_to_end_TFLOPS": attn_tflops(end_to_end_ms),
+        }
+        rows.append(row)
+        print("N", n, "decomposed end", row)
+
+    with open("attn_hip_decomposed.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 if __name__ == "__main__":
     with torch.inference_mode():
         benchmark.run(print_data=True, save_path="./")
+        benchmark_decomposed()

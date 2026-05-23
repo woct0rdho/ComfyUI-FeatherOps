@@ -445,6 +445,10 @@ extern "C" bool launch_attn_fp16_fp8kv(
         try_launch(ConfigTag<64, 64, 8>{}) ||
         try_launch(ConfigTag<64, 128, 16>{}) ||
         try_launch(ConfigTag<128, 64, 16>{}) ||
+        try_launch(ConfigTag<128, 64, 8>{}) ||
+        try_launch(ConfigTag<128, 32, 16>{}) ||
+        try_launch(ConfigTag<128, 32, 8>{}) ||
+        try_launch(ConfigTag<64, 32, 16>{}) ||
         try_launch(ConfigTag<32, 64, 8>{}) ||
         try_launch(ConfigTag<64, 32, 8>{}) ||
         try_launch(ConfigTag<32, 32, 8>{}) ||
@@ -563,6 +567,152 @@ void attn_fp16_fp8kv(
     STD_TORCH_CHECK(launch_err == hipSuccess, "attn_fp16_fp8kv kernel launch failed: ", hipGetErrorString(launch_err));
 }
 
+void quantize_kv_e5m2(
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    torch::stable::Tensor& k_fp8,
+    torch::stable::Tensor& v_fp8)
+{
+    STD_TORCH_CHECK(k.is_cuda(), "k must be a CUDA tensor");
+    STD_TORCH_CHECK(v.is_cuda(), "v must be a CUDA tensor");
+    STD_TORCH_CHECK(k_fp8.is_cuda(), "k_fp8 must be a CUDA tensor");
+    STD_TORCH_CHECK(v_fp8.is_cuda(), "v_fp8 must be a CUDA tensor");
+
+    const auto device_index = k.get_device_index();
+    STD_TORCH_CHECK(v.get_device_index() == device_index, "v must be on the same device as k");
+    STD_TORCH_CHECK(k_fp8.get_device_index() == device_index, "k_fp8 must be on the same device as k");
+    STD_TORCH_CHECK(v_fp8.get_device_index() == device_index, "v_fp8 must be on the same device as k");
+
+    STD_TORCH_CHECK(k.scalar_type() == torch::stable::ScalarType::Half, "k must be float16");
+    STD_TORCH_CHECK(v.scalar_type() == torch::stable::ScalarType::Half, "v must be float16");
+    STD_TORCH_CHECK(k_fp8.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "k_fp8 must be float8_e5m2");
+    STD_TORCH_CHECK(v_fp8.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "v_fp8 must be float8_e5m2");
+
+    STD_TORCH_CHECK(k.dim() == 4, "k must be 4D [B, H, Nkv, d]");
+    STD_TORCH_CHECK(v.dim() == 4, "v must be 4D [B, H, Nkv, d]");
+    STD_TORCH_CHECK(k_fp8.dim() == 4, "k_fp8 must be 4D [B, H, Nkv, d]");
+    STD_TORCH_CHECK(v_fp8.dim() == 4, "v_fp8 must be 4D [B, H, Nkv, d]");
+
+    const int64_t b = k.size(0);
+    const int64_t h = k.size(1);
+    const int64_t n_kv = k.size(2);
+    const int64_t d = k.size(3);
+
+    STD_TORCH_CHECK(v.size(0) == b && v.size(1) == h && v.size(2) == n_kv && v.size(3) == d, "v shape mismatch");
+    STD_TORCH_CHECK(k_fp8.size(0) == b && k_fp8.size(1) == h && k_fp8.size(2) == n_kv && k_fp8.size(3) == d, "k_fp8 shape mismatch");
+    STD_TORCH_CHECK(v_fp8.size(0) == b && v_fp8.size(1) == h && v_fp8.size(2) == n_kv && v_fp8.size(3) == d, "v_fp8 shape mismatch");
+
+    STD_TORCH_CHECK(k.stride(3) == 1, "k.stride(3) must be 1");
+    STD_TORCH_CHECK(v.stride(3) == 1, "v.stride(3) must be 1");
+    STD_TORCH_CHECK(k_fp8.stride(0) == h * n_kv * d && k_fp8.stride(1) == n_kv * d && k_fp8.stride(2) == d && k_fp8.stride(3) == 1, "k_fp8 must be contiguous");
+    STD_TORCH_CHECK(v_fp8.stride(0) == h * n_kv * d && v_fp8.stride(1) == n_kv * d && v_fp8.stride(2) == d && v_fp8.stride(3) == 1, "v_fp8 must be contiguous");
+
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
+
+    void* raw_stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+
+    const half_bits_t* const k_ptr = reinterpret_cast<const half_bits_t*>(k.const_data_ptr());
+    const half_bits_t* const v_ptr = reinterpret_cast<const half_bits_t*>(v.const_data_ptr());
+    fp8e5m2_t* const k_fp8_ptr = reinterpret_cast<fp8e5m2_t*>(k_fp8.mutable_data_ptr());
+    fp8e5m2_t* const v_fp8_ptr = reinterpret_cast<fp8e5m2_t*>(v_fp8.mutable_data_ptr());
+
+    const int total_kv = static_cast<int>(b * h * n_kv * d);
+    const int threads = 256;
+    const int blocks = (total_kv + threads - 1) / threads;
+    hipLaunchKernelGGL(
+        quantize_kv_e5m2_kernel,
+        dim3(blocks), dim3(threads), 0, stream,
+        k_ptr, v_ptr, k_fp8_ptr, v_fp8_ptr,
+        total_kv,
+        static_cast<int>(h), static_cast<int>(n_kv), static_cast<int>(d),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2));
+    const hipError_t launch_err = hipGetLastError();
+    STD_TORCH_CHECK(launch_err == hipSuccess, "fp8e5m2 quantize kernel launch failed: ", hipGetErrorString(launch_err));
+}
+
+void attn_fp16_fp8kv_prepacked(
+    const torch::stable::Tensor& q,
+    const torch::stable::Tensor& k_fp8,
+    const torch::stable::Tensor& v_fp8,
+    torch::stable::Tensor& o,
+    const int64_t Br,
+    const int64_t Bc,
+    const int64_t N_WAVES)
+{
+    STD_TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+    STD_TORCH_CHECK(k_fp8.is_cuda(), "k_fp8 must be a CUDA tensor");
+    STD_TORCH_CHECK(v_fp8.is_cuda(), "v_fp8 must be a CUDA tensor");
+    STD_TORCH_CHECK(o.is_cuda(), "o must be a CUDA tensor");
+
+    const auto device_index = q.get_device_index();
+    STD_TORCH_CHECK(k_fp8.get_device_index() == device_index, "k_fp8 must be on the same device as q");
+    STD_TORCH_CHECK(v_fp8.get_device_index() == device_index, "v_fp8 must be on the same device as q");
+    STD_TORCH_CHECK(o.get_device_index() == device_index, "o must be on the same device as q");
+
+    STD_TORCH_CHECK(q.scalar_type() == torch::stable::ScalarType::Half, "q must be float16");
+    STD_TORCH_CHECK(k_fp8.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "k_fp8 must be float8_e5m2");
+    STD_TORCH_CHECK(v_fp8.scalar_type() == torch::stable::ScalarType::Float8_e5m2, "v_fp8 must be float8_e5m2");
+    STD_TORCH_CHECK(o.scalar_type() == torch::stable::ScalarType::Half, "o must be float16");
+
+    STD_TORCH_CHECK(q.dim() == 4, "q must be 4D [B, H, N, d]");
+    STD_TORCH_CHECK(k_fp8.dim() == 4, "k_fp8 must be 4D [B, H, Nkv, d]");
+    STD_TORCH_CHECK(v_fp8.dim() == 4, "v_fp8 must be 4D [B, H, Nkv, d]");
+    STD_TORCH_CHECK(o.dim() == 4, "o must be 4D [B, H, N, d]");
+
+    const int64_t b = q.size(0);
+    const int64_t h = q.size(1);
+    const int64_t n = q.size(2);
+    const int64_t d = q.size(3);
+    const int64_t n_kv = k_fp8.size(2);
+
+    STD_TORCH_CHECK(k_fp8.size(0) == b && v_fp8.size(0) == b && o.size(0) == b, "Batch size mismatch");
+    STD_TORCH_CHECK(k_fp8.size(1) == h && v_fp8.size(1) == h && o.size(1) == h, "Head size mismatch");
+    STD_TORCH_CHECK(k_fp8.size(3) == d && v_fp8.size(3) == d && o.size(3) == d, "Head dim mismatch");
+    STD_TORCH_CHECK(v_fp8.size(2) == n_kv, "KV length mismatch");
+    STD_TORCH_CHECK(o.size(2) == n, "Output sequence length mismatch");
+
+    STD_TORCH_CHECK(q.stride(3) == 1, "q.stride(3) must be 1");
+    STD_TORCH_CHECK(o.stride(0) == q.stride(0) && o.stride(1) == q.stride(1) && o.stride(2) == q.stride(2) && o.stride(3) == 1, "o must have q-compatible contiguous-last-dim strides");
+    STD_TORCH_CHECK(k_fp8.stride(0) == h * n_kv * d && k_fp8.stride(1) == n_kv * d && k_fp8.stride(2) == d && k_fp8.stride(3) == 1, "k_fp8 must be contiguous");
+    STD_TORCH_CHECK(v_fp8.stride(0) == h * n_kv * d && v_fp8.stride(1) == n_kv * d && v_fp8.stride(2) == d && v_fp8.stride(3) == 1, "v_fp8 must be contiguous");
+
+    STD_TORCH_CHECK(n % Br == 0, "n must be a multiple of Br");
+    STD_TORCH_CHECK(n_kv % Bc == 0, "n_kv must be a multiple of Bc");
+    STD_TORCH_CHECK(d % 32 == 0, "d must be a multiple of 32");
+
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
+
+    void* raw_stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+
+    const half_bits_t* const q_ptr = reinterpret_cast<const half_bits_t*>(q.const_data_ptr());
+    const fp8e5m2_t* const k_fp8_ptr = reinterpret_cast<const fp8e5m2_t*>(k_fp8.const_data_ptr());
+    const fp8e5m2_t* const v_fp8_ptr = reinterpret_cast<const fp8e5m2_t*>(v_fp8.const_data_ptr());
+    half_bits_t* const o_ptr = reinterpret_cast<half_bits_t*>(o.mutable_data_ptr());
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d));
+    const bool launched = launch_attn_fp16_fp8kv(
+        q_ptr,
+        k_fp8_ptr,
+        v_fp8_ptr,
+        o_ptr,
+        static_cast<int>(b), static_cast<int>(h), static_cast<int>(n), static_cast<int>(d), static_cast<int>(n_kv),
+        q.stride(0), q.stride(1), q.stride(2),
+        k_fp8.stride(0), k_fp8.stride(1), k_fp8.stride(2),
+        scale,
+        static_cast<int>(Br), static_cast<int>(Bc), static_cast<int>(N_WAVES),
+        stream);
+
+    STD_TORCH_CHECK(launched, "Unsupported config Br=", Br, " Bc=", Bc, " N_WAVES=", N_WAVES);
+
+    const hipError_t launch_err = hipGetLastError();
+    STD_TORCH_CHECK(launch_err == hipSuccess, "attn_fp16_fp8kv_prepacked kernel launch failed: ", hipGetErrorString(launch_err));
+}
+
 STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
 {
     m.def(
@@ -577,10 +727,29 @@ STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
         "int Bc, "
         "int N_WAVES"
         ") -> ()");
+    m.def(
+        "quantize_kv_e5m2("
+        "Tensor k, "
+        "Tensor v, "
+        "Tensor(a!) k_fp8, "
+        "Tensor(b!) v_fp8"
+        ") -> ()");
+    m.def(
+        "attn_fp16_fp8kv_prepacked("
+        "Tensor q, "
+        "Tensor k_fp8, "
+        "Tensor v_fp8, "
+        "Tensor(a!) o, "
+        "int Br, "
+        "int Bc, "
+        "int N_WAVES"
+        ") -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
 {
     m.impl("attn_fp16_fp8kv", TORCH_BOX(&attn_fp16_fp8kv));
+    m.impl("quantize_kv_e5m2", TORCH_BOX(&quantize_kv_e5m2));
+    m.impl("attn_fp16_fp8kv_prepacked", TORCH_BOX(&attn_fp16_fp8kv_prepacked));
 }
 #endif
