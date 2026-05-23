@@ -9,10 +9,10 @@ from .utils import CONFIGS as _CONFIGS
 from .utils import generate_autotune_configs, get_compatible_config, old_autotune
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
-load_hip_stable_extension("attn_hip_bf16_ext", cur_dir, "hip_kernel_bf16.cu")
+load_hip_stable_extension("attn_hip_ext", cur_dir, "hip_kernel.cu")
 
 
-@torch.library.custom_op("feather_attn_internal::attn_bf16_configured", mutates_args=())
+@torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_configured", mutates_args=())
 def _configured_op(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -21,8 +21,10 @@ def _configured_op(
     bc: int,
     n_waves: int,
 ) -> torch.Tensor:
+    k_fp8 = torch.empty(k.shape, device=k.device, dtype=torch.float8_e5m2)
+    v_fp8 = torch.empty(v.shape, device=v.device, dtype=torch.float8_e5m2)
     out = torch.empty_like(q)
-    torch.ops.feather_attn.attn_bf16.default(q, k, v, out, br, bc, n_waves)
+    torch.ops.feather_attn_fp16.attn_fp16_fp8kv.default(q, k, v, k_fp8, v_fp8, out, br, bc, n_waves)
     return out
 
 
@@ -38,10 +40,10 @@ def _(
     return torch.empty_like(q)
 
 
-attn_hip_bf16_configured = _configured_op
+attn_hip_configured = _configured_op
 
 
-@torch.library.custom_op("feather_attn_internal::attn_bf16_autotuned", mutates_args=())
+@torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_autotuned", mutates_args=())
 def _autotuned_op(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -70,7 +72,7 @@ def _(
 register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS))
 
 
-def attn_hip_bf16(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def attn_hip(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     if torch.compiler.is_compiling():
         return _autotuned_op(q, k, v)
 
@@ -80,5 +82,5 @@ def attn_hip_bf16(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Te
     def run_fn(cfg):
         return _configured_op(q, k, v, *cfg)
 
-    best_cfg = old_autotune(b, h, n, n_kv, d, _CONFIGS, run_fn, "attn_bf16")
+    best_cfg = old_autotune(b, h, n, n_kv, d, _CONFIGS, run_fn, "attn_fp16_fp8kv")
     return _configured_op(q, k, v, *best_cfg)
