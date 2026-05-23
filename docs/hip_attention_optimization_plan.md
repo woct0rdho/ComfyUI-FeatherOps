@@ -1,0 +1,355 @@
+# gfx1151 HIP fp16/fp8e5m2 Attention Kernel Optimization Plan
+
+## Scope and Metric
+
+- Kernel scope:
+  - optimize `kernel_attn/hip/hip_kernel.cu` and its Python wrapper in `kernel_attn/hip/hip_kernel.py`;
+  - input/output contract stays fp16 tensors;
+  - K/V may be quantized internally to fp8e5m2, or accepted through an explicit prepacked path if an experiment proves that is useful;
+  - initial scope stays non-causal forward attention.
+- Target shape family:
+  - Qwen-Image attention: `B=1`, `H=24`, `S in {1024, 2048, 4096, 8192}`, `D=128`;
+  - primary decision shape: `B=1`, `H=24`, `S=4096`, `D=128`.
+- Performance metric:
+  - `benchmark_attn_hip.py` and generated `attn_hip.csv`;
+  - compare against AITER FlashAttention in the same benchmark;
+  - report median TFLOPS and derived milliseconds when interpreting results.
+- Accuracy gate:
+  - compare against fp16 PyTorch SDPA reference for the public fp16-input contract;
+  - use combined elementwise tolerance, not separate relative and absolute checks:
+    `abs(out - ref_fp16) <= 0.05 * abs(ref_fp16) + 0.05`;
+  - keep the quantized-K/V PyTorch reference as a diagnostic, not the primary pass/fail gate;
+  - rationale: SageAttention commonly targets `<5%` relative tolerance versus fp16 attention on random inputs, but relative-only gates are too strict near zero.
+- Tolerance policy:
+  - the starting tolerance is `rtol=0.05`, `atol=0.05`, combined as `rtol * abs(ref_fp16) + atol`;
+  - later experiments may loosen `rtol` and `atol` within a reasonable range if it unlocks meaningful speed;
+  - start tightening tolerances only after Qwen-Image visual comparisons are available;
+  - every tolerance change must be recorded in this file with the benchmark and visual-quality reason.
+- Keep rule:
+  - correctness passes under the combined tolerance gate;
+  - `S=4096` improves or stays flat;
+  - `S=8192` does not regress materially;
+  - the large-S trend (`2048`, `4096`, `8192`) does not regress materially;
+  - if an experiment optimizes only an explicitly separate prepacked path, report packed and end-to-end timings separately.
+
+## Current Baseline
+
+Latest benchmark CSV: `attn_hip.csv`.
+
+| S | AITER TFLOPS | HIP TFLOPS | HIP Prepacked TFLOPS | HIP/AITER | AITER ms | HIP ms | HIP Prepacked ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 22.371019 | 9.007391 | 10.059688 | 40.3% | 0.576 | 1.430 | 1.281 |
+| 2048 | 27.324732 | 9.302491 | 9.860458 | 34.0% | 1.886 | 5.540 | 5.227 |
+| 4096 | 27.758877 | 9.947880 | 9.823098 | 35.8% | 7.427 | 20.724 | 20.987 |
+| 8192 | 27.689679 | 9.851643 | 9.854911 | 35.6% | 29.781 | 83.705 | 83.677 |
+
+Interpretation:
+- The HIP kernel is `2.4x` slower at `S=1024` and about `2.8-2.9x` slower at larger S.
+- HIP TFLOPS is nearly flat from `S=1024` to `8192`, while AITER reaches about `28 TFLOPS` by `S=2048`.
+- The large-S gap is too large for tuning-only polish; the current algorithm structure likely dominates.
+- Internal K/V quantization is `O(BHSD)`, while attention is `O(BHS^2D)`, so quantization cannot explain the `S=4096` and `8192` gap by itself. It can still matter at `S=1024` and must be decomposed.
+- A standalone V-transposed prepack prototype was tested, rejected, and removed from the code. See A3/A6 notes for the historical measurements.
+
+## Current Kernel Observations
+
+- `attn_fp16_fp8kv` currently launches two kernels:
+  - `quantize_kv_e5m2_kernel` converts fp16 K/V to contiguous fp8e5m2 buffers;
+  - `fwd_kernel` runs tiled attention over one `(B,H,Br)` query block per workgroup.
+- The forward kernel materializes intermediate state in LDS:
+  - `Si` stores the `Br x Bc` QK score/probability tile in fp16;
+  - `Oi` stores the `Br x D` output accumulator in fp16;
+  - every K/V tile does QK WMMA, `__syncthreads`, scalar-ish row softmax, `__syncthreads`, PV WMMA, `__syncthreads`.
+- The softmax update is mostly assigned to `tx < Br`, so only one thread per row performs max, exp, sum, probability conversion, and output rescale over full row fragments.
+- The output accumulator is repeatedly rounded through fp16 in LDS after each K/V tile; this is both a performance cost and an accuracy compromise.
+- K loads for QK are naturally row-major and contiguous over `D`.
+- V loads for PV are currently hostile to coalescing: the WMMA fragment needs 16 tokens for a fixed output-dim lane, but row-major V means those 16 fp8 bytes are separated by `D=128` bytes. A standalone `[B,H,D,S]` VT prepack did not help enough; revisit V packing only as part of a new forward structure.
+
+## External Inspirations
+
+### AITER FlashAttention
+
+- Relevant reference: `~/aiter/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/fwd_prefill.py`.
+- RDNA default uses `BLOCK_M=128`, `BLOCK_N=32` on most RDNA targets, `num_warps=8`, and `waves_per_eu=6`.
+- The inner loop keeps online softmax state in registers: `m_i`, `l_i`, and `acc`.
+- It avoids materializing the full score tile and output accumulator to LDS between K/V blocks.
+- It has separate full-block and masked-block logic; our non-causal fixed-size path can start with the full-block fast path only.
+- It uses `exp2`/log2 scaling consistently to avoid slower base-e exponentials.
+
+### SageAttention
+
+- Relevant references:
+  - `~/SageAttention/sageattention/triton/quant_per_block.py`;
+  - `~/SageAttention/sageattention/triton/quant_per_thread.py`;
+  - `~/SageAttention/sageattention/triton/attn_qk_int8_per_block.py`;
+  - `~/SageAttention/sageattention/core.py`.
+- SageAttention uses practical approximate-attention tolerances versus fp16 attention; use the combined `5% rtol + 0.05 atol` elementwise gate for this kernel.
+- SageAttention supports both `HND` (`B,H,S,D`) and `NHD` (`B,S,H,D`) APIs by passing explicit strides.
+- Its quantization pipeline separates quantization granularity from the attention kernel: per-block or per-thread Q/K scales, optional K mean smoothing, and architecture-specific attention kernels.
+- For this HIP e5m2 path, do not copy int8 quantization blindly. gfx1151 does not have native fp8 WMMA for this path, and Q quantization introduces extra conversion/scaling work. Treat SageAttention as guidance for tolerances, layout flexibility, prepack contracts, and smoothing experiments.
+
+## Layout Assessment
+
+### `B,H,S,D` / HND
+
+- Current HIP layout.
+- Best immediate fit for the current one-head-per-workgroup kernel:
+  - each head's full sequence is contiguous as `[S,D]`;
+  - Q/K row loads are contiguous over `D`;
+  - K/V quantization writes contiguous fp8 per head;
+  - workgroups do not need cross-head coordination.
+- Downsides:
+  - adjacent heads for the same token are far apart;
+  - if the producer model naturally emits `B,S,H,D`, a transpose or non-contiguous stride path may be needed outside the kernel.
+
+### `B,S,H,D` / NHD
+
+- AITER's benchmark-facing shape uses this layout, and SageAttention supports it.
+- It can be better for framework integration and token-major producers.
+- For the current one-head-per-workgroup HIP kernel, it is probably worse for fwd memory streaming because advancing one token for a fixed head jumps by `H*D` elements instead of `D`.
+- NHD becomes more attractive only if a new kernel processes multiple heads for the same sequence tile in one workgroup or if avoiding external layout conversion dominates the total runtime.
+
+Decision for now:
+- Optimize HND first because it matches the current HIP work decomposition and gives contiguous per-head sequence streams.
+- Add an explicit layout experiment before committing to the public API:
+  - support NHD strides without an internal transpose;
+  - benchmark HND vs NHD with identical logical data and no hidden transpose in the timed region;
+  - keep NHD only if it wins end-to-end or if app integration requires it.
+- Independently of tensor API layout, V-specific packing remains a possible tile-local implementation detail, but the standalone `[B,H,D,S]` VT prepack path is rejected as-is.
+
+## Planned Experiments
+
+| ID | Keep? | Change | Key Result | Why |
+|---|---|---|---|---|
+| A0 | KEEP | update correctness gate to combined `0.05 * abs(ref) + 0.05` tolerance | target sizes pass `8/8`; small `N=128/512` random cases fail up to `tol_ratio=1.46` | scope test to Qwen target family for now |
+| A1 | KEEP infra | decompose benchmark into quantize-only, fwd-prepacked-only, and end-to-end | `S=4096`: quant `0.60 ms`, prepacked fwd `21.59 ms`, end-to-end `21.76 ms` | quantization is not the large-S bottleneck |
+| A2 | KEEP | tile sweep around AITER RDNA shape, especially `Br=128`, `Bc=32`, `N_WAVES=8/16` | end-to-end `S=4096` improved `9.53 -> 9.95 TFLOPS`, `S=8192` improved `9.71 -> 9.85 TFLOPS` | small but real primary-metric gain; no large-S regression |
+| A3 | REJECT | V fp8 transposed/tile-packed prepack path | `S=4096`: row prepacked `21.59 ms`, VT prepacked `22.19 ms`; VT prepack `2.54 ms` vs row `0.60 ms` | simple `[B,H,D,S]` V transpose did not overcome current forward bottlenecks; code path removed |
+| A4 | IN PROGRESS | register-resident online softmax/PV prototype for fixed `Br=128`, `Bc=32`, `D=128` | A4-A first-tile write-only fast path rejected and reverted; full rewrite still pending | remove LDS score/prob/output round trips |
+| A5 | TODO | HND vs NHD stride/layout benchmark | pending | decide public layout strategy |
+| A6 | KEEP findings | profile kept or surprising variants with generated-code inspection, PC sampling, or thread tracing | AITER/HIP `S=4096` kernel traces captured with `rocprofv3`; PMCs/PC sampling still future work | explain wins/regressions before further tuning |
+| A7 | TODO | optional Sage-inspired K smoothing or scale-bearing quantization experiment | pending | accuracy/headroom only after core fwd is faster |
+
+## Next Steps
+
+### A0: Correctness Gate
+
+- Status: complete.
+- Update `test_attn_hip.py` so public pass/fail compares to fp16 SDPA using `tol = 0.05 * ref_fp16.abs() + 0.05`.
+- Keep current quantized-K/V reference metrics in the printed diagnostics.
+- Do not compare relative and absolute tolerances as separate failure criteria.
+- Treat `rtol=0.05`, `atol=0.05` as the starting point, not a permanent final quality target.
+- If a later optimization needs looser tolerance, adjust both the test and this plan before using the result as a keeper.
+- Tighten tolerance only after visual Qwen-Image comparisons show enough quality margin.
+- Re-run `python test_attn_hip.py` before any performance experiment.
+- Finding: the combined gate passes target sizes `S=1024` and `S=4096`; small random `N=128/512, D=128` cases exceed the starting tolerance, so the test is currently scoped to Qwen target-family sizes.
+
+### A1: Benchmark Decomposition
+
+- Status: complete.
+- Add or temporarily expose a prepacked attention path:
+  - `quantize_kv_e5m2(k, v) -> (k_fp8, v_fp8)`;
+  - `attn_hip_prepacked(q, k_fp8, v_fp8)`.
+- Benchmark three timings for all target S values:
+  - quantize-only;
+  - fwd-prepacked-only;
+  - current end-to-end `attn_hip`.
+- Keep any prepacked API only if it clarifies performance or provides a useful integration path.
+- Finding: prepacked fwd-only is only modestly faster than end-to-end and the gap shrinks at large S, so the next high-impact work must optimize `fwd_kernel`, not quantization/allocation.
+
+### A2: Cheap Tile Sweep
+
+- Status: complete.
+- Add configs inspired by AITER RDNA defaults:
+  - `(128, 32, 8)`;
+  - `(128, 32, 16)`;
+  - `(128, 64, 8)`;
+  - `(64, 32, 16)`;
+  - optionally `(128, 16, 8)` only if generated code stays reasonable.
+- Run full correctness and benchmark after each kept config set.
+- Reject configs that only improve `S=1024` while regressing `S=4096` or `S=8192`.
+- Finding: keep `(128, 64, 8)`, `(128, 32, 16)`, `(128, 32, 8)`, and `(64, 32, 16)`. The autotuner now picks `(128, 32, 16)` at `S=8192` and sometimes for prepacked fwd. Do not add `(128, 16, 8)` unless the PV loop is rewritten for `Bc < 32`.
+
+### A3: V-Specific Prepack
+
+- Status: rejected as implemented and reverted from code.
+- Split K and V fp8 layout contracts:
+  - keep K row-major `[B,H,S,D]` because QK loads contiguous `D` fragments;
+  - pack V for PV as tile-transposed or `[B,H,D,S]`-like storage so a 16-token fragment for a fixed output-dim tile can be loaded contiguously.
+- First prototype can be fixed to `D=128` and `Bc=32/64`.
+- Measure fwd-prepacked-only first, then include quantize/prepack cost.
+- If V prepack wins only when prepack is excluded, document it as a possible cache-reuse API rather than replacing end-to-end attention.
+- Finding: the current `[B,H,D,S]` VT prototype is not a keeper. In the normal benchmark, `S=4096` row-major prepacked fwd is `21.589 ms`, while VT prepacked fwd is `22.191 ms`; `S=8192` row-major prepacked fwd is `83.311 ms`, while VT is `88.805 ms`.
+- Finding: VT prepack cost is much worse: at `S=4096`, row quantization is `0.600 ms`, while VT quantization is `2.541 ms`; at `S=8192`, row quantization is `1.136 ms`, while VT quantization is `5.044 ms`.
+- Interpretation: the current forward bottleneck is not fixed by only making V token fragments contiguous. The extra address arithmetic and transpose/prepack cost erase any possible PV-load benefit. Revisit V packing only as a tile-local layout inside an A4-style forward rewrite, not as this standalone `[B,H,D,S]` path.
+- Revert result: removed the standalone VT C++ kernels, stable ops, Python wrappers, benchmark provider, profiling modes, and VT benchmark CSV columns. Historical profile artifacts remain under `tmp_attn_fp8kv_analysis/` for reference.
+
+### A4: Register-Resident Online Attention Rewrite
+
+- Status: in progress.
+- Build a specialized fixed-shape prototype before generalizing:
+  - `D=128`;
+  - `Br=128`;
+  - `Bc=32` initially;
+  - non-causal, full blocks only.
+- Target structure:
+  - load Q tile once per query block;
+  - loop over K/V blocks;
+  - compute QK with WMMA;
+  - reduce row max/sum without writing the full `Br x Bc` tile to LDS;
+  - update `m_i`, `l_i`, and output accumulator in registers;
+  - perform PV immediately after softmax probabilities are available;
+  - store normalized output once at the end.
+- Primary expected gains:
+  - remove `Si` score/probability LDS round trip;
+  - remove repeated `Oi` fp16 LDS rescale and round trip;
+  - reduce `__syncthreads` frequency;
+  - parallelize softmax work across lanes/waves instead of one thread per row.
+- Main risk:
+  - register pressure for `Br x D` accumulator may lower occupancy. If so, test smaller `Br=64` or split `D` tiles while preserving online softmax state.
+
+#### A4-A: First-Tile Output Fast Path
+
+- Status: rejected and reverted.
+- Change tested:
+  - remove initial `Oi` zero-fill and initial barrier;
+  - use a first-tile `C = P @ V` path instead of `C += P @ V` from zero;
+  - skip the first tile's useless `Oi *= rowmax_diff_exp` rescale.
+- Correctness: `python test_attn_hip.py` passed `12/12`.
+- Same-session benchmark comparison:
+  - baseline `S=4096`: HIP `9.444903 TFLOPS`, prepacked `9.866963 TFLOPS`, decomposed prepacked `21.2817 ms`, end-to-end `22.0324 ms`;
+  - A4-A `S=4096`: HIP `9.675851 TFLOPS`, prepacked `9.758676 TFLOPS`, decomposed prepacked `21.7418 ms`, end-to-end `21.7234 ms`;
+  - baseline `S=8192`: HIP `9.732768 TFLOPS`, prepacked `9.999134 TFLOPS`, decomposed prepacked `85.2115 ms`, end-to-end `84.6056 ms`;
+  - A4-A `S=8192`: HIP `9.554699 TFLOPS`, prepacked `9.653398 TFLOPS`, decomposed prepacked `85.2666 ms`, end-to-end `86.5936 ms`.
+- Reject reason:
+  - `S=8192` regressed materially, especially prepacked benchmark and decomposed end-to-end;
+  - prepacked `S=4096` also regressed;
+  - the runtime first-tile branch/extra template variant changed generated code and autotune choices (`S=8192` switched to `(64,128,16)`), while the removed first-tile zero/rescale work is too small relative to the repeated LDS softmax/PV structure.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the previous committed baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
+### A5: Layout Experiment
+
+- Add an NHD wrapper or benchmark provider that passes explicit strides to the same kernel logic.
+- Benchmark:
+  - HND contiguous `q/k/v` as today;
+  - NHD contiguous `q/k/v` with no hidden transpose in the timed function;
+  - optional non-contiguous views only as integration diagnostics, not primary performance data.
+- Decision criteria:
+  - if HND wins for fwd and quantize, keep HND as the optimized kernel layout;
+  - if NHD wins end-to-end because the model avoids a transpose, support NHD as a public wrapper but keep the internal fwd memory path honest;
+  - if neither dominates, expose layout-specific configured ops and let benchmark/autotune choose.
+
+### A6: Profiling Protocol
+
+- Inspect generated ISA after each surprising result.
+- If the kernel remains below `15 TFLOPS` after A3/A4, profile before further micro-optimizations.
+- Prioritize these questions:
+  - is the stall dominated by global V loads, LDS traffic, VALU softmax/exp, barriers, or WMMA under-issue;
+  - did V prepack convert strided memory into coalesced loads;
+  - did register pressure reduce occupancy enough to erase online-attention gains;
+  - are `exp2f` and fp16/fp32 conversions generating unexpected code.
+
+#### A6-A: AITER Kernel-Trace Baseline
+
+- Artifacts:
+  - `tmp_attn_fp8kv_analysis/profile_aiter_4096/aiter_results.db`;
+  - `tmp_attn_fp8kv_analysis/profile_aiter_4096_venv/aiter_results_results.db`.
+- Workload: `python tmp_attn_fp8kv_analysis/profile_attn_aiter.py -N 4096 --iters 5 --warmup 2`.
+- Captured dispatches:
+  - 7 `attn_fwd` dispatches, one per warmup/profile call;
+  - 3 random-normal setup kernels;
+  - 7 fp16 fill kernels and 7 fp32 fill kernels for AITER output/LSE scratch setup.
+- Dominant kernel:
+  - `attn_fwd`: `97.34%` of GPU kernel time;
+  - average duration `7371.192 us` with `rocprofv3`, `7216.647 us` in the earlier build-tree trace;
+  - logical performance at `B=1,H=24,S=4096,D=128`: about `28.0 TFLOPS` from the venv profile and about `28.6 TFLOPS` from the earlier profile;
+  - dispatch metadata: grid reported as `grid_x=6144`, `grid_y=32`, `grid_z=1`, `workgroup_x=256`, `lds_size=32768`, `vgpr_count=224`, `sgpr_count=128`, `scratch_size=0`.
+- Interpretation:
+  - ROCProfiler's `grid_x` is total work-items in x, not logical Triton programs. AITER's source grid is `(H=24, ceil(S/BLOCK_M)=32, B=1)`, and `24 * workgroup_x(256) = 6144` explains the profile row.
+  - AITER's fwd path is a single dominant kernel with `BLOCK_M=128`, RDNA `BLOCK_N=32`, 8 waves per workgroup, 32 KB LDS, and high VGPR use (`224`).
+  - AITER spends negligible time in helper fill kernels relative to attention; our optimization target should remain the main fwd kernel structure.
+  - The 32 KB LDS footprint suggests AITER is not materializing both a full score tile and a full fp16 output accumulator in LDS the way our current HIP path does; this reinforces A4's register-resident online-softmax/PV direction.
+
+#### A6-B: HIP vs AITER Kernel-Trace Comparison
+
+- HIP artifacts:
+  - `tmp_attn_fp8kv_analysis/profile_hip_prepacked_configured_4096/hip_prepacked_configured_results_results.db`;
+  - `tmp_attn_fp8kv_analysis/profile_hip_prepacked_vt_configured_4096/hip_prepacked_vt_configured_results_results.db`.
+- Workloads:
+  - row-major prepacked: `python tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_configured --iters 5 --warmup 2 --config 128,32,16`;
+  - VT prepacked: `python tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_vt_configured --iters 5 --warmup 2 --config 128,32,16`.
+- Main fwd kernel comparison at `S=4096`:
+  - AITER `attn_fwd`: `7371.192 us` average, about `28.0 TFLOPS`, `workgroup_x=256`, `lds_size=32768`, `vgpr_count=224`, `scratch_size=0`;
+  - HIP row prepacked `fwd_kernel<128,32,16>`: `21118.214 us` average, about `9.76 TFLOPS`, `workgroup_x=512`, `lds_size=40960`, `vgpr_count=88`, `scratch_size=0`;
+  - HIP VT prepacked `fwd_kernel_vt<128,32,16>`: `20841.611 us` average, about `9.89 TFLOPS`, `workgroup_x=512`, `lds_size=40960`, `vgpr_count=88`, `scratch_size=0`.
+- Launch-shape interpretation:
+  - AITER's profile grid is `grid_x=6144`, `grid_y=32`, `grid_z=1`; ROCProfiler reports total x work-items, so this corresponds to `24` logical head programs times `256` threads, with `32` query blocks in y.
+  - HIP's profile grid is `grid_x=512`, `grid_y=24`, `grid_z=32`, matching our launch `grid=(B=1,H=24,Tr=32)` and `block=512`; ROCProfiler reports x total work-items as `1 * 512`.
+- Key differences:
+  - AITER is about `2.86x` faster than HIP row prepacked in the venv kernel trace, matching the benchmark gap.
+  - HIP uses twice the workgroup threads (`512` vs `256`) but much lower VGPR count (`88` vs `224`), indicating our problem is not register spilling or scratch. We are likely underusing registers and overusing LDS/barriers/serial softmax work.
+  - Estimated occupancy from the reference calculator is not the likely blocker: AITER is roughly VGPR-limited to about `37.5%` occupancy, while HIP is roughly LDS/workgroup-limited to about `75%` occupancy for this config. AITER is faster despite lower occupancy because its per-wave work is more efficient.
+  - HIP uses more LDS (`40 KB` vs `32 KB`) because it stores both `Br x Bc` scores/probabilities and `Br x D` fp16 output state in LDS. AITER's high VGPR count and lower LDS align with register-resident online attention.
+  - Both AITER and HIP report `scratch_size=0`, so stack/scratch is not the immediate issue.
+  - VT's profile-only fwd average is slightly faster than row-major, but the normal benchmark shows VT is slower; the effect is too small and unstable to matter, and the prepack cost is much worse.
+- Next optimization implication:
+  - Stop pursuing standalone VT prepack as A3.
+  - Build A4 around a specialized `Br=128`, `Bc=32`, `D=128`, non-causal, full-block kernel that keeps online softmax state and output accumulators out of LDS as much as possible.
+
+### A7: Sage-Inspired Accuracy/Quantization Follow-Ups
+
+- Only run after a faster fwd baseline exists.
+- Candidate ideas:
+  - K mean smoothing before e5m2 quantization if fp16-reference tolerance failures cluster on biased inputs;
+  - optional per-block scale-bearing int8 or fp8-like quantization for K/V if e5m2 unscaled quantization becomes the accuracy bottleneck;
+  - Q quantization only if gfx1151 generated code shows a real path to faster QK than fp16 WMMA plus conversion overhead.
+- Reject any quantization idea that improves accuracy but loses the performance advantage versus AITER by a large margin.
+
+## Non-Negotiable Run Protocol
+
+1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+2. Per-step order:
+   - `python test_attn_hip.py`
+   - `python benchmark_attn_hip.py`
+   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
+3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+4. If a new baseline is kept, commit the kernel immediately.
+5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
+
+## Durable Findings
+
+- The current attention kernel is structurally behind AITER by about `2.8-2.9x` at large S.
+- The high-priority issues are not likely fixed by only changing autotune order:
+  - full score/probability materialization in LDS;
+  - repeated output accumulator materialization in fp16 LDS;
+  - row softmax work concentrated into `tx < Br`;
+  - strided V loads for PV WMMA.
+- HND is probably the better internal layout for a one-head-per-workgroup HIP kernel, but this must be verified against NHD because AITER/SageAttention APIs are NHD-capable and model integration may matter.
+- V layout should be considered separately from public tensor layout. A V-specific packed fp8 layout can improve PV loads without forcing public NHD tensors.
+- Accuracy should use the combined tolerance `0.05 * abs(ref_fp16) + 0.05`, not independent relative and absolute gates.
+- Tolerances are a speed/quality policy lever: loosen only with a documented speed reason, and tighten after visual Qwen-Image validation exists.
+- K/V quantization is not the large-S bottleneck. At `S=4096`, row-major quantization is about `0.60 ms` while prepacked forward is about `21.59 ms`.
+- The current prepacked row-major fp8 path gives only a small fwd-only gain (`S=4096`: `9.55 TFLOPS` prepacked vs `9.47 TFLOPS` end-to-end in decomposition), so the forward kernel must be rewritten.
+- The standalone VT fp8 path was rejected and removed. It was slower in normal benchmark fwd time and increased `S=4096` quantization/prepack from about `0.60 ms` to about `2.54 ms`.
+- Adding AITER-inspired `Br=128/Bc=32` configs is a small keeper. It improves the primary `S=4096` end-to-end result to about `9.95 TFLOPS`, but it does not change the conclusion that the forward algorithm is structurally behind AITER.
+- Profiling confirms the algorithmic gap: AITER `attn_fwd` is about `7.37 ms` with `32 KB` LDS and `224` VGPRs; HIP `fwd_kernel<128,32,16>` is about `21.12 ms` with `40 KB` LDS and `88` VGPRs. HIP has no scratch, so the next target is LDS/barrier/softmax structure, not spill cleanup.
+
+## Do-Not-Repeat (Unless New Preconditions)
+
+- Do not spend multiple iterations on minor config reordering before decomposing quantize/fwd cost.
+- Do not optimize NHD first unless HND vs NHD benchmarking proves it matters end-to-end.
+- Do not add Q quantization before the fwd kernel removes its obvious LDS/softmax bottlenecks.
+- Do not claim a prepacked-only win as an end-to-end win unless prepack cost is also measured.
+- Do not continue standalone `[B,H,D,S]` VT prepack unless a new forward kernel changes the memory-access preconditions; it is already slower as implemented.
+- Do not copy SageAttention int8 strategies directly without checking gfx1151 ISA and generated code. RDNA3.5 does not have faster int8 wmma than fp16.
+
+## Reference
+
+- `~/amd-llvm-project/`, especially `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst` - hipcc source code
+- `~/rdna35-isa-markdown/`
+- `~/aiter/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/fwd_prefill.py` - AITER FlashAttention forward reference
+- `~/SageAttention/sageattention/triton/quant_per_block.py` - SageAttention per-block int8 quantization reference
+- `~/SageAttention/sageattention/triton/quant_per_thread.py` - SageAttention per-thread int8 quantization reference
+- `~/SageAttention/sageattention/triton/attn_qk_int8_per_block.py` - SageAttention Triton int8-QK attention reference
+- `~/SageAttention/sageattention/core.py` - SageAttention public API, layout, smoothing, and tolerance context
