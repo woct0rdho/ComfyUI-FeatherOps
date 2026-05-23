@@ -228,6 +228,218 @@ __device__ void mul_add_A_B(
     }
 }
 
+template <int N_WAVES, int N_TILES>
+__device__ void rescale_mul_add_A_B_reg(
+    const half_bits_t* __restrict__ const A,
+    const fp8e5m2_t* __restrict__ const B,
+    const float* __restrict__ const alpha,
+    fp32x8_t (&fragO)[N_TILES],
+    const int lda,
+    const int ldb,
+    const int m,
+    const int n,
+    const int k)
+{
+    fp16x16_t fragA[2];
+    fp16x16_t fragB[2];
+
+    const int wave_id = threadIdx.x / kWaveSize;
+    const int lane_id = threadIdx.x % kWaveSize;
+    const int wmma_lane = lane_id % 16;
+
+    #pragma unroll
+    for (int wave_off = 0; wave_off < N_TILES; ++wave_off) {
+        const int wave_xy = wave_id + wave_off * N_WAVES;
+        const int wave_x = wave_xy % (n / kWmmaN);
+        const int wave_y = wave_xy / (n / kWmmaN);
+
+        const int blk_x = wave_x * kWmmaN;
+        const int blk_y = wave_y * kWmmaM;
+
+        if ((blk_x < n) && (blk_y < m)) {
+            #pragma unroll
+            for (int ele = 0; ele < 8; ++ele) {
+                const int r = ele * 2 + (lane_id / 16);
+                fragO[wave_off][ele] *= alpha[blk_y + r];
+            }
+
+            fp32x8_t fragACC = fragO[wave_off];
+
+            for (int i = 0; i < k; i += kWmmaK * 2) {
+                fragA[0] = HALF16((A + (blk_y * lda + i))[wmma_lane * lda]);
+                #pragma unroll
+                for (int k_idx = 0; k_idx < 16; ++k_idx) {
+                    fragB[0][k_idx] = fp8e5m2_to_half_bits(B[(i + k_idx) * ldb + blk_x + wmma_lane]);
+                }
+
+                fragA[1] = HALF16((A + (blk_y * lda + i + kWmmaK))[wmma_lane * lda]);
+                #pragma unroll
+                for (int k_idx = 0; k_idx < 16; ++k_idx) {
+                    fragB[1][k_idx] = fp8e5m2_to_half_bits(B[(i + kWmmaK + k_idx) * ldb + blk_x + wmma_lane]);
+                }
+
+                fragACC = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fragA[0], fragB[0], fragACC);
+                fragACC = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fragA[1], fragB[1], fragACC);
+            }
+
+            fragO[wave_off] = fragACC;
+        }
+    }
+}
+
+template <int N_WAVES, int N_TILES>
+__device__ void store_O_reg(
+    const fp32x8_t (&fragO)[N_TILES],
+    half_bits_t* __restrict__ const O,
+    const int ldo,
+    const float* __restrict__ const inv_l,
+    const int m,
+    const int n)
+{
+    const int wave_id = threadIdx.x / kWaveSize;
+    const int lane_id = threadIdx.x % kWaveSize;
+    const int wmma_lane = lane_id % 16;
+
+    #pragma unroll
+    for (int wave_off = 0; wave_off < N_TILES; ++wave_off) {
+        const int wave_xy = wave_id + wave_off * N_WAVES;
+        const int wave_x = wave_xy % (n / kWmmaN);
+        const int wave_y = wave_xy / (n / kWmmaN);
+
+        const int blk_x = wave_x * kWmmaN;
+        const int blk_y = wave_y * kWmmaM;
+
+        if ((blk_x < n) && (blk_y < m)) {
+            #pragma unroll
+            for (int ele = 0; ele < 8; ++ele) {
+                const int r = ele * 2 + (lane_id / 16);
+                O[(blk_y + r) * ldo + blk_x + wmma_lane] = fp32_to_half_bits(fragO[wave_off][ele] * inv_l[blk_y + r]);
+            }
+        }
+    }
+}
+
+template <int Br, int Bc, int N_WAVES>
+__global__ void __launch_bounds__(kWaveSize * N_WAVES)
+fwd_kernel_reg_o_d128(
+    const half_bits_t* __restrict__ const q,
+    const fp8e5m2_t* __restrict__ const k,
+    const fp8e5m2_t* __restrict__ const v,
+    half_bits_t* __restrict__ const o,
+    const int Tr,
+    const int Tc,
+    const int d,
+    const int64_t q_stride0,
+    const int64_t q_stride1,
+    const int64_t q_stride2,
+    const int64_t kv_stride0,
+    const int64_t kv_stride1,
+    const int64_t kv_stride2,
+    const float scale)
+{
+    constexpr int kD = 128;
+    constexpr int kRegTiles = ((Br * kD) / (kWmmaM * kWmmaN) + N_WAVES - 1) / N_WAVES;
+
+    const int q_offset = blockIdx.x * q_stride0 + blockIdx.y * q_stride1;
+    const int kv_offset = blockIdx.x * kv_stride0 + blockIdx.y * kv_stride1;
+
+    const int ld_q = q_stride2;
+    const int ld_kv = kv_stride2;
+
+    const int Tr_i = blockIdx.z;
+    if (Tr_i >= Tr) return;
+
+    const int tx = threadIdx.x;
+
+    extern __shared__ half_bits_t sram[];
+    half_bits_t* __restrict__ const Si = &sram[0];
+    float* __restrict__ const alpha = reinterpret_cast<float*>(Si + Br * Bc);
+    float* __restrict__ const inv_l = alpha + Br;
+
+    fp32x8_t fragO[kRegTiles];
+    fp32x8_t zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    #pragma unroll
+    for (int i = 0; i < kRegTiles; ++i) {
+        fragO[i] = zero;
+    }
+
+    const half_bits_t* __restrict__ const Qi = q + q_offset + (Tr_i * Br) * ld_q;
+
+    float row_max_old = -INFINITY;
+    float l_i = 0;
+
+    for (int j = 0; j < Tc; ++j) {
+        const fp8e5m2_t* __restrict__ const Kj = k + kv_offset + (j * Bc) * ld_kv;
+        const fp8e5m2_t* __restrict__ const Vj = v + kv_offset + (j * Bc) * ld_kv;
+
+        float row_max_new = -INFINITY;
+        float row_sum = 0;
+        float rowmax_diff_exp = 0;
+
+        mul_A_BT<N_WAVES>(Qi, Kj, Si, ld_q, ld_kv, Bc, Br, Bc, kD, scale);
+        __syncthreads();
+
+        if (tx < Br) {
+            float val32 = row_max_new;
+            #pragma unroll 2
+            for (int i = 0; i < Bc; i += 16) {
+                fp16x16_t val = HALF16(Si[(tx * Bc) + i]);
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val32 = fmaxf(val32, half_bits_to_fp32(val[j_idx]));
+                }
+            }
+            row_max_new = val32;
+
+            row_max_new = fmaxf(row_max_old, row_max_new);
+            rowmax_diff_exp = exp2f(row_max_old - row_max_new);
+            row_max_old = row_max_new;
+
+            #pragma unroll 4
+            for (int i = 0; i < Bc; i += 16) {
+                fp16x16_t val = HALF16(Si[(tx * Bc) + i]);
+                fp32x16_t val_f32;
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val_f32[j_idx] = half_bits_to_fp32(val[j_idx]);
+                }
+
+                val_f32 = val_f32 - row_max_new;
+
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val_f32[j_idx] = exp2f(val_f32[j_idx]);
+                }
+
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    row_sum += val_f32[j_idx];
+                }
+
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val[j_idx] = fp32_to_half_bits(val_f32[j_idx]);
+                }
+
+                HALF16W(Si[(tx * Bc) + i]) = val;
+            }
+            l_i = rowmax_diff_exp * l_i + row_sum;
+            alpha[tx] = rowmax_diff_exp;
+        }
+        __syncthreads();
+
+        rescale_mul_add_A_B_reg<N_WAVES, kRegTiles>(Si, Vj, alpha, fragO, Bc, ld_kv, Br, kD, Bc);
+        __syncthreads();
+    }
+
+    if (tx < Br) {
+        inv_l[tx] = 1.0f / l_i;
+    }
+    __syncthreads();
+
+    store_O_reg<N_WAVES, kRegTiles>(fragO, o + q_offset + (Tr_i * Br) * ld_q, ld_q, inv_l, Br, kD);
+}
+
 template <int Br, int Bc, int N_WAVES>
 __global__ void __launch_bounds__(kWaveSize * N_WAVES)
 fwd_kernel(
@@ -417,6 +629,22 @@ extern "C" bool launch_attn_fp16_fp8kv(
 
         const dim3 block(kWaveSize * kNW);
         const dim3 grid(b, h, Tr);
+
+        if constexpr (kBr == 128 && kBc == 32 && kNW == 16) {
+            if (d == 128) {
+                const int sram_sz = kBr * kBc * sizeof(half_bits_t) + 2 * kBr * sizeof(float);
+
+                hipLaunchKernelGGL(
+                    (fwd_kernel_reg_o_d128<kBr, kBc, kNW>),
+                    grid, block, sram_sz, stream,
+                    q, k, v, o,
+                    Tr, Tc, d,
+                    q_stride0, q_stride1, q_stride2,
+                    kv_stride0, kv_stride1, kv_stride2,
+                    scale * 1.4426950408889634f);
+                return;
+            }
+        }
 
         const int sram_sz = kBr * kBc * sizeof(half_bits_t) + kBr * d * sizeof(half_bits_t);
 
