@@ -1,6 +1,7 @@
 import numbers
 
 import folder_paths
+import torch
 from comfy.sd import load_diffusion_model
 
 from .debug_ops import DebugOps
@@ -37,6 +38,7 @@ class FeatherUNetLoader:
                 "img_mod",
                 "txt_mod",
             ]
+            FeatherOps.out_dtype = torch.bfloat16
         elif model_type == "wan":
             FeatherOps.excluded_names = [
                 # Non-repeating modules
@@ -46,8 +48,10 @@ class FeatherUNetLoader:
                 "time_projection",
                 "head",
             ]
+            FeatherOps.out_dtype = torch.float16
         else:
             FeatherOps.excluded_names = []
+            FeatherOps.out_dtype = torch.bfloat16
 
         if ops == "feather":
             model_options = {"custom_operations": FeatherOps}

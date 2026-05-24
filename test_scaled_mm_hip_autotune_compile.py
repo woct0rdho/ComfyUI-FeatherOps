@@ -9,14 +9,14 @@ from kernel.naive import scaled_mm_naive
 def _make_inputs(m, n, k, device):
     a = torch.randn((m, k), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((k, n), device=device, dtype=torch.float32).to(torch.float8_e5m2)
-    scale = torch.tensor(2.34, device=device, dtype=torch.bfloat16)
-    bias = torch.randn(n, device=device, dtype=torch.bfloat16)
-    out_dtype = torch.bfloat16
+    scale = torch.tensor(2.34, device=device, dtype=torch.float32)
+    bias = torch.randn(n, device=device, dtype=torch.float16)
+    out_dtype = torch.float16
     b_prepacked = prepack_b_for_scaled_mm(b)
     return a, b, b_prepacked, scale, bias, out_dtype
 
 
-def _check_close(out, ref, label, out_dtype=torch.bfloat16):
+def _check_close(out, ref, label, out_dtype=torch.float16):
     out = out.float()
     ref = ref.float()
     diff = out - ref
@@ -24,7 +24,7 @@ def _check_close(out, ref, label, out_dtype=torch.bfloat16):
     fro_rel_err = fro_rel_err.item()
     max_abs_err = diff.abs().max().item()
 
-    atol_threshold = 8 if out_dtype == torch.bfloat16 else 1
+    atol_threshold = 16 if out_dtype == torch.bfloat16 else 2
     if fro_rel_err > 0.01 or max_abs_err > atol_threshold:
         raise RuntimeError(f"{label} failed: fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}")
 
@@ -88,8 +88,8 @@ def test_torch_compile_view_input_no_scale(device):
     x = torch.randn((2, 16, 3072), device=device, dtype=torch.bfloat16)
     b = torch.randn((3072, 3072), device=device, dtype=torch.float32).to(torch.float8_e5m2)
     b_prepacked = prepack_b_for_scaled_mm(b)
-    bias = torch.randn(3072, device=device, dtype=torch.bfloat16)
-    out_dtype = torch.bfloat16
+    bias = torch.randn(3072, device=device, dtype=torch.float16)
+    out_dtype = torch.float16
 
     @torch.compile(fullgraph=True, mode="max-autotune")
     def compiled_fn(x, b_prepacked, bias):

@@ -41,9 +41,9 @@ def benchmark(N, provider):
 
     a = torch.randn((N, N), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((N, N), device=device, dtype=torch.float32).to(torch.float8_e5m2)
-    scale = torch.tensor(2.34, device=device, dtype=torch.bfloat16)
-    bias = torch.randn(N, device=device, dtype=torch.bfloat16)
-    out_dtype = torch.bfloat16
+    scale = torch.tensor(2.34, device=device, dtype=torch.float32)
+    bias = torch.randn(N, device=device, dtype=torch.float16)
+    out_dtype = torch.float16
 
     # Prepacking is done once and excluded from do_bench
     b_prepacked = prepack_b_for_scaled_mm(b)

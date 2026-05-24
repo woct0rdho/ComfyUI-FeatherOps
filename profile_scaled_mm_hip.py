@@ -26,7 +26,7 @@ def main():
     a = torch.randn((m, k), device=device, dtype=torch.float32).to(torch.float16)
     b = torch.randn((k, n), device=device, dtype=torch.float32).to(torch.float8_e5m2)
     b_prepacked = prepack_b_for_scaled_mm(b)
-    scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.float16)
+    scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.float32)
     bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.float16)
 
     cfg = tuple(int(x.strip()) for x in args.config.split(","))
