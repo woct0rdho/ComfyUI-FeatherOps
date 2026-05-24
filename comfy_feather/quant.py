@@ -113,14 +113,15 @@ class FeatherFP8E5M2PackedLayout(QuantizedLayout):
 
 
 def make_feather_quantized_weight(weight, scale, orig_dtype):
+    if weight.ndim != 2:
+        raise ValueError(f"Feather FP8 packed weights require a 2D tensor, got {weight.ndim}D")
+
     if scale is None:
         scale = torch.ones((), device=weight.device, dtype=torch.float32)
     else:
         scale = scale.to(device=weight.device, dtype=torch.float32)
 
-    qdata = weight.to(torch.float8_e5m2)
-    if qdata.ndim == 2:
-        qdata = prepack_transpose(qdata)
+    qdata = prepack_transpose(weight.to(torch.float8_e5m2))
     params = FeatherFP8E5M2PackedLayout.Params(
         scale=scale,
         orig_dtype=orig_dtype,
