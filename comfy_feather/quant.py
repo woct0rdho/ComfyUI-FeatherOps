@@ -52,6 +52,7 @@ class FeatherFP8E5M2PackedParams:
 def quantize_fp8e5m2_scaled(x, scale="recalculate", seed=None, inplace_ops=False):
     if scale is None or scale == "recalculate":
         scale = torch.amax(x.abs()).to(dtype=torch.float32) / torch.finfo(torch.float8_e5m2).max
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
         if x.dtype not in {torch.float32, torch.bfloat16}:
             dtype_info = torch.finfo(x.dtype)
             scale = 1.0 / torch.clamp(1.0 / scale, min=dtype_info.min, max=dtype_info.max)
@@ -121,7 +122,12 @@ def make_feather_quantized_weight(weight, scale, orig_dtype):
     else:
         scale = scale.to(device=weight.device, dtype=torch.float32)
 
-    qdata = prepack_transpose(weight.to(torch.float8_e5m2))
+    if weight.dtype == torch.float8_e5m2:
+        qdata = prepack_transpose(weight.to(torch.float8_e5m2))
+    else:
+        qdata, scale = quantize_fp8e5m2_scaled(weight.to(torch.float32) * scale)
+        qdata = prepack_transpose(qdata)
+
     params = FeatherFP8E5M2PackedLayout.Params(
         scale=scale,
         orig_dtype=orig_dtype,
