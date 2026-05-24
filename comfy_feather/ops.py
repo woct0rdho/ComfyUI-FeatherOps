@@ -88,6 +88,11 @@ def feather_ops(out_dtype=torch.bfloat16, excluded_names=()):
                 x_shape_orig = x.shape
                 x = x.reshape(-1, x_shape_orig[-1])
 
+                m = x.shape[0]
+                m_padded = ((m + 15) // 16) * 16
+                if m_padded != m:
+                    x = F.pad(x, (0, 0, 0, m_padded - m))
+
                 # The kernel requires fp16 x and produces the configured output dtype
                 x_fp16 = x.to(torch.float16)
 
@@ -105,6 +110,9 @@ def feather_ops(out_dtype=torch.bfloat16, excluded_names=()):
                 uncast_bias_weight(self, weight, bias, offload_stream)
 
                 y = y.to(x.dtype)
+
+                if m_padded != m:
+                    y = y[:m]
 
                 self.weight_function = saved_weight_function
                 y = apply_lora_patches(x, y, saved_weight_function)
