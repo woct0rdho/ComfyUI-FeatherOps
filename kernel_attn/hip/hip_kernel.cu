@@ -285,7 +285,7 @@ fwd_kernel_kv_staged_d128(
     const int64_t kv_stride2,
     const float scale)
 {
-    static_assert(Br == 128 && Bc == 32 && N_WAVES == 8);
+    static_assert((Br == 64 || Br == 128) && Bc == 32 && N_WAVES == 8);
     constexpr int kD = 128;
     constexpr int kSiStride = Bc + 8;
     constexpr int kKVLdsStride = kD + 16;
@@ -402,6 +402,13 @@ fwd_kernel_kv_staged_d128(
     store_O_reg<N_WAVES, kRegTiles>(fragO, o + q_offset + (Tr_i * Br) * ld_q, ld_q, inv_l, Br, kD);
 }
 
+template <int Br, int Bc, int NW>
+struct ConfigTag {
+    static constexpr int kBr = Br;
+    static constexpr int kBc = Bc;
+    static constexpr int kN_WAVES = NW;
+};
+
 extern "C" bool launch_attn_fp16_fp8kv(
     const half_bits_t* const q,
     const fp8e5m2_t* const k,
@@ -426,25 +433,38 @@ extern "C" bool launch_attn_fp16_fp8kv(
 {
     if (d != 128) return false;
 
-    if (Br == 128 && Bc == 32 && N_WAVES == 8) {
-        const int Tr = n / Br;
-        const int Tc = n_kv / Bc;
+    const auto launch_staged = [&](const auto tag) -> void {
+        constexpr int kBr = decltype(tag)::kBr;
+        constexpr int kBc = decltype(tag)::kBc;
+        constexpr int kNW = decltype(tag)::kN_WAVES;
 
-        const dim3 block(kWaveSize * 8);
+        const int Tr = n / kBr;
+        const int Tc = n_kv / kBc;
+
+        const dim3 block(kWaveSize * kNW);
         const dim3 grid(b, h, Tr);
 
-        const int kSiStride = Bc + 8;
+        const int kSiStride = kBc + 8;
         const int kKVLdsStride = d + 16;
-        const int sram_sz = Br * kSiStride * sizeof(half_bits_t) + 2 * Br * sizeof(float) + 2 * Bc * kKVLdsStride * sizeof(fp8e5m2_t);
+        const int sram_sz = kBr * kSiStride * sizeof(half_bits_t) + 2 * kBr * sizeof(float) + 2 * kBc * kKVLdsStride * sizeof(fp8e5m2_t);
 
         hipLaunchKernelGGL(
-            (fwd_kernel_kv_staged_d128<128, 32, 8>),
+            (fwd_kernel_kv_staged_d128<kBr, kBc, kNW>),
             grid, block, sram_sz, stream,
             q, k, v, o,
             Tr, Tc,
             q_stride0, q_stride1, q_stride2,
             kv_stride0, kv_stride1, kv_stride2,
             scale * 1.4426950408889634f);
+
+    };
+
+    if (Br == 64 && Bc == 32 && N_WAVES == 8) {
+        launch_staged(ConfigTag<64, 32, 8>{});
+        return true;
+    }
+    if (Br == 128 && Bc == 32 && N_WAVES == 8) {
+        launch_staged(ConfigTag<128, 32, 8>{});
         return true;
     }
 

@@ -8,6 +8,7 @@ from kernel.hip.utils import load_hip_stable_extension
 from .utils import generate_autotune_configs, get_compatible_config, old_autotune
 
 _CONFIGS = [
+    (64, 32, 8),
     (128, 32, 8),
 ]
 
