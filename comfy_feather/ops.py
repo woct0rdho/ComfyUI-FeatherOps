@@ -1,9 +1,11 @@
+import comfy.float
 import torch
 import torch.nn.functional as F
 from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_weight
 from torch import nn
 
 from ..kernel.hip.hip_kernel import scaled_mm_hip
+from .lora import apply_lora_patches
 
 
 # (N, K) -> (K/16, N, 16)
@@ -16,6 +18,20 @@ def prepack_transpose(x):
 def unprepack_transpose(x):
     k, N, _ = x.shape
     return x.permute(1, 0, 2).reshape(N, k * 16)
+
+
+def quantize_fp8e5m2_scaled(x, seed=None):
+    scale = torch.amax(x.abs()).to(dtype=torch.float32) / torch.finfo(torch.float8_e5m2).max
+    if x.dtype not in {torch.float32, torch.bfloat16}:
+        dtype_info = torch.finfo(x.dtype)
+        scale = 1.0 / torch.clamp(1.0 / scale, min=dtype_info.min, max=dtype_info.max)
+
+    x = x * (1.0 / scale).to(dtype=x.dtype)
+    if seed is not None and seed > 0:
+        x = comfy.float.stochastic_rounding(x, dtype=torch.float8_e5m2, seed=seed)
+    else:
+        x = x.to(torch.float8_e5m2)
+    return x, scale.float()
 
 
 class FeatherOps(manual_cast):
@@ -71,14 +87,19 @@ class FeatherOps(manual_cast):
         def convert_weight(self, weight, inplace=False, **kwargs):
             if not self.is_quantized:
                 return weight
-            return unprepack_transpose(weight)
+            weight = unprepack_transpose(weight)
+            if self.weight_scale is not None:
+                scale = self.weight_scale.to(device=weight.device, dtype=torch.float32)
+                weight = (weight.to(torch.float32) * scale).to(weight.dtype)
+            return weight
 
         def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
             if not self.is_quantized:
                 weight = weight.to(self.weight.dtype)
+                weight_scale = None
             else:
                 # Currently the kernel only supports fp8e5m2 weight
-                weight = weight.to(torch.float8_e5m2)
+                weight, weight_scale = quantize_fp8e5m2_scaled(weight, seed=seed)
                 weight = prepack_transpose(weight)
 
             if return_weight:
@@ -86,6 +107,8 @@ class FeatherOps(manual_cast):
 
             assert inplace_update is False  # TODO: eventually remove the inplace_update stuff
             self.weight = nn.Parameter(weight, requires_grad=False)
+            if weight_scale is not None:
+                self.weight_scale = weight_scale
 
         def forward(self, x):
             run_every_op()
@@ -102,7 +125,7 @@ class FeatherOps(manual_cast):
             # The kernel requires fp16 x and produces the configured output dtype
             x_fp16 = x.to(torch.float16)
 
-            # Temporarily clear weight_function so cast_bias_weight does not apply patches to prepacked weight
+            # Temporarily clear weight_function so cast_bias_weight does not apply low-VRAM patches to prepacked weight
             saved_weight_function = self.weight_function
             self.weight_function = []
 
@@ -116,35 +139,7 @@ class FeatherOps(manual_cast):
 
             y = y.to(x.dtype)
 
-            # Apply LoRA
             self.weight_function = saved_weight_function
-            for patch_fn in self.weight_function:
-                if not (hasattr(patch_fn, "patches") and hasattr(patch_fn, "key")):
-                    raise NotImplementedError("FeatherOps currently only supports basic LoRA")
-
-                patches = patch_fn.patches.get(patch_fn.key, [])
-                for patch_data in patches:
-                    # patch_data: (strength_patch, adapter, strength_model, offset, function)
-                    strength_patch = patch_data[0]
-                    adapter = patch_data[1]
-                    strength_model = patch_data[2]
-
-                    if not hasattr(adapter, "weights") or adapter.weights is None:
-                        raise NotImplementedError("FeatherOps currently only supports basic LoRA")
-
-                    weights = adapter.weights
-                    lora_B = weights[0]
-                    lora_A = weights[1]
-                    alpha = weights[2] if weights[2] is not None else 1
-
-                    rank = lora_A.shape[0]
-                    lora_scale = strength_patch * strength_model * (alpha / rank)
-
-                    lora_A = lora_A.to(device=x.device, dtype=x.dtype)
-                    lora_B = lora_B.to(device=x.device, dtype=x.dtype)
-
-                    temp = F.linear(x, lora_A)
-                    temp = F.linear(temp, lora_B)
-                    y += temp * lora_scale
+            y = apply_lora_patches(x, y, saved_weight_function)
 
             return y.view(*x_shape_orig[:-1], y.shape[-1])
