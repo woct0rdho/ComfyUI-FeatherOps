@@ -90,6 +90,25 @@ __device__ __forceinline__ fp16x16_t load_e5m2x16_as_fp16(const fp8e5m2_t* __res
     return out.h;
 }
 
+__device__ __forceinline__ float cfrag_value_at(
+    const fp32x8_t frag,
+    const int row,
+    const int col)
+{
+    const int row_lane_group = row & 1;
+    const int row_ele = row >> 1;
+    const int src_lane = row_lane_group * 16 + col;
+    float out = 0;
+    #pragma unroll
+    for (int ele = 0; ele < 8; ++ele) {
+        const float candidate = __shfl(frag[ele], src_lane, kWaveSize);
+        if (ele == row_ele) {
+            out = candidate;
+        }
+    }
+    return out;
+}
+
 __global__ void quantize_kv_e5m2_kernel(
     const half_bits_t* __restrict__ const k,
     const half_bits_t* __restrict__ const v,
@@ -121,6 +140,53 @@ __global__ void quantize_kv_e5m2_kernel(
     const uint64_t v_h4 = reinterpret_cast<const uint64_t*>(v + v_off)[0];
     reinterpret_cast<uint32_t*>(k_fp8 + base)[0] = half_bits4_to_fp8e5m2x4(k_h4);
     reinterpret_cast<uint32_t*>(v_fp8 + base)[0] = half_bits4_to_fp8e5m2x4(v_h4);
+}
+
+__global__ void wmma_fragment_probe_kernel(half_bits_t* __restrict__ const out)
+{
+    const int lane_id = threadIdx.x % kWaveSize;
+    const int wmma_lane = lane_id % 16;
+    const int lane_group = lane_id / 16;
+
+    fp32x8_t fragS0;
+    fp32x8_t fragS1;
+    #pragma unroll
+    for (int ele = 0; ele < 8; ++ele) {
+        const int row = ele * 2 + lane_group;
+        fragS0[ele] = static_cast<float>(row * 32 + wmma_lane + 1);
+        fragS1[ele] = static_cast<float>(row * 32 + 16 + wmma_lane + 1);
+    }
+
+    const int row = wmma_lane;
+
+    fp16x16_t fragP0;
+    fp16x16_t fragP1;
+    #pragma unroll
+    for (int col = 0; col < 16; ++col) {
+        const float p0 = cfrag_value_at(fragS0, row, col);
+        const float p1 = cfrag_value_at(fragS1, row, col);
+        fragP0[col] = fp32_to_half_bits(p0);
+        fragP1[col] = fp32_to_half_bits(p1);
+        out[row * 16 + col] = fragP0[col];
+        out[256 + row * 16 + col] = fragP1[col];
+    }
+
+    fp16x16_t fragI;
+    #pragma unroll
+    for (int k_idx = 0; k_idx < 16; ++k_idx) {
+        fragI[k_idx] = fp32_to_half_bits(k_idx == wmma_lane ? 1.0f : 0.0f);
+    }
+
+    fp32x8_t zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    fp32x8_t fragO0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fragP0, fragI, zero);
+    fp32x8_t fragO1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(fragP1, fragI, zero);
+
+    #pragma unroll
+    for (int ele = 0; ele < 8; ++ele) {
+        const int r = ele * 2 + lane_group;
+        out[512 + r * 16 + wmma_lane] = fp32_to_half_bits(fragO0[ele]);
+        out[768 + r * 16 + wmma_lane] = fp32_to_half_bits(fragO1[ele]);
+    }
 }
 
 // C = A @ B^T, where A is fp16 Q [Br, d] and B is fp8e5m2 K [Bc, d].
@@ -653,6 +719,27 @@ void quantize_kv_e5m2(
     STD_TORCH_CHECK(launch_err == hipSuccess, "fp8e5m2 quantize kernel launch failed: ", hipGetErrorString(launch_err));
 }
 
+void wmma_fragment_probe(torch::stable::Tensor& out)
+{
+    STD_TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
+    STD_TORCH_CHECK(out.scalar_type() == torch::stable::ScalarType::Half, "out must be float16");
+    STD_TORCH_CHECK(out.dim() == 3, "out must be 3D [4, 16, 16]");
+    STD_TORCH_CHECK(out.size(0) == 4 && out.size(1) == 16 && out.size(2) == 16, "out shape must be [4, 16, 16]");
+    STD_TORCH_CHECK(out.stride(0) == 256 && out.stride(1) == 16 && out.stride(2) == 1, "out must be contiguous");
+
+    const auto device_index = out.get_device_index();
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
+
+    void* raw_stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
+    const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
+
+    half_bits_t* const out_ptr = reinterpret_cast<half_bits_t*>(out.mutable_data_ptr());
+    hipLaunchKernelGGL(wmma_fragment_probe_kernel, dim3(1), dim3(kWaveSize), 0, stream, out_ptr);
+    const hipError_t launch_err = hipGetLastError();
+    STD_TORCH_CHECK(launch_err == hipSuccess, "wmma fragment probe kernel launch failed: ", hipGetErrorString(launch_err));
+}
+
 void attn_fp16_fp8kv_prepacked(
     const torch::stable::Tensor& q,
     const torch::stable::Tensor& k_fp8,
@@ -764,6 +851,10 @@ STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
         "int Bc, "
         "int N_WAVES"
         ") -> ()");
+    m.def(
+        "wmma_fragment_probe("
+        "Tensor(a!) out"
+        ") -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
@@ -771,5 +862,6 @@ STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
     m.impl("attn_fp16_fp8kv", TORCH_BOX(&attn_fp16_fp8kv));
     m.impl("quantize_kv_e5m2", TORCH_BOX(&quantize_kv_e5m2));
     m.impl("attn_fp16_fp8kv_prepacked", TORCH_BOX(&attn_fp16_fp8kv_prepacked));
+    m.impl("wmma_fragment_probe", TORCH_BOX(&wmma_fragment_probe));
 }
 #endif
