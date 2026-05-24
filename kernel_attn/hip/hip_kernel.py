@@ -58,6 +58,12 @@ def quantize_kv_e5m2(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, to
     return k_fp8, v_fp8
 
 
+def wmma_fragment_probe() -> torch.Tensor:
+    out = torch.empty((4, 16, 16), device="cuda", dtype=torch.float16)
+    torch.ops.feather_attn_fp16.wmma_fragment_probe.default(out)
+    return out
+
+
 @torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_prepacked_configured", mutates_args=())
 def _prepacked_configured_op(
     q: torch.Tensor,
