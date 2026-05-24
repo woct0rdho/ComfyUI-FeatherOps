@@ -4,7 +4,7 @@ import folder_paths
 import torch
 from comfy.sd import load_diffusion_model
 
-from .ops import FeatherOps
+from .ops import feather_ops
 from .sampling import install_sampling_model_pin
 
 
@@ -26,7 +26,7 @@ class FeatherUNetLoader:
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
         if model_type == "qwen":
-            FeatherOps.excluded_names = [
+            excluded_names = [
                 # Non-repeating modules
                 "time_text_embed",
                 "img_in",
@@ -37,9 +37,9 @@ class FeatherUNetLoader:
                 "img_mod",
                 "txt_mod",
             ]
-            FeatherOps.out_dtype = torch.bfloat16
+            out_dtype = torch.bfloat16
         elif model_type == "wan":
-            FeatherOps.excluded_names = [
+            excluded_names = [
                 # Non-repeating modules
                 "patch_embedding",
                 "text_embedding",
@@ -47,12 +47,12 @@ class FeatherUNetLoader:
                 "time_projection",
                 "head",
             ]
-            FeatherOps.out_dtype = torch.float16
+            out_dtype = torch.float16
         else:
-            FeatherOps.excluded_names = []
-            FeatherOps.out_dtype = torch.bfloat16
+            excluded_names = []
+            out_dtype = torch.bfloat16
 
-        model_options = {"custom_operations": FeatherOps}
+        model_options = {"custom_operations": feather_ops(out_dtype=out_dtype, excluded_names=excluded_names)}
         model = load_diffusion_model(unet_path, model_options=model_options)
         install_sampling_model_pin(model)
         return (model,)
