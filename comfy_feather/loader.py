@@ -12,7 +12,7 @@ class FeatherUNetLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "model_type": (["qwen", "wan", "default"],),
+                "model_type": (["default", "anima", "qwen", "wan"],),
             }
         }
 
@@ -23,7 +23,16 @@ class FeatherUNetLoader:
     def load_unet(self, unet_name, model_type):
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
-        if model_type == "qwen":
+        if model_type == "anima":
+            excluded_names = [
+                # Non-repeating modules
+                "t_embedder",
+                "x_embedder",
+                "final_layer",
+                "llm_adapter",
+            ]
+            out_dtype = torch.bfloat16
+        elif model_type == "qwen":
             excluded_names = [
                 # Non-repeating modules
                 "time_text_embed",
