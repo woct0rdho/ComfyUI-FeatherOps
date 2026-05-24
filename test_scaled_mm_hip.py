@@ -6,17 +6,14 @@ from kernel.hip.hip_kernel import _CONFIGS, prepack_b_for_scaled_mm, scaled_mm_h
 from kernel.naive import scaled_mm_naive
 
 
-def test_config(cfg, M, N, K, device):
+def test_config(cfg, M, N, K, device, b_dtype, out_dtype):
     a = torch.randn((M, K), device=device, dtype=torch.float32).to(torch.float16)
-    b = torch.randn((K, N), device=device, dtype=torch.float32).to(torch.float8_e5m2)
-    scale = torch.tensor(2.34, device=device, dtype=torch.bfloat16)
-    bias = torch.randn(N, device=device, dtype=torch.bfloat16)
-    out_dtype = torch.bfloat16
+    b = torch.randn((K, N), device=device, dtype=torch.float32).to(b_dtype)
+    scale = torch.tensor(2.34, device=device, dtype=torch.float32)
+    bias = torch.randn(N, device=device, dtype=out_dtype)
 
     b_prepacked = prepack_b_for_scaled_mm(b)
     out_hip = scaled_mm_hip_configured(a, b_prepacked, scale, bias, out_dtype, *cfg)
-
-    # out_ref = scaled_mm_naive(a, b, scale, bias, out_dtype)
     out_ref = scaled_mm_naive(a, b_prepacked, scale, bias, out_dtype, b_prepacked=True)
 
     out_hip = out_hip.float()
@@ -26,8 +23,11 @@ def test_config(cfg, M, N, K, device):
     fro_rel_err = fro_rel_err.item()
     max_abs_err = diff.abs().max().item()
 
-    atol_threshold = 16 if out_dtype == torch.bfloat16 else 1
-    if fro_rel_err > 0.01 or max_abs_err > atol_threshold:
+    atol = {
+        torch.float16: 2.0,
+        torch.bfloat16: 16.0,
+    }[out_dtype]
+    if fro_rel_err > 0.01 or max_abs_err > atol:
         return False, f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
     return True, f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
 
@@ -49,8 +49,14 @@ def main():
         (4096, 4096, 4096),
         (8192, 8192, 8192),
     ]
+    combos = [
+        (torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e5m2, torch.float16),
+        (torch.float8_e5m2, torch.bfloat16),
+    ]
 
-    print(f"Testing HIP fp8e5m2 mixed precision kernel ({len(_CONFIGS)} configs across {len(test_sizes)} matrix sizes)\n")
+    print(f"Testing HIP mixed precision kernel ({len(_CONFIGS)} configs across {len(test_sizes)} matrix sizes and {len(combos)} dtype combos)\n")
     print("Config format: (warps_m, warps_n, unroll_k, repeat_m, repeat_n)")
     print("=" * 80)
 
@@ -71,10 +77,11 @@ def main():
             if M % block_m != 0 or N % block_n != 0 or K % chunk_k != 0:
                 continue
 
-            passed, msg = test_config(cfg, M, N, K, device)
-            if not passed:
-                config_passed = False
-                config_errors.append(f"  M={M} N={N} K={K}: {msg}")
+            for b_dtype, out_dtype in combos:
+                passed, msg = test_config(cfg, M, N, K, device, b_dtype, out_dtype)
+                if not passed:
+                    config_passed = False
+                    config_errors.append(f"  M={M} N={N} K={K} b_dtype={b_dtype} out_dtype={out_dtype}: {msg}")
 
         status = "PASS" if config_passed else "FAIL"
         print(f"[{status}] {cfg} BlockM={block_m} BlockN={block_n}")

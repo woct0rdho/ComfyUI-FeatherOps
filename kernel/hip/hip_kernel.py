@@ -163,6 +163,7 @@ def scaled_mm_hip(
         run_fn,
         "mixed",
         b_prepacked.dtype,
+        out_dtype,
     )
     return _configured_op(a, b_prepacked, scale, bias, out_dtype, *best_cfg)
 

@@ -23,9 +23,9 @@ def scaled_mm_naive(
     a = a.to(mm_dtype)
     b = b.to(mm_dtype)
     c = a @ b
-    c = c.to(out_dtype)
     if scale is not None:
-        scale = scale.to(c.dtype)
+        c = c.to(torch.float32)
+        scale = scale.to(torch.float32)
         if scale.dim() == 0:
             c *= scale
         else:
@@ -33,6 +33,7 @@ def scaled_mm_naive(
                 c *= scale[:, None]
             else:
                 c *= scale[None, :]
+    c = c.to(out_dtype)
     if bias is not None:
         bias = bias.to(c.dtype)
         if bias_dim == 0:

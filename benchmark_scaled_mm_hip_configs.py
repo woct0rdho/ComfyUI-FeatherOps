@@ -46,7 +46,7 @@ def _run_config(
     warmup: int,
 ) -> Tuple[float, float]:
     def run_kernel():
-        scaled_mm_hip_configured(a, b_prepacked, scale, bias, torch.bfloat16, *cfg)
+        scaled_mm_hip_configured(a, b_prepacked, scale, bias, torch.float16, *cfg)
 
     timings_ms = triton.testing.do_bench(run_kernel, warmup=warmup, rep=rep, return_mode="all")
     avg_ms = statistics.mean(timings_ms)
@@ -84,8 +84,8 @@ def main() -> None:
         print(f"\nShape M={m} N={n} K={k}")
         a = torch.randn(m, k, device=device, dtype=torch.float32).to(torch.float16)
         b = torch.randn(k, n, device=device, dtype=torch.float32).to(torch.float8_e5m2)
-        scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.bfloat16)
-        bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.bfloat16)
+        scale = None if args.no_scale else torch.tensor(2.34, device=device, dtype=torch.float32)
+        bias = None if args.no_bias else torch.randn(n, device=device, dtype=torch.float16)
 
         b_prepacked = prepack_b_for_scaled_mm(b)
 

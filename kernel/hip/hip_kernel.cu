@@ -37,6 +37,36 @@ __device__ __forceinline__ bfloat16_t operator*(const bfloat16_t a, const bfloat
     return bfloat16_t(static_cast<float>(a) * static_cast<float>(b));
 }
 
+__device__ __forceinline__ uint16_t half_to_bits(const half h) {
+    return *reinterpret_cast<const uint16_t*>(&h);
+}
+
+__device__ __forceinline__ half bits_to_half(const uint16_t bits) {
+    return *reinterpret_cast<const half*>(&bits);
+}
+
+template <bool kOutputFp16>
+__device__ __forceinline__ uint16_t float_to_output_bits(const float value) {
+    if constexpr (kOutputFp16) {
+        return half_to_bits(__float2half_rn(value));
+    } else {
+        return bfloat16_t(value).data;
+    }
+}
+
+template <bool kOutputFp16>
+__device__ __forceinline__ uint16_t add_output_bits(const uint16_t a, const uint16_t b) {
+    if constexpr (kOutputFp16) {
+        return half_to_bits(__hadd(bits_to_half(a), bits_to_half(b)));
+    } else {
+        bfloat16_t a_bf16;
+        bfloat16_t b_bf16;
+        a_bf16.data = a;
+        b_bf16.data = b;
+        return (a_bf16 + b_bf16).data;
+    }
+}
+
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
 constexpr int kWmmaK = 16;
@@ -92,13 +122,14 @@ template <int kBlockWarpsM,
           int kRepeatM,
           int kRepeatN,
           bool kEnableAWsgr,
-          bool kUseFp8E5M2>
+          bool kUseFp8E5M2,
+          bool kOutputFp16>
 __global__ void scaled_mm_kernel(
     const half* __restrict__ const a,
     const uint8_t* __restrict__ const b_prepacked,
-    const bfloat16_t* __restrict__ const scale,
-    const bfloat16_t* __restrict__ const bias,
-    bfloat16_t* __restrict__ const c,
+    const float* __restrict__ const scale,
+    const uint16_t* __restrict__ const bias,
+    uint16_t* __restrict__ const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -119,7 +150,7 @@ __global__ void scaled_mm_kernel(
     constexpr int kShASize = kUnrollK * kK0 * kBlockM * kAStrideK1;
 
     // B uses NxK prepacked layout for efficient vec16 stores during loading
-    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 bfloat16s.
+    // C-shuffle epilogue reuses sh_a and sh_b memory. Each warp needs 16*16 output elements.
     constexpr int kCStride = kWmmaN;  // 16 elements per row
 
     union SharedStorage {
@@ -127,7 +158,7 @@ __global__ void scaled_mm_kernel(
             half a[kShASize];
             uint8_t b[kUnrollK][kBlockN][kWmmaK];
         } ab;
-        bfloat16_t c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
+        uint16_t c[kBlockWarpsM * kBlockWarpsN][kWmmaM][kCStride];
     };
     __shared__ __align__(16) SharedStorage sh;
 
@@ -327,9 +358,9 @@ __global__ void scaled_mm_kernel(
     // Epilogue: C-Shuffle - write output with coalesced vec8 stores
     // Use LDS to transpose from column-major (WMMA layout) to row-major (coalesced)
     if (wave_id < kBlockWarpsM * kBlockWarpsN) {
-        bfloat16_t* __restrict__ const sh_c = sh.c[wave_id][0];
+        uint16_t* __restrict__ const sh_c = sh.c[wave_id][0];
 
-        const float scale_f = has_scale ? static_cast<float>(scale[0]) : 1.0f;
+        const float scale_f = has_scale ? scale[0] : 1.0f;
         const int subgroup = lane / 16;
         const int lane_in_subgroup = lane % 16;
 
@@ -350,7 +381,7 @@ __global__ void scaled_mm_kernel(
                 for (int acc_idx = 0; acc_idx < 8; ++acc_idx) {
                     const int row_logi = subgroup * 8 + acc_idx;
                     const int row_phys = c_row_logi_to_phys_16(row_logi);
-                    sh_c[row_phys * kCStride + col] = bfloat16_t(acc[repeat_idx][acc_idx] * scale_f);
+                    sh_c[row_phys * kCStride + col] = float_to_output_bits<kOutputFp16>(acc[repeat_idx][acc_idx] * scale_f);
                 }
 
                 // Wave executes in lockstep (SIMT), so all writes complete before reads
@@ -366,13 +397,13 @@ __global__ void scaled_mm_kernel(
                 const int64_t out_row = tile_m_base + read_row;
                 const int64_t out_col = tile_n_base + read_col_base;
 
-                bfloat16_t* __restrict__ const out_ptr = c + out_row * N + out_col;
-                bfloat16_t* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
+                uint16_t* __restrict__ const out_ptr = c + out_row * N + out_col;
+                uint16_t* __restrict__ const h = sh_c + read_row_phys * kCStride + read_col_base;
 
                 if (has_bias) {
                     #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        h[i] = h[i] + bias[out_col + i];
+                        h[i] = add_output_bits<kOutputFp16>(h[i], bias[out_col + i]);
                     }
                 }
 
@@ -425,15 +456,16 @@ template <typename Config>
 void launch_scaled_mm_configured(
     const half* const a,
     const uint8_t* const b_prepacked,
-    const bfloat16_t* const scale,
-    const bfloat16_t* const bias,
-    bfloat16_t* const c,
+    const float* const scale,
+    const uint16_t* const bias,
+    uint16_t* const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
     const int has_scale,
     const int has_bias,
     const int b_dtype,
+    const int output_dtype,
     hipStream_t stream)
 {
     constexpr int kBlockWarpsM = Config::kBlockWarpsM;
@@ -451,37 +483,74 @@ void launch_scaled_mm_configured(
     const dim3 grid(static_cast<uint32_t>(N / kBlockN), static_cast<uint32_t>(M / kBlockM), 1);
 
     const bool use_fp8_e5m2 = (b_dtype == 1);
+    const bool use_fp16_output = (output_dtype == 0);
     if (enable_a_wsgr) {
         if (use_fp8_e5m2) {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true>),
-                grid, block, 0, stream,
-                a, b_prepacked, scale, bias, c,
-                M, N, K,
-                has_scale, has_bias);
+            if (use_fp16_output) {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true, true>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            } else {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, true, false>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            }
         } else {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false>),
-                grid, block, 0, stream,
-                a, b_prepacked, scale, bias, c,
-                M, N, K,
-                has_scale, has_bias);
+            if (use_fp16_output) {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false, true>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            } else {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, true, false, false>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            }
         }
     } else {
         if (use_fp8_e5m2) {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true>),
-                grid, block, 0, stream,
-                a, b_prepacked, scale, bias, c,
-                M, N, K,
-                has_scale, has_bias);
+            if (use_fp16_output) {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true, true>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            } else {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, true, false>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            }
         } else {
-            hipLaunchKernelGGL(
-                (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false>),
-                grid, block, 0, stream,
-                a, b_prepacked, scale, bias, c,
-                M, N, K,
-                has_scale, has_bias);
+            if (use_fp16_output) {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false, true>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            } else {
+                hipLaunchKernelGGL(
+                    (scaled_mm_kernel<kBlockWarpsM, kBlockWarpsN, kUnrollK, kRepeatM, kRepeatN, false, false, false>),
+                    grid, block, 0, stream,
+                    a, b_prepacked, scale, bias, c,
+                    M, N, K,
+                    has_scale, has_bias);
+            }
         }
     }
 }
@@ -489,9 +558,9 @@ void launch_scaled_mm_configured(
 extern "C" bool launch_scaled_mm(
     const half* const a,
     const uint8_t* const b_prepacked,
-    const bfloat16_t* const scale,
-    const bfloat16_t* const bias,
-    bfloat16_t* const c,
+    const float* const scale,
+    const uint16_t* const bias,
+    uint16_t* const c,
     const int64_t M,
     const int64_t N,
     const int64_t K,
@@ -503,6 +572,7 @@ extern "C" bool launch_scaled_mm(
     const int repeat_m,
     const int repeat_n,
     const int b_dtype,
+    const int output_dtype,
     hipStream_t stream)
 {
     const auto try_launch = [&](const auto tag) -> bool {
@@ -515,7 +585,7 @@ extern "C" bool launch_scaled_mm(
                 a, b_prepacked, scale, bias, c,
                 M, N, K,
                 has_scale, has_bias,
-                b_dtype, stream);
+                b_dtype, output_dtype, stream);
             return true;
         }
         return false;
@@ -577,7 +647,7 @@ void scaled_mm(
     STD_TORCH_CHECK(c.get_device_index() == device_index, "c must be on the same device as a");
 
     STD_TORCH_CHECK(a.scalar_type() == torch::stable::ScalarType::Half, "a must be float16");
-    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::BFloat16, "c must be bfloat16");
+    STD_TORCH_CHECK(c.scalar_type() == torch::stable::ScalarType::Half || c.scalar_type() == torch::stable::ScalarType::BFloat16, "c must be float16 or bfloat16");
     STD_TORCH_CHECK(b_dtype == 0 || b_dtype == 1, "b_dtype must be 0 (fp8e4m3) or 1 (fp8e5m2)");
     if (b_dtype == 0) {
         STD_TORCH_CHECK(b_prepacked.scalar_type() == torch::stable::ScalarType::Float8_e4m3fn, "b_prepacked must be float8_e4m3fn when b_dtype=0");
@@ -612,7 +682,7 @@ void scaled_mm(
         const auto& scale_t = *scale;
         STD_TORCH_CHECK(scale_t.is_cuda(), "scale must be a CUDA tensor");
         STD_TORCH_CHECK(scale_t.get_device_index() == device_index, "scale must be on the same device as a");
-        STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::BFloat16, "scale must be bfloat16");
+        STD_TORCH_CHECK(scale_t.scalar_type() == torch::stable::ScalarType::Float, "scale must be float32");
         STD_TORCH_CHECK(scale_t.numel() == 1, "scale must have one element");
     }
     if (bias.has_value()) {
@@ -620,7 +690,7 @@ void scaled_mm(
         const auto& bias_t = *bias;
         STD_TORCH_CHECK(bias_t.is_cuda(), "bias must be a CUDA tensor");
         STD_TORCH_CHECK(bias_t.get_device_index() == device_index, "bias must be on the same device as a");
-        STD_TORCH_CHECK(bias_t.scalar_type() == torch::stable::ScalarType::BFloat16, "bias must be bfloat16");
+        STD_TORCH_CHECK(bias_t.scalar_type() == c.scalar_type(), "bias must have the same dtype as c");
         STD_TORCH_CHECK(bias_t.numel() == N, "bias must have N elements");
     }
 
@@ -632,9 +702,9 @@ void scaled_mm(
 
     const half* const a_ptr = reinterpret_cast<const half*>(a.const_data_ptr());
     const uint8_t* const b_ptr = reinterpret_cast<const uint8_t*>(b_prepacked.const_data_ptr());
-    const bfloat16_t* const scale_ptr = scale.has_value() ? reinterpret_cast<const bfloat16_t*>(scale->const_data_ptr()) : nullptr;
-    const bfloat16_t* const bias_ptr = bias.has_value() ? reinterpret_cast<const bfloat16_t*>(bias->const_data_ptr()) : nullptr;
-    bfloat16_t* const c_ptr = reinterpret_cast<bfloat16_t*>(c.mutable_data_ptr());
+    const float* const scale_ptr = scale.has_value() ? reinterpret_cast<const float*>(scale->const_data_ptr()) : nullptr;
+    const uint16_t* const bias_ptr = bias.has_value() ? reinterpret_cast<const uint16_t*>(bias->const_data_ptr()) : nullptr;
+    uint16_t* const c_ptr = reinterpret_cast<uint16_t*>(c.mutable_data_ptr());
 
     const auto is_aligned_16 = [](const void* const p) {
         return (reinterpret_cast<uintptr_t>(p) & 0xFu) == 0u;
@@ -653,12 +723,14 @@ void scaled_mm(
     const int64_t threads_per_block = kWaveSize * block_warps_m * block_warps_n;
     STD_TORCH_CHECK(threads_per_block <= 1024, "Block size exceeds HIP thread-per-block limit");
 
+    const int output_dtype = c.scalar_type() == torch::stable::ScalarType::Half ? 0 : 1;
+
     const bool launched = launch_scaled_mm(
         a_ptr, b_ptr, scale_ptr, bias_ptr, c_ptr,
         M, N, K,
         scale.has_value() ? 1 : 0, bias.has_value() ? 1 : 0,
         block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n,
-        b_dtype, stream);
+        b_dtype, output_dtype, stream);
     STD_TORCH_CHECK(launched, "Unsupported config");
 
     const hipError_t launch_err = hipGetLastError();
