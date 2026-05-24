@@ -6,7 +6,6 @@
   - optimize `kernel_attn/hip/hip_kernel.cu` and its Python wrapper in `kernel_attn/hip/hip_kernel.py`;
   - input/output contract stays fp16 tensors;
   - K/V may be quantized internally to fp8e5m2, or accepted through an explicit prepacked path if an experiment proves that is useful;
-  - initial scope stays non-causal forward attention.
 - Target shape family:
   - Qwen-Image attention: `B=1`, `H=24`, `S in {1024, 2048, 4096, 8192}`, `D=128`;
   - primary decision shape: `B=1`, `H=24`, `S=4096`, `D=128`.
@@ -24,11 +23,10 @@
   - the starting tolerance is `rtol=0.05`, `atol=0.05`, combined as `rtol * abs(ref_fp16) + atol`;
   - later experiments may loosen `rtol` and `atol` within a reasonable range if it unlocks meaningful speed;
   - start tightening tolerances only after Qwen-Image visual comparisons are available;
-  - every tolerance change must be recorded in this file with the benchmark and visual-quality reason.
+  - every tolerance change must be recorded in this file.
 - Keep rule:
   - correctness passes under the combined tolerance gate;
   - `S=4096` improves or stays flat;
-  - `S=8192` does not regress materially;
   - the large-S trend (`2048`, `4096`, `8192`) does not regress materially;
   - if an experiment optimizes only an explicitly separate prepacked path, report packed and end-to-end timings separately.
 
@@ -38,17 +36,16 @@ Latest benchmark CSV: `attn_hip.csv`.
 
 | S | AITER TFLOPS | HIP TFLOPS | HIP Prepacked TFLOPS | HIP/AITER | AITER ms | HIP ms | HIP Prepacked ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1024 | 22.065456 | 17.528201 | 21.147751 | 79.4% | 0.584 | 0.735 | 0.609 |
-| 2048 | 27.330107 | 22.739478 | 24.443372 | 83.2% | 1.885 | 2.266 | 2.108 |
-| 4096 | 27.214516 | 22.507021 | 23.835616 | 82.7% | 7.575 | 9.160 | 8.649 |
-| 8192 | 27.451727 | 22.080018 | 22.500524 | 80.4% | 30.040 | 37.349 | 36.651 |
+| 1024 | 22.203998 | 17.621812 | 21.118083 | 79.4% | 0.580 | 0.731 | 0.610 |
+| 2048 | 27.463989 | 22.507469 | 24.202511 | 82.0% | 1.877 | 2.290 | 2.130 |
+| 4096 | 27.192308 | 22.823213 | 23.567182 | 83.9% | 7.582 | 9.034 | 8.749 |
+| 8192 | 27.306838 | 22.914635 | 23.389831 | 83.9% | 30.200 | 35.990 | 35.258 |
 
 Interpretation:
-- The HIP kernel is about `1.2-1.3x` slower than AITER on large S after padded `Si` stride.
+- The HIP kernel is about `1.19x` slower than AITER on large S after raw K/V LDS staging.
 - HIP TFLOPS is still flatter than AITER from `S=1024` to `8192`, but A4-B/A4-C plus A9-A plus padded `Si` stride plus packed RNE quantization lifted the large-S plateau from about `10 TFLOPS` to about `22-24 TFLOPS`.
 - The large-S gap is too large for tuning-only polish; the current algorithm structure likely dominates.
 - Internal K/V quantization is `O(BHSD)`, while attention is `O(BHS^2D)`, so quantization cannot explain the `S=4096` and `8192` gap by itself. It can still matter at `S=1024` and must be decomposed.
-- A standalone V-transposed prepack prototype was tested, rejected, and removed from the code. See A3/A6 notes for the historical measurements.
 
 ## Current Kernel Observations
 
@@ -62,6 +59,7 @@ Interpretation:
 - The softmax update is mostly assigned to `tx < Br`, so only one thread per row performs max, exp, sum, probability conversion, and output rescale over full row fragments.
 - The output accumulator is repeatedly rounded through fp16 in LDS after each K/V tile; this is both a performance cost and an accuracy compromise.
 - The specialized A4-B/A4-C path for `(Br=128, Bc=32, N_WAVES in {8, 16}, D=128)` keeps the output accumulator in fp32 registers and stores only `Si`, `alpha`, and final `inv_l` in LDS.
+- The kept A12-D3 path uses sentinel config `(128,32,82)` and stages raw fp8 K/V tiles in LDS before QK/PV; autotune selects it at `S=1024`, `4096`, and `8192`.
 - The specialized path now pads `Si` row stride from `Bc=32` to `40` half elements to avoid LDS bank conflicts.
 - K loads for QK are naturally row-major and contiguous over `D`.
 - V loads for PV are currently hostile to coalescing: the WMMA fragment needs 16 tokens for a fixed output-dim lane, but row-major V means those 16 fp8 bytes are separated by `D=128` bytes. A standalone `[B,H,D,S]` VT prepack did not help enough; revisit V packing only as part of a new forward structure.
@@ -77,6 +75,19 @@ Interpretation:
 - It avoids materializing the full score tile and output accumulator to LDS between K/V blocks.
 - It has separate full-block and masked-block logic; our non-causal fixed-size path can start with the full-block fast path only.
 - It uses `exp2`/log2 scaling consistently to avoid slower base-e exponentials.
+
+### CK-Tile FMHA
+
+- Relevant references:
+  - `~/rocm-libraries/projects/composablekernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp`;
+  - `~/rocm-libraries/projects/composablekernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qx_ks_vs_custom_policy.hpp`;
+  - `~/rocm-libraries/projects/composablekernel/dispatcher/codegen/fmha/fmha_arch_specs.json`;
+  - `~/rocm-libraries/shared/rocroller/docs/src/LDSSwizzling.md`.
+- Treat CK-Tile `FMHA` as the fused-attention kernel family, not as a gfx1151 hardware instruction. The gfx1151/RDNA3.5 target path must stay WMMA-based (`v_wmma_f32_16x16x16_f16`), not CDNA MFMA-specific.
+- CK-Tile's QR pipeline uses `QLoadOnce=true`; Q has zero SMEM footprint in that policy and is loaded into a register tile before the K/V loop.
+- K/V use LDS descriptors with padding/swizzled or shuffled layouts; row-major V is shuffled before the LDS store instead of changing the public tensor layout.
+- Online state is represented as distributed register tiles: `s_acc`, `p_compute`, `m`, `l`, and `o_acc`; row reductions use `block_tile_reduce_sync` rather than one scalar thread per row.
+- The transferable lesson is not a standalone V transpose. The useful direction is a full register-tile QK/softmax/PV rewrite where V staging and distributed softmax happen together.
 
 ### SageAttention
 
@@ -111,13 +122,11 @@ Interpretation:
 - For the current one-head-per-workgroup HIP kernel, it is probably worse for fwd memory streaming because advancing one token for a fixed head jumps by `H*D` elements instead of `D`.
 - NHD becomes more attractive only if a new kernel processes multiple heads for the same sequence tile in one workgroup or if avoiding external layout conversion dominates the total runtime.
 
-Decision for now:
-- Optimize HND first because it matches the current HIP work decomposition and gives contiguous per-head sequence streams.
-- Add an explicit layout experiment before committing to the public API:
-  - support NHD strides without an internal transpose;
-  - benchmark HND vs NHD with identical logical data and no hidden transpose in the timed region;
-  - keep NHD only if it wins end-to-end or if app integration requires it.
-- Independently of tensor API layout, V-specific packing remains a possible tile-local implementation detail, but the standalone `[B,H,D,S]` VT prepack path is rejected as-is.
+Decision:
+- Keep HND (`B,H,S,D`) as the optimized internal/public fast path for this one-head-per-workgroup kernel.
+- NHD-backed views are correct through explicit strides, but are not performance-competitive for the current implementation.
+- If a producer naturally emits NHD, an attention-boundary HND pack/swizzle does not pay for itself for one attention call; prefer producing HND directly or emitting the current HND fp8 prepack contract directly if integration allows it.
+- Independently of tensor API layout, V-specific tile-local packing remains a possible future implementation detail, but the standalone `[B,H,D,S]` VT prepack path is rejected as-is.
 
 ## Planned Experiments
 
@@ -128,12 +137,14 @@ Decision for now:
 | A2 | KEEP | tile sweep around AITER RDNA shape, especially `Br=128`, `Bc=32`, `N_WAVES=8/16` | end-to-end `S=4096` improved `9.53 -> 9.95 TFLOPS`, `S=8192` improved `9.71 -> 9.85 TFLOPS` | small but real primary-metric gain; no large-S regression |
 | A3 | REJECT | V fp8 transposed/tile-packed prepack path | `S=4096`: row prepacked `21.59 ms`, VT prepacked `22.19 ms`; VT prepack `2.54 ms` vs row `0.60 ms` | simple `[B,H,D,S]` V transpose did not overcome current forward bottlenecks; code path removed |
 | A4 | KEEP partial | register-resident online softmax/PV prototype for fixed `Br=128`, `Bc=32`, `D=128` | A4-C 8-wave register-output path lifts `S=4096` HIP to `16.53 TFLOPS` and prepacked to `17.48 TFLOPS`; full score-tile rewrite still pending | remove LDS score/prob/output round trips |
-| A5 | TODO | HND vs NHD stride/layout benchmark | pending | decide public layout strategy |
+| A5 | KEEP HND | HND vs NHD stride/layout benchmark | HND wins; direct NHD views are correct but slower, and NHD-to-HND pack/swizzle does not pay for one attention call | keep HND as optimized layout; only support NHD if integration requires it |
 | A6 | KEEP findings | profile kept or surprising variants with generated-code inspection, PC sampling, bank-conflict PMCs, or thread tracing | padded `Si` stride removes HIP `LDSBankConflict` and lifts `S=4096` prepacked to `23.85 TFLOPS` | explain wins/regressions before further tuning |
 | A7 | KEEP partial | optional Sage-inspired K smoothing or scale-bearing quantization experiment | packed branchless RNE quantizer passes and improves end-to-end HIP; plain truncation rejected | accuracy/headroom only after core fwd is faster |
 | A8 | REJECT | shape-specialized cleanup and boundary removal | boundary removal on the fixed fast path regressed because the compile-time specialization raised VGPR pressure and lowered throughput | keep only divisibility-asserted fast paths for fixed target shapes |
 | A9 | KEEP partial | perm-based `fp8e5m2x4_to_half2x2` decode | A9-A lifts `S=4096` prepacked to `19.55 TFLOPS`; V-side strided fp8 loads still scalarized | reduce conversion overhead if the combined tolerance gate still passes |
 | A10 | KEEP findings | 128-bit load/store audit | Q/global and LDS tile movement use 128-bit ops; strided fp8 V loads and final output stores are narrower | verify hot-path reads/writes stay at the widest legal vector width |
+| A11 | REJECT | local softmax micro-optimizations inspired by CK/AITER distributed reductions | two-lane split regressed; single-lane score-cache was mixed and generated nearly identical hot-loop counts | isolated softmax patches do not fix the score-LDS/PV-load structure; move to full register-tile rewrite |
+| A12 | KEEP partial | fixed-shape RDNA3.5 WMMA structural staging | raw K/V LDS staging sentinel `(128,32,82)` is kept and selected at `S=1024/4096/8192`; row-owned skeleton and Q-LDS staging were rejected | reduce hostile V global scalar loads and K reloads while preserving current correct `Si`/PV dataflow |
 
 ## Next Steps
 
@@ -287,15 +298,33 @@ Decision for now:
 
 ### A5: Layout Experiment
 
-- Add an NHD wrapper or benchmark provider that passes explicit strides to the same kernel logic.
-- Benchmark:
-  - HND contiguous `q/k/v` as today;
-  - NHD contiguous `q/k/v` with no hidden transpose in the timed function;
-  - optional non-contiguous views only as integration diagnostics, not primary performance data.
-- Decision criteria:
-  - if HND wins for fwd and quantize, keep HND as the optimized kernel layout;
-  - if NHD wins end-to-end because the model avoids a transpose, support NHD as a public wrapper but keep the internal fwd memory path honest;
-  - if neither dominates, expose layout-specific configured ops and let benchmark/autotune choose.
+- Status: complete; keep HND as the optimized layout.
+- Benchmark artifact: `tmp_attn_fp8kv_analysis/benchmark_layout_a5.py` writes `attn_layout_a5.csv`.
+- Method:
+  - create contiguous NHD tensors `[B,S,H,D]` and HND views via `permute(0,2,1,3)`;
+  - compare logically identical HND-contiguous tensors against NHD-backed views with no hidden transpose in the timed direct-view function;
+  - measure reusable-buffer pack/swizzle variants from NHD view to HND before attention to see whether an intermediate pack pays for itself;
+  - fixed config `(128,32,8)` to isolate layout effects from autotune noise.
+- Correctness: HND-contiguous and NHD-view prepacked outputs matched exactly (`max_abs_diff=0`) for all tested `S`.
+- Main layout results:
+
+| S | HND E2E ms | NHD View E2E ms | NHD Pack KV E2E ms | NHD Pack QKV E2E ms | HND Prepacked ms | NHD-Q Prepacked ms | Quant HND ms | Quant NHD View ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.752 | 1.299 | 1.264 | 1.539 | 0.608 | 0.650 | 0.154 | 0.673 |
+| 2048 | 2.313 | 3.738 | 3.795 | 4.144 | 2.123 | 2.234 | 0.280 | 1.753 |
+| 4096 | 9.198 | 11.748 | 11.922 | 12.704 | 8.810 | 9.117 | 0.447 | 3.096 |
+| 8192 | 38.174 | 43.296 | 43.632 | 44.560 | 37.489 | 38.705 | 0.786 | 5.208 |
+
+- Interpretation:
+  - HND-contiguous wins end-to-end at every target size;
+  - direct NHD views are mainly hurt by strided K/V quantization (`S=4096`: `3.096 ms` vs `0.447 ms`; `S=8192`: `5.208 ms` vs `0.786 ms`);
+  - prepacked fwd with only Q as an NHD-backed view is much closer, but still slower (`S=4096`: `9.117 ms` vs `8.810 ms`; `S=8192`: `38.705 ms` vs `37.489 ms`);
+  - reusable-buffer NHD-to-HND packing/swizzling does not improve one-call end-to-end time; packing K/V or Q/K/V before attention is slower than direct NHD views and much slower than HND-contiguous input.
+- Decision:
+  - keep HND as the optimized kernel layout and benchmark contract;
+  - do not add a separate NHD public wrapper for performance yet;
+  - if model integration is NHD-native, prefer producer-side HND emission or producer-side HND fp8 prepack rather than attention-boundary repacking;
+  - revisit NHD only for a different work decomposition that processes multiple heads per sequence tile or avoids the K/V quantization stride penalty structurally.
 
 ### A6: Profiling Protocol
 
@@ -522,6 +551,32 @@ Decision for now:
   - the 16-wave variant remains the autotune winner on the regressed code path, showing the change made the preferred 8-wave fast path worse instead of better.
 - Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed A9-A baseline. Per protocol, no test/benchmark/profile was run after the revert.
 
+#### A8-B: Ordered Remaining Branch Removal
+
+- Status: rejected and reverted for the three requested follow-ups.
+- Method: try one branch-removal experiment at a time, with correctness and benchmark after each one.
+- Experiment order tested:
+  - remove `quantize_kv_e5m2_kernel`'s `if (base >= total) return` by asserting exact packed quantization launch coverage;
+  - remove `fwd_kernel_reg_o_d128`'s `if (Tr_i >= Tr) return`, since `grid.z == Tr`;
+  - remove only the `mul_A_BT` full-tile guard, using the existing fixed `Br=128`, `Bc=32`, `D=128` contract.
+- `quantize_kv_e5m2_kernel` tail removal:
+  - also removed dead `total` / runtime-`d` quantizer arguments and replaced `d=128` indexing with fixed shift/mask arithmetic;
+  - correctness passed `2/2` configs;
+  - benchmark regressed slightly in quantization and end-to-end at large S: `S=4096` quant `0.4515 ms`, HIP `22.546524 TFLOPS`; `S=8192` quant `0.7906 ms`, HIP `21.977509 TFLOPS`;
+  - rejection reason: the always-false tail branch was cheap, while the changed index expression tree/codegen lost enough to regress.
+- `Tr_i >= Tr` removal:
+  - also removed the now-unused `Tr` kernel argument;
+  - correctness passed `2/2` configs;
+  - benchmark was mixed and not a clear baseline improvement: `S=4096` HIP `22.679081 TFLOPS`, prepacked `23.580466 TFLOPS`; `S=8192` HIP `21.903405 TFLOPS`, prepacked `22.143074 TFLOPS`;
+  - rejection reason: large-S/prepacked numbers regressed enough that this failed the keep rule.
+- `mul_A_BT` guard removal:
+  - replaced only the QK full-tile guard with `__builtin_assume`; left `rescale_mul_add_A_B_reg` unchanged;
+  - correctness passed `2/2` configs;
+  - benchmark regressed substantially: `S=4096` HIP `21.372958 TFLOPS`, prepacked `22.179452 TFLOPS`; `S=8192` HIP `20.165936 TFLOPS`, prepacked `20.579359 TFLOPS`;
+  - rejection reason: the QK guard is codegen-useful; removing it changes live ranges/scheduling enough to hurt throughput.
+- Keep `rescale_mul_add_A_B_reg` unchanged for now; previous all-helper boundary-removal experiments regressed badly and this helper is the highest VGPR/live-range risk.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed output-store-guard baseline after each rejected experiment. Per protocol, no benchmark/profile was run after the reverts.
+
 ### A9: Perm-Based FP8 Decode
 
 - Prototype `fp8e5m2x4_to_half2x2` using only `__builtin_amdgcn_perm` or equivalent byte/half shuffle operations.
@@ -597,6 +652,282 @@ Decision for now:
   - generated code for the rejected 16-wave symbol has about `1126` static instructions, `115` VGPRs, and `66` static `v_perm_b32`, but runtime remains far below A9-A.
 - Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed A9-A baseline. Per protocol, no test/benchmark/profile was run after the revert.
 
+### A11: CK/AITER-Inspired Distributed Softmax
+
+#### A11-A: Two-Lane Row Softmax Split
+
+- Status: rejected and reverted.
+- Motivation:
+  - CK-Tile and AITER distribute row reductions across register tiles rather than assigning all softmax work for a row to one scalar thread;
+  - current HIP still has `tx < Br` doing max, exp, sum, probability conversion, and row-state update for all `Bc=32` columns.
+- Change tested:
+  - keep `Br=128`, `Bc=32`, `D=128`, padded `Si`, register output accumulator, and public wrappers unchanged;
+  - map two adjacent lanes to each row, each handling one 16-column half of the `Si` row;
+  - use `__shfl_xor(..., 1, 32)` to combine the pair's local max and sum;
+  - duplicate `m_i`/`l_i` row state across the pair and store `alpha`/`inv_l` from the even lane.
+- Correctness: `python test_attn_hip.py` passed `2/2` configs.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `17.183272 TFLOPS`, prepacked `20.563332 TFLOPS`;
+  - `S=2048`: HIP `22.144419 TFLOPS`, prepacked `23.901451 TFLOPS`;
+  - `S=4096`: HIP `22.180531 TFLOPS`, prepacked `23.250855 TFLOPS`;
+  - `S=8192`: HIP `21.689678 TFLOPS`, prepacked `22.148266 TFLOPS`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1506 ms`, prepacked fwd `0.6292 ms`, end-to-end `0.7613 ms`;
+  - `S=2048`: quant kernel `0.2817 ms`, prepacked fwd `2.1504 ms`, end-to-end `2.3271 ms`;
+  - `S=4096`: quant kernel `0.4501 ms`, prepacked fwd `8.8401 ms`, end-to-end `9.2238 ms`;
+  - `S=8192`: quant kernel `0.7894 ms`, prepacked fwd `37.4313 ms`, end-to-end `37.9324 ms`.
+- Generated-code findings:
+  - the 8-wave fwd symbol changed from no cross-lane shuffle to `2` static `ds_bpermute` instructions from the two `__shfl_xor` reductions;
+  - static `v_exp_f32` in the 8-wave symbol dropped from about `33` to `17`, but the dynamic amount of exponent work is still effectively split across two lanes, not removed;
+  - the hot V-load pattern did not change: the 8-wave symbol still has `48` `global_load_d16_u8` and `48` `global_load_d16_hi_u8` static instructions;
+  - VGPR stayed in the same range (`191` for 8-wave), so the regression is not spill/scratch related.
+- Rejection reason:
+  - isolated two-lane softmax does not attack the current dominant structural issues: `Si` score/probability materialization and strided V fp8 loads remain unchanged;
+  - the added cross-lane shuffle and duplicated row-state update are not offset by splitting a 32-column softmax row;
+  - this confirms CK/AITER-style reduction should be adopted as part of a full register-tile QK/softmax/PV rewrite, not as a local patch around the existing LDS `Si` structure.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed output-store-guard baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
+#### A11-B: Single-Lane Score Cache
+
+- Status: rejected and reverted.
+- Motivation:
+  - A11-A split the row and added cross-lane shuffles; this follow-up tested only whether keeping the two `Si` half16 chunks in registers between max and exp/sum would avoid useful LDS rereads without changing the one-thread-per-row work mapping.
+- Change tested:
+  - load `Si[row, 0:16]` and `Si[row, 16:32]` once into `fp16x16_t` locals;
+  - compute max from those locals;
+  - reuse the same locals for exp/sum and probability stores.
+- Correctness: `python test_attn_hip.py` passed `2/2` configs.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `17.077834 TFLOPS`, prepacked `20.699270 TFLOPS`;
+  - `S=2048`: HIP `22.392539 TFLOPS`, prepacked `24.178813 TFLOPS`;
+  - `S=4096`: HIP `22.610518 TFLOPS`, prepacked `23.421638 TFLOPS`;
+  - `S=8192`: HIP `21.970617 TFLOPS`, prepacked `22.343316 TFLOPS`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1522 ms`, prepacked fwd `0.6275 ms`, end-to-end `0.7512 ms`;
+  - `S=2048`: quant kernel `0.2797 ms`, prepacked fwd `2.1140 ms`, end-to-end `2.2988 ms`;
+  - `S=4096`: quant kernel `0.4508 ms`, prepacked fwd `8.7910 ms`, end-to-end `9.1646 ms`;
+  - `S=8192`: quant kernel `0.7896 ms`, prepacked fwd `37.2574 ms`, end-to-end `37.3048 ms`.
+- Generated-code findings:
+  - the 8-wave fwd symbol still has `36` `ds_load_b128`, `33` `v_exp_f32`, `48` `global_load_d16_u8`, `48` `global_load_d16_hi_u8`, `32` WMMA instructions, and no `ds_bpermute`;
+  - VGPR was still in the same range (`189` for 8-wave), and scratch stayed absent;
+  - the compiler already produced effectively the same hot-loop shape as the original source, so the source-level cache did not create a new memory behavior.
+- Rejection reason:
+  - benchmark was mixed and did not improve the prepacked forward path at the primary size;
+  - generated code was effectively unchanged, while the source became more verbose;
+  - this confirms that small rewrites around the current scalar row-softmax loop are exhausted.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the committed output-store-guard baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
+### A12: RDNA3.5 WMMA Register-Tile Forward Rewrite
+
+- Status: next structural plan.
+- Goal:
+  - build a separate fixed-shape forward kernel for `D=128`, `Br=128`, `Bc=32`, `N_WAVES=8`, non-causal, full blocks;
+  - keep the existing `fwd_kernel_reg_o_d128` as the stable baseline and dispatch A12 only through an explicit new config/tag until it earns keeper status;
+  - use RDNA3.5 WMMA (`v_wmma_f32_16x16x16_f16`) throughout. Do not chase CK/CDNA MFMA paths or assume hardware FMHA instructions exist on gfx1151.
+- Structural target:
+  - one wave owns a `16 x 128` query-row block and its online state, instead of owning a D-output tile across all rows;
+  - Q fragments for that row block are loaded once and reused across all K/V blocks;
+  - QK score fragments stay in registers long enough for row max/sum and probability conversion;
+  - P fragments feed PV WMMA without materializing the full `Br x Bc` score/probability tile in LDS;
+  - output accumulators stay in registers and are normalized once at the end;
+  - LDS is used for operand staging/swizzle only, not as algorithmic storage for `Si`, `alpha`, or repeated probability traffic.
+- Expected payoff:
+  - remove the `Si` score/probability LDS round trip, including the two `__syncthreads` around softmax/PV that exist only for that storage;
+  - remove `alpha` LDS broadcast by keeping `m_i`, `l_i`, and `rowmax_diff_exp` in the wave that owns the row block;
+  - make V staging/shuffling potentially worthwhile because P is register-resident and the PV operand path can be designed together with it;
+  - shift closer to AITER/CK behavior: more useful VGPRs, less algorithmic LDS, lower barrier pressure.
+- Main risks:
+  - register pressure may exceed the current sweet spot and reduce occupancy too much;
+  - C-fragment-to-PV-A-fragment permutation may require expensive `v_perm`/`ds_bpermute` if implemented naively;
+  - row-block wave ownership may duplicate K/V loads unless K/V staging is added carefully;
+  - direct register P-to-PV may be too hard in one step, so the plan deliberately has intermediate compile/correctness milestones.
+
+#### A12-A: Row-Block Wave Ownership Skeleton
+
+- Status: rejected and reverted as a standalone source step.
+- Implement a new kernel symbol, not an in-place rewrite of `fwd_kernel_reg_o_d128`.
+- Fixed mapping:
+  - `N_WAVES=8`;
+  - wave `0..7` owns rows `wave_id * 16 .. wave_id * 16 + 15` for the same `Br=128` query block;
+  - each wave computes all `D=128` output columns for its 16 rows as multiple WMMA output fragments.
+- First milestone can keep the current global K/V decode path and can temporarily materialize probabilities if needed, but row ownership and online state ownership must be correct from the start.
+- Keep/reject gate:
+  - keep only if correctness passes and generated code shows no scratch;
+  - if the skeleton alone is slower, do not reject immediately unless the codegen shows untenable VGPR/scratch; it is a staging point for A12-B/C.
+- Change tested:
+  - added separate `fwd_kernel_row_owned_d128<128,32>` behind sentinel config `(128,32,80)`;
+  - row-owned wave mapping was used for QK, softmax row state, PV, and final store;
+  - kept existing padded `Si`, `alpha`, and `inv_l` LDS structure so this isolated ownership from register-P/PV changes.
+- Correctness: `python test_attn_hip.py` passed `3/3` configs, including `(128,32,80)`.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Benchmark outcome:
+  - eager autotune selected the existing `(128,32,8)` path for every `S` and for both end-to-end and prepacked modes;
+  - final selected-path results remained in the baseline range, e.g. `S=4096` HIP `22.527631 TFLOPS`, prepacked `23.590034 TFLOPS`; `S=8192` HIP `22.121517 TFLOPS`, prepacked `22.570517 TFLOPS`.
+- Generated-code findings:
+  - row-owned A12-A had no private segment/scratch, but VGPR rose to `232` versus about `189` for the selected 8-wave baseline in the same build;
+  - static 8-wave baseline vs A12-A fwd counts: `global_load_d16_u8/hi` `48/48 -> 128/128`, `ds_load_b128` `36 -> 8`, `s_waitcnt` `149 -> 50`, WMMA count unchanged at `32`;
+  - the increased V scalar-load footprint and high VGPR explain why autotune did not select the row-owned skeleton.
+- Rejection reason:
+  - row ownership alone does not remove score/probability LDS traffic or fix V access; it mostly remaps work and increases pressure;
+  - keeping this scaffold in `_CONFIGS` would add compile/autotune cost without improving the kept runtime path;
+  - continue only with a more direct register-P/PV rewrite, not this standalone row-owned-plus-`Si` scaffold.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` and `kernel_attn/hip/hip_kernel.py` were restored to the committed baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
+#### A12-B: Register Score/P Softmax For `Bc=32`
+
+- For each row-owned wave, compute two `16 x 16` QK score fragments for the `Bc=32` K block.
+- Reduce row max and row sum inside the same wave over the two fragments.
+- Convert scores to fp16 probabilities in the layout needed by PV WMMA without writing the full `Br x Bc` tile to LDS.
+- Inspect generated code for:
+  - cross-lane operations introduced by C-fragment permutation;
+  - `v_exp_f32` count and placement;
+  - VGPR count and scratch;
+  - whether barriers tied to score/probability storage disappear.
+- Keep/reject gate:
+  - correctness must pass;
+  - no scratch;
+  - barrier count and score-LDS traffic must drop materially versus baseline;
+  - if runtime regresses but score-LDS traffic is gone, profile before reverting because this may expose the next structural blocker.
+
+#### A12-C: PV Path With Register P And Row-Owned Output
+
+- Feed the register probability fragments into PV WMMA and accumulate row-owned output fragments in fp32 registers.
+- Start with row-major V global fp8 loads if needed to validate the P-to-PV mapping.
+- Then test tile-local V staging/shuffle only inside this A12 kernel, not as standalone `[B,H,D,S]` prepack:
+  - stage one `Bc x D` V tile for the workgroup or per row-wave group;
+  - use an LDS layout designed for PV WMMA reads and zero/negligible bank conflicts;
+  - avoid the rejected dynamic full transpose loop shape from A10-A.
+- Keep/reject gate:
+  - primary metric remains full `benchmark_attn_hip.py` end-to-end and prepacked at `S=4096` and `S=8192`;
+  - compare generated V-load counts against baseline `global_load_d16_u8` / `global_load_d16_hi_u8`;
+  - keep V staging only if it improves the A12 register-P kernel, not as a standalone API/layout change.
+
+#### A12-D: Q Load-Once And K Staging
+
+- Once row ownership works, load Q fragments once per query row block and reuse them across all K/V blocks.
+- Test K staging through LDS only if it reuses K across the eight row-owned waves without increasing barriers enough to lose the win.
+- Use CK/Triton as layout references, but keep the implementation WMMA-specific and simple:
+  - K source is already contiguous over `D`, so K staging is about reuse and scheduling, not fixing coalescing;
+  - preserve `LDSBankConflict=0.0` or near-zero if staging is added;
+  - do not use CDNA async-copy/MFMA assumptions on gfx1151.
+- Keep/reject gate:
+  - Q global-load traffic should drop versus baseline in the fwd symbol or in profiler-derived memory stats;
+  - K staging must improve large-S prepacked runtime or clearly enable A12-C V staging; otherwise reject.
+
+##### A12-D1: Q LDS Load-Once On Row-Owned Skeleton
+
+- Status: rejected and reverted.
+- Change tested:
+  - extended A12-A by staging the full `Br x D` Q tile into LDS once before the K/V loop;
+  - A12 dynamic LDS increased from `11264` bytes to `44032` bytes (`Br*D` Q tile plus padded `Si`, `alpha`, and `inv_l`);
+  - QK loaded Q from LDS with `lda=128` instead of reloading Q from global each K/V tile.
+- Correctness: `python test_attn_hip.py` passed `3/3` configs, including `(128,32,80)`.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Benchmark outcome:
+  - eager autotune still selected existing `(128,32,8)` for every `S` and mode;
+  - selected-path final results stayed baseline-like, e.g. `S=4096` HIP `22.781408 TFLOPS`, prepacked `23.590976 TFLOPS`; `S=8192` HIP `21.807253 TFLOPS`, prepacked `22.341335 TFLOPS`.
+- Generated-code findings:
+  - Q staging reduced static A12 `global_load_b128` (`32 -> 18`) but raised `ds_load_b128` (`8 -> 40`) and added another barrier;
+  - the A12 Q-staged symbol had private segment size `0x24` and scratch-related instructions, violating the no-scratch gate;
+  - VGPR rose further to `252`; V scalar loads remained high at `128` `global_load_d16_u8` and `128` `global_load_d16_hi_u8`.
+- Rejection reason:
+  - Q-LDS staging attacks Q reloads but not the real A12 blocker: row-owned PV still creates a much worse V scalar-load footprint;
+  - the larger LDS footprint plus VGPR increase triggered private segment use, so this is not a viable staging baseline;
+  - Q load-once should be revisited only if Q can remain in registers in a register-P/PV kernel, or if a different staging layout avoids scratch and excessive LDS.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` and `kernel_attn/hip/hip_kernel.py` were restored to the committed baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
+##### A12-D2: Raw FP8 K Tile LDS Staging On Baseline Mapping
+
+- Status: rejected and reverted.
+- Motivation:
+  - Triton/CK-style fused attention stages K for reuse across query rows;
+  - current baseline reloads the same `Bc x D` K tile from global for multiple row score blocks.
+- Change tested:
+  - added a separate sentinel config `(128,32,81)` that keeps the current baseline work mapping and `Si` softmax/PV structure;
+  - staged raw fp8 K once per K/V block into LDS with padded stride `D + 16`;
+  - QK then decoded K from LDS using the same e5m2 decode path; V path remained unchanged.
+- Correctness: `python test_attn_hip.py` passed `3/3` configs, including `(128,32,81)`.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Benchmark outcome:
+  - eager autotune selected existing `(128,32,8)` for every `S` and mode;
+  - selected-path results stayed baseline-like, e.g. `S=4096` HIP `22.727916 TFLOPS`, prepacked `23.478412 TFLOPS`; `S=8192` HIP `22.225991 TFLOPS`, prepacked `22.543205 TFLOPS`.
+- Generated-code findings for 8-wave baseline versus K-staged sentinel:
+  - `global_load_b128` dropped from `48` to `33`, so the intended global K-load reduction did appear;
+  - `ds_load_b128` increased from `36` to `52`, `s_barrier` from `4` to `5`, and `s_waitcnt` from `149` to `167`;
+  - VGPR rose to `222`, scratch stayed absent;
+  - V scalar-load pattern remained unchanged at `48` `global_load_d16_u8` plus `48` `global_load_d16_hi_u8`.
+- Rejection reason:
+  - raw K staging reduces global K vector loads but adds LDS traffic, a barrier, and waitcnt pressure without addressing the dominant V scalar loads or `Si` materialization;
+  - the extra LDS path is not worthwhile in the current baseline dataflow;
+  - K staging should be revisited only after register-P/PV removes the score/probability LDS round trip or after a fused K/V staging design can amortize the extra barrier.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` and `kernel_attn/hip/hip_kernel.py` were restored to the committed baseline. Per protocol, no test/benchmark/profile was run after the revert.
+
+##### A12-D3: Raw FP8 K/V Tile LDS Staging On Baseline Mapping
+
+- Status: kept.
+- Motivation:
+  - A12-D2 showed K-only staging reduced K global vector loads but left the hostile V scalar global-load pattern unchanged;
+  - this variant stages raw fp8 K and raw fp8 V together, using one extra staging barrier to amortize both operands.
+- Change:
+  - added sentinel config `(128,32,82)` with `fwd_kernel_kv_staged_d128<128,32,8>`;
+  - copies each `Bc x D` K and V tile into LDS once per K/V block using 128-bit vector copies;
+  - uses padded LDS stride `D + 16` for both K and V raw fp8 tiles;
+  - QK decodes K from LDS and PV decodes V from LDS using the existing fp8e5m2 conversion path;
+  - keeps public Python wrapper APIs unchanged and lets eager/autotune choose among `(128,32,16)`, `(128,32,8)`, and `(128,32,82)`.
+- Correctness: `python test_attn_hip.py` passed `3/3` configs.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `17.621812 TFLOPS`, prepacked `21.118083 TFLOPS`, selected `(128,32,82)`;
+  - `S=2048`: HIP `22.507469 TFLOPS`, prepacked `24.202511 TFLOPS`, selected `(128,32,8)`;
+  - `S=4096`: HIP `22.823213 TFLOPS`, prepacked `23.567182 TFLOPS`, selected `(128,32,82)`;
+  - `S=8192`: HIP `22.914635 TFLOPS`, prepacked `23.389831 TFLOPS`, selected `(128,32,82)`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1511 ms`, prepacked fwd `0.5960 ms`, end-to-end `0.7366 ms`;
+  - `S=2048`: quant kernel `0.2800 ms`, prepacked fwd `2.1070 ms`, end-to-end `2.2869 ms`;
+  - `S=4096`: quant kernel `0.4486 ms`, prepacked fwd `8.6455 ms`, end-to-end `8.9592 ms`;
+  - `S=8192`: quant kernel `0.7856 ms`, prepacked fwd `35.4946 ms`, end-to-end `36.0928 ms`.
+- Generated-code findings for 8-wave baseline versus K/V-staged sentinel:
+  - `global_load_d16_u8` / `global_load_d16_hi_u8` dropped from `48` / `48` to `0` / `0` in the fwd symbol;
+  - `global_load_b128` dropped from `48` to `34`;
+  - `ds_load_b128` increased from `36` to `52`, `ds_store_b128` from `4` to `6`, `s_barrier` from `4` to `5`, and `s_waitcnt` from `149` to `185`;
+  - VGPR is `226`, scratch/private segment remains `0`;
+  - WMMA count remains `32` and `v_exp_f32` count remains `33`.
+- Profile: `PYTHONPATH=~/ComfyUI-FeatherOps ~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/bin/rocprofv3 --kernel-trace --stats --pmc LDSBankConflict -d /tmp/opencode/rocprof_kvstage_pyroot -- python tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_configured --iters 5 --warmup 2 --config 128,32,82`.
+- Profile findings:
+  - `fwd_kernel_kv_staged_d128<128,32,8>` average duration `8576.611 us` over 7 fwd dispatches;
+  - `LDSBankConflict` average `0.0`, total `0.0`;
+  - this keeps the zero-bank-conflict property while adding raw K/V LDS staging.
+- Keep reason:
+  - this is the first structural staging change that removes the V global scalar-load pattern and is selected by autotune at the primary `S=4096` and large `S=8192` sizes;
+  - `S=8192` improves materially in both end-to-end and prepacked modes;
+  - `S=4096` end-to-end improves and prepacked remains in the baseline range;
+  - no scratch and no LDS bank conflicts.
+
+#### A12-E: Load/Compute Overlap And Scheduling
+
+- Only after A12-B/C establishes the new dataflow, tune waitcnt/barrier placement and prefetch distance.
+- Compare against AITER generated code for broad structure only:
+  - `buffer_load_b128` / `ds_load_b128` density;
+  - barrier count and placement;
+  - VGPR/LDS footprint;
+  - absence of scratch.
+- Do not repeat the rejected standalone scheduler-barrier experiment. Scheduler barriers are allowed only when tied to a concrete prefetch/staging pipeline.
+
+#### A12 Implementation Rules
+
+- Add the A12 kernel behind an explicit config/tag so the existing baseline remains callable during development.
+- Keep public Python wrapper APIs unchanged unless the A12 kernel becomes a clear keeper.
+- Keep all A12 milestones fixed to `D=128`, `Br=128`, `Bc=32`, non-causal, and full blocks until the primary shape improves.
+- Use the non-negotiable run protocol after each source experiment:
+  - check for running benchmark/profile jobs;
+  - run `python test_attn_hip.py`;
+  - run `python benchmark_attn_hip.py`;
+  - inspect generated code or profile before explaining any regression;
+  - revert failed steps and skip post-revert runs.
+- Commit only a kept source baseline, not rejected A12 scaffolding.
+
 ## Non-Negotiable Run Protocol
 
 1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
@@ -612,18 +943,13 @@ Decision for now:
 
 ## Durable Findings
 
-- The pre-A4 baseline was structurally behind AITER by about `2.8-2.9x` at large S.
-- A4-B/A4-C reduced the large-S gap from about `2.8-2.9x` to about `1.6-1.7x`; the current path is still structurally behind AITER but no longer dominated by the output-accumulator LDS round trip.
-- A9-A further reduced the large-S gap to about `1.45-1.5x` by shrinking the contiguous K fp8 decode path.
-- Padded `Si` stride further reduced the large-S gap to about `1.2-1.3x` and removed HIP `LDSBankConflict` (`65.753 -> 0.0` average per fwd dispatch at `S=4096`).
-- Branchless packed RNE quantization reduces large-S end-to-end overhead while keeping the combined correctness gate; plain truncation is not acceptable without an unreasonable tolerance loosen.
 - The 128-bit audit shows Q/global and LDS tile movement are already wide; the next memory-width target is V-side fp8 access/decode, not output stores.
 - The high-priority issues are not likely fixed by only changing autotune order:
   - full score/probability materialization in LDS;
   - repeated output accumulator materialization in fp16 LDS;
   - row softmax work concentrated into `tx < Br`;
   - strided V loads for PV WMMA.
-- HND is probably the better internal layout for a one-head-per-workgroup HIP kernel, but this must be verified against NHD because AITER/SageAttention APIs are NHD-capable and model integration may matter.
+- A5 verifies HND is the better internal layout for this one-head-per-workgroup HIP kernel; direct NHD views and one-call NHD-to-HND pack/swizzle variants both lose end-to-end.
 - V layout should be considered separately from public tensor layout. A V-specific packed fp8 layout can improve PV loads without forcing public NHD tensors.
 - Accuracy should use the combined tolerance `0.05 * abs(ref_fp16) + 0.05`, not independent relative and absolute gates.
 - Tolerances are a speed/quality policy lever: loosen only with a documented speed reason, and tighten after visual Qwen-Image validation exists.
@@ -632,21 +958,33 @@ Decision for now:
 - The standalone VT fp8 path was rejected and removed. It was slower in normal benchmark fwd time and increased `S=4096` quantization/prepack from about `0.60 ms` to about `2.54 ms`.
 - Adding AITER-inspired `Br=128/Bc=32` configs is a small keeper. It improves the primary `S=4096` end-to-end result to about `9.95 TFLOPS`, but it does not change the conclusion that the forward algorithm is structurally behind AITER.
 - Profiling confirms the algorithmic gap: AITER `attn_fwd` is about `7.37 ms` with `32 KB` LDS and `224` VGPRs; HIP `fwd_kernel<128,32,16>` is about `21.12 ms` with `40 KB` LDS and `88` VGPRs. HIP has no scratch, so the next target is LDS/barrier/softmax structure, not spill cleanup.
+- Local softmax micro-optimizations are exhausted: splitting a `Bc=32` row across two lanes and caching score halves in the current `Si` structure did not produce a keeper.
+- The next worthwhile structural target is row-block wave ownership with register-resident score/P and row-owned output, then V/K staging inside that new dataflow.
+- A12-A shows row-block wave ownership without register-P/PV is not enough: it increases VGPR pressure and V scalar-load footprint while autotune keeps selecting the old `(128,32,8)` kernel.
+- A12-D1 shows Q load-once via LDS is not viable on top of the row-owned/`Si` scaffold: it raises LDS to `44 KB`, VGPR to `252`, and introduces private segment use.
+- A12-D2 shows standalone raw K LDS staging on the current baseline mapping is not enough: it reduces global K vector loads but adds LDS loads, a barrier, and waitcnt pressure while V scalar loads and `Si` materialization remain.
+- A12-D3 raw K/V LDS staging is a keeper: it removes V global scalar loads from the fwd symbol, keeps `LDSBankConflict=0.0`, and improves large-S throughput while preserving correctness.
 
 ## Do-Not-Repeat (Unless New Preconditions)
 
 - Do not spend multiple iterations on minor config reordering before decomposing quantize/fwd cost.
-- Do not optimize NHD first unless HND vs NHD benchmarking proves it matters end-to-end.
-- Do not add Q quantization before the fwd kernel removes its obvious LDS/softmax bottlenecks.
 - Do not claim a prepacked-only win as an end-to-end win unless prepack cost is also measured.
-- Do not continue standalone `[B,H,D,S]` VT prepack unless a new forward kernel changes the memory-access preconditions; it is already slower as implemented.
+- Do not add Q quantization before the fwd kernel removes its obvious LDS/softmax bottlenecks.
+- Do not pursue CDNA MFMA-specific CK paths for gfx1151. Use CK only for fused-attention dataflow/layout ideas that can be mapped to RDNA3.5 WMMA.
 - Do not copy SageAttention int8 strategies directly without checking gfx1151 ISA and generated code. RDNA3.5 does not have faster int8 wmma than fp16.
+- Do not continue standalone `[B,H,D,S]` VT prepack unless a new forward kernel changes the memory-access preconditions; it is already slower as implemented.
+- Do not re-add the `(128,32,80)` row-owned sentinel unless the implementation also removes `Si` score/probability materialization or fixes the V scalar-load footprint.
+- Do not re-add the `(128,32,81)` raw K-staged sentinel on the current baseline mapping; K staging needs a register-P/PV or fused K/V staging precondition.
 
 ## Reference
 
 - `~/amd-llvm-project/`, especially `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst` - hipcc source code
 - `~/rdna35-isa-markdown/`
 - `~/aiter/aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/fwd_prefill.py` - AITER FlashAttention forward reference
+- `~/rocm-libraries/projects/composablekernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp` - CK-Tile QR FMHA dataflow reference
+- `~/rocm-libraries/projects/composablekernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qx_ks_vs_custom_policy.hpp` - CK-Tile Q-load, K/V LDS, and V-shuffle policy reference
+- `~/rocm-libraries/projects/composablekernel/dispatcher/codegen/fmha/fmha_arch_specs.json` - CK FMHA tile/wave/warp config reference
+- `~/rocm-libraries/shared/rocroller/docs/src/LDSSwizzling.md` - LDS swizzle reference for bank-conflict reasoning
 - `~/SageAttention/sageattention/triton/quant_per_block.py` - SageAttention per-block int8 quantization reference
 - `~/SageAttention/sageattention/triton/quant_per_thread.py` - SageAttention per-thread int8 quantization reference
 - `~/SageAttention/sageattention/triton/attn_qk_int8_per_block.py` - SageAttention Triton int8-QK attention reference

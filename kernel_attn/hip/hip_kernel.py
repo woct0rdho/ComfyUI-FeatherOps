@@ -10,6 +10,8 @@ from .utils import generate_autotune_configs, get_compatible_config, old_autotun
 _CONFIGS = [
     (128, 32, 16),
     (128, 32, 8),
+    # Sentinel N_WAVES=82 selects the raw K/V LDS-staged 8-wave kernel.
+    (128, 32, 82),
 ]
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
