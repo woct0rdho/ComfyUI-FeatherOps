@@ -4,7 +4,6 @@ import folder_paths
 import torch
 from comfy.sd import load_diffusion_model
 
-from .debug_ops import DebugOps
 from .ops import FeatherOps
 from .sampling import install_sampling_model_pin
 
@@ -15,7 +14,6 @@ class FeatherUNetLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "ops": (["feather", "debug"],),
                 "model_type": (["qwen", "wan", "default"],),
             }
         }
@@ -24,7 +22,7 @@ class FeatherUNetLoader:
     FUNCTION = "load_unet"
     CATEGORY = "loaders"
 
-    def load_unet(self, unet_name, ops, model_type):
+    def load_unet(self, unet_name, model_type):
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
 
         if model_type == "qwen":
@@ -54,14 +52,9 @@ class FeatherUNetLoader:
             FeatherOps.excluded_names = []
             FeatherOps.out_dtype = torch.bfloat16
 
-        if ops == "feather":
-            model_options = {"custom_operations": FeatherOps}
-        else:
-            model_options = {"custom_operations": DebugOps}
-
+        model_options = {"custom_operations": FeatherOps}
         model = load_diffusion_model(unet_path, model_options=model_options)
-        if ops == "feather":
-            install_sampling_model_pin(model)
+        install_sampling_model_pin(model)
         return (model,)
 
 
