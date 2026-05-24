@@ -1,4 +1,3 @@
-import comfy.float
 import torch
 import torch.nn.functional as F
 from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_weight
@@ -6,32 +5,7 @@ from torch import nn
 
 from ..kernel.hip.hip_kernel import scaled_mm_hip
 from .lora import apply_lora_patches
-
-
-# (N, K) -> (K/16, N, 16)
-def prepack_transpose(x):
-    N, K = x.shape
-    return x.view(N, K // 16, 16).permute(1, 0, 2).contiguous()
-
-
-# (K/16, N, 16) -> (N, K)
-def unprepack_transpose(x):
-    k, N, _ = x.shape
-    return x.permute(1, 0, 2).reshape(N, k * 16)
-
-
-def quantize_fp8e5m2_scaled(x, seed=None):
-    scale = torch.amax(x.abs()).to(dtype=torch.float32) / torch.finfo(torch.float8_e5m2).max
-    if x.dtype not in {torch.float32, torch.bfloat16}:
-        dtype_info = torch.finfo(x.dtype)
-        scale = 1.0 / torch.clamp(1.0 / scale, min=dtype_info.min, max=dtype_info.max)
-
-    x = x * (1.0 / scale).to(dtype=x.dtype)
-    if seed is not None and seed > 0:
-        x = comfy.float.stochastic_rounding(x, dtype=torch.float8_e5m2, seed=seed)
-    else:
-        x = x.to(torch.float8_e5m2)
-    return x, scale.float()
+from .quant import get_feather_plain_tensors, is_feather_quantized_weight, make_feather_quantized_weight, quantize_feather_weight, unprepack_transpose
 
 
 class FeatherOps(manual_cast):
@@ -42,7 +16,6 @@ class FeatherOps(manual_cast):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.is_quantized = False
-            self.weight_scale = None
 
         def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
             weight_key = prefix + "weight"
@@ -67,15 +40,10 @@ class FeatherOps(manual_cast):
                     self.weight = nn.Parameter(weight, requires_grad=False)
                 else:
                     self.is_quantized = True
-
-                    # Currently the kernel only supports fp8e5m2 weight
-                    weight = weight.to(torch.float8_e5m2)
-                    weight = prepack_transpose(weight)
-                    self.weight = nn.Parameter(weight, requires_grad=False)
-
-                if weight_scale is not None:
-                    # The kernel applies scale in fp32 before output casting
-                    self.weight_scale = weight_scale.to(torch.float32)
+                    self.weight = nn.Parameter(
+                        make_feather_quantized_weight(weight, weight_scale, FeatherOps.out_dtype),
+                        requires_grad=False,
+                    )
             else:
                 missing_keys.append(weight_key)
 
@@ -87,28 +55,25 @@ class FeatherOps(manual_cast):
         def convert_weight(self, weight, inplace=False, **kwargs):
             if not self.is_quantized:
                 return weight
+
+            if is_feather_quantized_weight(weight):
+                return weight.dequantize()
+
+            # Backward-compatible fallback for older in-memory packed weights
             weight = unprepack_transpose(weight)
-            if self.weight_scale is not None:
-                scale = self.weight_scale.to(device=weight.device, dtype=torch.float32)
-                weight = (weight.to(torch.float32) * scale).to(weight.dtype)
             return weight
 
         def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
             if not self.is_quantized:
                 weight = weight.to(self.weight.dtype)
-                weight_scale = None
             else:
-                # Currently the kernel only supports fp8e5m2 weight
-                weight, weight_scale = quantize_fp8e5m2_scaled(weight, seed=seed)
-                weight = prepack_transpose(weight)
+                weight = quantize_feather_weight(weight, seed=seed, inplace_ops=True)
 
             if return_weight:
                 return weight
 
             assert inplace_update is False  # TODO: eventually remove the inplace_update stuff
             self.weight = nn.Parameter(weight, requires_grad=False)
-            if weight_scale is not None:
-                self.weight_scale = weight_scale
 
         def forward(self, x):
             run_every_op()
@@ -130,8 +95,9 @@ class FeatherOps(manual_cast):
             self.weight_function = []
 
             bias_dtype = self.bias.dtype if self.bias is not None else None
-            weight, bias, offload_stream = cast_bias_weight(self, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True)
-            scale = self.weight_scale.to(device=x.device, dtype=torch.float32) if self.weight_scale is not None else None
+            weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True)
+            weight, scale = get_feather_plain_tensors(weight)
+            scale = scale.to(device=x.device, dtype=torch.float32)
 
             y = scaled_mm_hip(x_fp16, weight, scale, bias, out_dtype=FeatherOps.out_dtype)
 
