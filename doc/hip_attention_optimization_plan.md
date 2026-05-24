@@ -36,13 +36,13 @@ Latest benchmark CSV: `attn_hip.csv`.
 
 | S | AITER TFLOPS | HIP TFLOPS | HIP Prepacked TFLOPS | HIP/AITER | AITER ms | HIP ms | HIP Prepacked ms |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 1024 | 22.203998 | 17.621812 | 21.118083 | 79.4% | 0.580 | 0.731 | 0.610 |
-| 2048 | 27.463989 | 22.507469 | 24.202511 | 82.0% | 1.877 | 2.290 | 2.130 |
-| 4096 | 27.192308 | 22.823213 | 23.567182 | 83.9% | 7.582 | 9.034 | 8.749 |
-| 8192 | 27.306838 | 22.914635 | 23.389831 | 83.9% | 30.200 | 35.990 | 35.258 |
+| 1024 | 22.218375 | 17.699625 | 21.715846 | 79.7% | 0.580 | 0.728 | 0.593 |
+| 2048 | 27.502781 | 22.206512 | 24.004859 | 80.7% | 1.874 | 2.321 | 2.147 |
+| 4096 | 27.477566 | 23.033576 | 23.751923 | 83.8% | 7.503 | 8.950 | 8.680 |
+| 8192 | 27.353322 | 22.736288 | 23.170572 | 83.1% | 30.147 | 36.269 | 35.590 |
 
 Interpretation:
-- The HIP kernel is about `1.19x` slower than AITER on large S after raw K/V LDS staging.
+- The HIP kernel is about `1.19x` slower than AITER on large S after raw K/V LDS staging and cleanup.
 - HIP TFLOPS is still flatter than AITER from `S=1024` to `8192`, but A4-B/A4-C plus A9-A plus padded `Si` stride plus packed RNE quantization lifted the large-S plateau from about `10 TFLOPS` to about `22-24 TFLOPS`.
 - The large-S gap is too large for tuning-only polish; the current algorithm structure likely dominates.
 - Internal K/V quantization is `O(BHSD)`, while attention is `O(BHS^2D)`, so quantization cannot explain the `S=4096` and `8192` gap by itself. It can still matter at `S=1024` and must be decomposed.
@@ -51,15 +51,15 @@ Interpretation:
 
 - `attn_fp16_fp8kv` currently launches two kernels:
   - `quantize_kv_e5m2_kernel` converts fp16 K/V to contiguous fp8e5m2 buffers;
-  - `fwd_kernel` runs tiled attention over one `(B,H,Br)` query block per workgroup.
-- The default/general forward kernel materializes intermediate state in LDS:
+  - `fwd_kernel_kv_staged_d128<128,32,8>` runs tiled attention over one `(B,H,Br)` query block per workgroup.
+- The current forward kernel still materializes intermediate score/probability state in LDS:
   - `Si` stores the `Br x Bc` QK score/probability tile in fp16;
-  - `Oi` stores the `Br x D` output accumulator in fp16;
-  - every K/V tile does QK WMMA, `__syncthreads`, scalar-ish row softmax, `__syncthreads`, PV WMMA, `__syncthreads`.
+  - raw fp8 K/V tiles are staged in LDS with stride `D + 16`;
+  - every K/V tile stages K/V, `__syncthreads`, does QK WMMA, `__syncthreads`, scalar-ish row softmax, `__syncthreads`, PV WMMA, `__syncthreads`.
 - The softmax update is mostly assigned to `tx < Br`, so only one thread per row performs max, exp, sum, probability conversion, and output rescale over full row fragments.
-- The output accumulator is repeatedly rounded through fp16 in LDS after each K/V tile; this is both a performance cost and an accuracy compromise.
-- The specialized A4-B/A4-C path for `(Br=128, Bc=32, N_WAVES in {8, 16}, D=128)` keeps the output accumulator in fp32 registers and stores only `Si`, `alpha`, and final `inv_l` in LDS.
-- The kept A12-D3 path uses sentinel config `(128,32,82)` and stages raw fp8 K/V tiles in LDS before QK/PV; autotune selects it at `S=1024`, `4096`, and `8192`.
+- The output accumulator stays in fp32 registers and is only normalized/stored once, but the `Si` score/probability LDS round trip remains.
+- The specialized A4-C/A12-D3 path for `(Br=128, Bc=32, N_WAVES=8, D=128)` keeps the output accumulator in fp32 registers and stores only `Si`, `alpha`, final `inv_l`, and raw K/V tiles in LDS.
+- A12-D6 removed the temporary staged sentinel and makes normal config `(128,32,8)` launch the raw fp8 K/V LDS-staged kernel directly.
 - The specialized path now pads `Si` row stride from `Bc=32` to `40` half elements to avoid LDS bank conflicts.
 - K loads for QK are naturally row-major and contiguous over `D`.
 - V loads for PV are currently hostile to coalescing: the WMMA fragment needs 16 tokens for a fixed output-dim lane, but row-major V means those 16 fp8 bytes are separated by `D=128` bytes. A standalone `[B,H,D,S]` VT prepack did not help enough; revisit V packing only as part of a new forward structure.
@@ -144,7 +144,7 @@ Decision:
 | A9 | KEEP partial | perm-based `fp8e5m2x4_to_half2x2` decode | A9-A lifts `S=4096` prepacked to `19.55 TFLOPS`; V-side strided fp8 loads still scalarized | reduce conversion overhead if the combined tolerance gate still passes |
 | A10 | KEEP findings | 128-bit load/store audit | Q/global and LDS tile movement use 128-bit ops; strided fp8 V loads and final output stores are narrower | verify hot-path reads/writes stay at the widest legal vector width |
 | A11 | REJECT | local softmax micro-optimizations inspired by CK/AITER distributed reductions | two-lane split regressed; single-lane score-cache was mixed and generated nearly identical hot-loop counts | isolated softmax patches do not fix the score-LDS/PV-load structure; move to full register-tile rewrite |
-| A12 | KEEP partial | fixed-shape RDNA3.5 WMMA structural staging | raw K/V LDS staging sentinel `(128,32,82)` is kept and selected at `S=1024/4096/8192`; row-owned skeleton and Q-LDS staging were rejected | reduce hostile V global scalar loads and K reloads while preserving current correct `Si`/PV dataflow |
+| A12 | KEEP partial | fixed-shape RDNA3.5 WMMA structural staging | raw K/V LDS staging is now the only normal `(128,32,8)` fp8 path; row-owned skeleton, Q-LDS staging, smaller K/V stride, and `Bc=64` staging were rejected | reduce hostile V global scalar loads and K reloads while preserving current correct `Si`/PV dataflow |
 
 ## Next Steps
 
@@ -804,6 +804,24 @@ Decision:
   - compare generated V-load counts against baseline `global_load_d16_u8` / `global_load_d16_hi_u8`;
   - keep V staging only if it improves the A12 register-P kernel, not as a standalone API/layout change.
 
+##### A12-B/C1: Wave-Shuffle Register-P/PV Sentinel
+
+- Status: rejected and reverted after correctness failure.
+- Change tested:
+  - added sentinel config `(128,32,83)` with one wave owning each 16-row query block;
+  - staged raw fp8 K/V tiles in LDS using the kept `D + 16` stride;
+  - computed two QK WMMA fragments per wave for the `Bc=32` tile;
+  - attempted to transpose QK C-fragments into PV A-fragments with wave `__shfl`, avoiding the full `Si` score/probability LDS tile;
+  - accumulated all eight `D=128` output fragments for the row-owned wave in registers.
+- Correctness: `python test_attn_hip.py` failed the sentinel while the kept configs still passed.
+- Failure details:
+  - `(128,32,83)` at `S=1024`: `fp16_ref_l2=1.05`, `fp16_ref_max=0.452`, `fp16_tol_ratio=6.76`;
+  - `(128,32,83)` at `S=4096`: `fp16_ref_l2=1.06`, `fp16_ref_max=0.167`, `fp16_tol_ratio=3.16`.
+- Rejection reason:
+  - the register-P/PV dataflow is directionally correct but the first C-fragment-to-A-fragment wave-shuffle mapping is not correct enough to benchmark;
+  - per protocol, no benchmark/profile was run after the correctness failure.
+- Revert result: removed the `(128,32,83)` sentinel kernel, dispatch branch, and Python config entry. A later attempt must first validate the WMMA fragment transpose on a minimal QK/PV fixture before re-entering the full attention benchmark protocol.
+
 #### A12-D: Q Load-Once And K Staging
 
 - Once row ownership works, load Q fragments once per query row block and reuse them across all K/V blocks.
@@ -905,6 +923,95 @@ Decision:
   - `S=4096` end-to-end improves and prepacked remains in the baseline range;
   - no scratch and no LDS bank conflicts.
 
+##### A12-D4: Smaller Raw K/V LDS Stride
+
+- Status: rejected and reverted.
+- Motivation:
+  - A12-D3 improved large-S performance but added raw K/V LDS footprint and wait pressure;
+  - this tested whether reducing the raw K/V LDS stride from `D + 16` to `D + 8` could preserve the zero-conflict staging path with less LDS footprint.
+- Change tested:
+  - changed only the staged sentinel `(128,32,82)` K/V LDS stride and launch LDS size from `D + 16` to `D + 8`;
+  - kept the same public API, config list, QK/PV code, and `Si` stride.
+- Correctness: `python test_attn_hip.py` passed `3/3` configs.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Benchmark outcome:
+  - autotune selected the existing `(128,32,8)` path for all sizes and both end-to-end/prepacked modes, so the modified staged path was no longer competitive;
+  - selected-path results regressed versus kept A12-D3 at large S, e.g. `S=8192` HIP `22.135442 TFLOPS`, prepacked `22.513205 TFLOPS`;
+  - `S=4096` selected-path results were HIP `22.582749 TFLOPS`, prepacked `23.578126 TFLOPS`.
+- Generated-code findings:
+  - staged-kernel static counts were unchanged versus A12-D3: `34` `global_load_b128`, `0/0` `global_load_d16_u8`/`global_load_d16_hi_u8`, `52` `ds_load_b128`, `6` `ds_store_b128`, `5` `s_barrier`, `185` `s_waitcnt`, `32` WMMA, and `33` `v_exp_f32`;
+  - VGPR stayed `226`, scratch/private segment stayed `0`, and code size was unchanged.
+- Profile: `PYTHONPATH=~/ComfyUI-FeatherOps ~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/bin/rocprofv3 --kernel-trace --stats --pmc LDSBankConflict -d /tmp/opencode/rocprof_kvstride8 -- python tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_configured --iters 5 --warmup 2 --config 128,32,82`.
+- Profile findings:
+  - forced `(128,32,82)` average duration worsened to `12443.569 us` over 7 fwd dispatches;
+  - `LDSBankConflict` remained `0.0` total/average, so the slowdown is not captured by the bank-conflict counter;
+  - because the static instruction mix was unchanged, the likely cause is a less favorable dynamic LDS address phase/scheduling pattern despite the smaller footprint.
+- Rejection reason:
+  - smaller K/V LDS footprint did not translate into less executed work and made the staged path slow enough that autotune avoided it;
+  - keep `D + 16` as the raw K/V LDS stride unless a later register-P/PV layout changes the access pattern.
+- Revert result: `kernel_attn/hip/hip_kernel.cu` was restored to the kept A12-D3 stride. Per protocol, no test/benchmark/profile was run after this revert.
+
+##### A12-D5: Raw K/V LDS Staging With `Bc=64`
+
+- Status: rejected and removed.
+- Motivation:
+  - after A12-D3 removed V scalar global loads, retest a larger K/V tile as a new precondition to amortize K/V-loop barriers and staging over `Bc=64`.
+- Change tested:
+  - generalized `fwd_kernel_kv_staged_d128` to instantiate `Bc=64` behind temporary sentinel config `(128,64,85)`;
+  - kept raw K/V LDS stride `D + 16` and the existing `Si`/softmax/PV dataflow.
+- Correctness: `python test_attn_hip.py` passed `4/4` configs including `(128,64,85)`.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Benchmark outcome:
+  - autotune still selected the existing staged `(128,32,82)` path at every target size and in both end-to-end/prepacked modes;
+  - selected-path results were good but not caused by the `Bc=64` candidate: `S=4096` HIP `24.123188 TFLOPS`, prepacked `25.310475 TFLOPS`; `S=8192` HIP `24.322420 TFLOPS`, prepacked `24.895708 TFLOPS`.
+- Forced-profile findings:
+  - forced `(128,64,85)` at `S=4096` averaged `8311.413 us` over 7 fwd dispatches;
+  - same-session forced `(128,32,82)` averaged `8193.236 us`;
+  - `Bc=64` introduced nonzero `LDSBankConflict` average `4.159` while the `Bc=32` staged path stayed `0.0`.
+- Generated-code findings:
+  - `Bc=64` staged symbol had VGPR `146`, scratch/private segment `0`, but a larger text body than the `Bc=32` staged symbol;
+  - lower VGPR did not offset the larger tile's LDS conflict and scheduling costs.
+- Rejection reason:
+  - `Bc=64` was never selected by autotune and was slower than `Bc=32` when forced in the profiler;
+  - it also loses the zero-bank-conflict property, so it is not a keeper.
+- Revert result: removed the `(128,64,85)` config and dispatch branch while doing the staged-path cleanup. No post-revert run was performed for the rejected candidate alone.
+
+##### A12-D6: Normalize Raw K/V LDS Staging As The Only FP8 Path
+
+- Status: kept.
+- Motivation:
+  - after repeated benchmark runs selected the raw K/V LDS-staged kernel and the non-staged path no longer provided a primary-shape win, remove dead autotune/config/dispatch overhead and the temporary sentinel.
+- Change:
+  - `_CONFIGS` is now only `(128,32,8)`;
+  - normal `(128,32,8)` dispatch launches `fwd_kernel_kv_staged_d128<128,32,8>` directly;
+  - removed temporary sentinel `(128,32,82)` and unsupported `(128,32,16)` from the fp8 wrapper config list;
+  - deleted `fwd_kernel_reg_o_d128`, `ConfigTag`, and the generic non-staged dispatch scaffolding;
+  - public wrapper APIs remain unchanged, but only the kept `D=128`, `Br=128`, `Bc=32`, `N_WAVES=8` config is accepted.
+- Correctness: `python test_attn_hip.py` passed `1/1` configs.
+- Benchmark: `python benchmark_attn_hip.py`.
+- Main benchmark results:
+  - `S=1024`: HIP `17.699625 TFLOPS`, prepacked `21.715846 TFLOPS`;
+  - `S=2048`: HIP `22.206512 TFLOPS`, prepacked `24.004859 TFLOPS`;
+  - `S=4096`: HIP `23.033576 TFLOPS`, prepacked `23.751923 TFLOPS`;
+  - `S=8192`: HIP `22.736288 TFLOPS`, prepacked `23.170572 TFLOPS`.
+- Decomposed timings:
+  - `S=1024`: quant kernel `0.1532 ms`, prepacked fwd `0.6053 ms`, end-to-end `0.7332 ms`;
+  - `S=2048`: quant kernel `0.2845 ms`, prepacked fwd `2.1437 ms`, end-to-end `2.3436 ms`;
+  - `S=4096`: quant kernel `0.4399 ms`, prepacked fwd `8.6040 ms`, end-to-end `9.0838 ms`;
+  - `S=8192`: quant kernel `0.7815 ms`, prepacked fwd `35.3417 ms`, end-to-end `35.9544 ms`.
+- Generated-code findings:
+  - only two GPU kernels remain in the extension image: `quantize_kv_e5m2_kernel` and `fwd_kernel_kv_staged_d128<128,32,8>`;
+  - staged-kernel counts match the kept A12-D3 symbol: `34` `global_load_b128`, `0/0` `global_load_d16_u8`/`global_load_d16_hi_u8`, `52` `ds_load_b128`, `6` `ds_store_b128`, `5` `s_barrier`, `185` `s_waitcnt`, `32` WMMA, and `33` `v_exp_f32`;
+  - VGPR is `226`, scratch/private segment remains `0`.
+- Profile: `PYTHONPATH=~/ComfyUI-FeatherOps ~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/bin/rocprofv3 --kernel-trace --stats --pmc LDSBankConflict -d /tmp/opencode/rocprof_cleanup_staged -- python tmp_attn_fp8kv_analysis/profile_attn_hip.py -N 4096 --mode prepacked_configured --iters 5 --warmup 2 --config 128,32,8`.
+- Profile findings:
+  - `fwd_kernel_kv_staged_d128<128,32,8>` average duration `8546.388 us` over 7 fwd dispatches;
+  - `LDSBankConflict` average `0.0`, total `0.0`.
+- Keep reason:
+  - the cleanup removes unsupported paths and the temporary sentinel without changing the staged generated-code structure;
+  - `S=4096` improves versus the kept A12-D3 benchmark, and the small `S=2048`/`S=8192` differences are within the same run-to-run band seen during staged-kernel profiling;
+  - the zero-bank-conflict, no-scratch properties are preserved.
+
 #### A12-E: Load/Compute Overlap And Scheduling
 
 - Only after A12-B/C establishes the new dataflow, tune waitcnt/barrier placement and prefetch distance.
@@ -963,7 +1070,7 @@ Decision:
 - A12-A shows row-block wave ownership without register-P/PV is not enough: it increases VGPR pressure and V scalar-load footprint while autotune keeps selecting the old `(128,32,8)` kernel.
 - A12-D1 shows Q load-once via LDS is not viable on top of the row-owned/`Si` scaffold: it raises LDS to `44 KB`, VGPR to `252`, and introduces private segment use.
 - A12-D2 shows standalone raw K LDS staging on the current baseline mapping is not enough: it reduces global K vector loads but adds LDS loads, a barrier, and waitcnt pressure while V scalar loads and `Si` materialization remain.
-- A12-D3 raw K/V LDS staging is a keeper: it removes V global scalar loads from the fwd symbol, keeps `LDSBankConflict=0.0`, and improves large-S throughput while preserving correctness.
+- A12-D3/D6 raw K/V LDS staging is the current fp8 baseline: it removes V global scalar loads from the fwd symbol, keeps `LDSBankConflict=0.0`, and improves large-S throughput while preserving correctness.
 
 ## Do-Not-Repeat (Unless New Preconditions)
 
@@ -973,8 +1080,6 @@ Decision:
 - Do not pursue CDNA MFMA-specific CK paths for gfx1151. Use CK only for fused-attention dataflow/layout ideas that can be mapped to RDNA3.5 WMMA.
 - Do not copy SageAttention int8 strategies directly without checking gfx1151 ISA and generated code. RDNA3.5 does not have faster int8 wmma than fp16.
 - Do not continue standalone `[B,H,D,S]` VT prepack unless a new forward kernel changes the memory-access preconditions; it is already slower as implemented.
-- Do not re-add the `(128,32,80)` row-owned sentinel unless the implementation also removes `Si` score/probability materialization or fixes the V scalar-load footprint.
-- Do not re-add the `(128,32,81)` raw K-staged sentinel on the current baseline mapping; K staging needs a register-P/PV or fused K/V staging precondition.
 
 ## Reference
 
