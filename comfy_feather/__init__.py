@@ -1,7 +1,4 @@
 from .loader import FeatherCLIPTextEncodePadded, FeatherUNetLoader
-from .preview import patch_taehv_preview
-
-patch_taehv_preview()
 
 NODE_CLASS_MAPPINGS = {
     "FeatherUNetLoader": FeatherUNetLoader,

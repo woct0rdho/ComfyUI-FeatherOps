@@ -6,6 +6,7 @@ from comfy.sd import load_diffusion_model
 
 from .debug_ops import DebugOps
 from .ops import FeatherOps
+from .sampling import install_sampling_model_pin
 
 
 class FeatherUNetLoader:
@@ -59,6 +60,8 @@ class FeatherUNetLoader:
             model_options = {"custom_operations": DebugOps}
 
         model = load_diffusion_model(unet_path, model_options=model_options)
+        if ops == "feather":
+            install_sampling_model_pin(model)
         return (model,)
 
 
