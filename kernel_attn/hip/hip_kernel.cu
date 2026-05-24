@@ -24,6 +24,7 @@ typedef float fp32x16_t __attribute__((ext_vector_type(16)));
 #define HALF16(pointer) (reinterpret_cast<const fp16x16_t*>(&(pointer))[0])
 #define HALF16W(pointer) (reinterpret_cast<fp16x16_t*>(&(pointer))[0])
 #define U32X4(pointer) (reinterpret_cast<const uint32x4_t*>(&(pointer))[0])
+#define U32X4W(pointer) (reinterpret_cast<uint32x4_t*>(&(pointer))[0])
 
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
@@ -269,6 +270,140 @@ __device__ void store_O_reg(
 
 template <int Br, int Bc, int N_WAVES>
 __global__ void __launch_bounds__(kWaveSize * N_WAVES)
+fwd_kernel_kv_staged_d128(
+    const half_bits_t* __restrict__ const q,
+    const fp8e5m2_t* __restrict__ const k,
+    const fp8e5m2_t* __restrict__ const v,
+    half_bits_t* __restrict__ const o,
+    const int Tr,
+    const int Tc,
+    const int64_t q_stride0,
+    const int64_t q_stride1,
+    const int64_t q_stride2,
+    const int64_t kv_stride0,
+    const int64_t kv_stride1,
+    const int64_t kv_stride2,
+    const float scale)
+{
+    static_assert(Br == 128 && Bc == 32 && N_WAVES == 8);
+    constexpr int kD = 128;
+    constexpr int kSiStride = Bc + 8;
+    constexpr int kKVLdsStride = kD + 16;
+    constexpr int kRegTiles = ((Br * kD) / (kWmmaM * kWmmaN) + N_WAVES - 1) / N_WAVES;
+
+    const int q_offset = blockIdx.x * q_stride0 + blockIdx.y * q_stride1;
+    const int kv_offset = blockIdx.x * kv_stride0 + blockIdx.y * kv_stride1;
+
+    const int ld_q = q_stride2;
+    const int ld_kv = kv_stride2;
+
+    const int Tr_i = blockIdx.z;
+    if (Tr_i >= Tr) return;
+
+    const int tx = threadIdx.x;
+
+    extern __shared__ half_bits_t sram[];
+    half_bits_t* __restrict__ const Si = &sram[0];
+    float* __restrict__ const alpha = reinterpret_cast<float*>(Si + Br * kSiStride);
+    float* __restrict__ const inv_l = alpha + Br;
+    fp8e5m2_t* __restrict__ const Ks = reinterpret_cast<fp8e5m2_t*>(inv_l + Br);
+    fp8e5m2_t* __restrict__ const Vs = Ks + Bc * kKVLdsStride;
+
+    fp32x8_t fragO[kRegTiles];
+    fp32x8_t zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    #pragma unroll
+    for (int i = 0; i < kRegTiles; ++i) {
+        fragO[i] = zero;
+    }
+
+    const half_bits_t* __restrict__ const Qi = q + q_offset + (Tr_i * Br) * ld_q;
+
+    float row_max_old = -INFINITY;
+    float l_i = 0;
+
+    for (int j = 0; j < Tc; ++j) {
+        const fp8e5m2_t* __restrict__ const Kj = k + kv_offset + (j * Bc) * ld_kv;
+        const fp8e5m2_t* __restrict__ const Vj = v + kv_offset + (j * Bc) * ld_kv;
+
+        #pragma unroll 1
+        for (int vec = tx; vec < Bc * (kD / 16); vec += kWaveSize * N_WAVES) {
+            const int kv_row = vec / (kD / 16);
+            const int kv_col = (vec % (kD / 16)) * 16;
+            U32X4W(Ks[kv_row * kKVLdsStride + kv_col]) = U32X4(Kj[kv_row * ld_kv + kv_col]);
+            U32X4W(Vs[kv_row * kKVLdsStride + kv_col]) = U32X4(Vj[kv_row * ld_kv + kv_col]);
+        }
+        __syncthreads();
+
+        float row_max_new = -INFINITY;
+        float row_sum = 0;
+        float rowmax_diff_exp = 0;
+
+        mul_A_BT<N_WAVES>(Qi, Ks, Si, ld_q, kKVLdsStride, kSiStride, Br, Bc, kD, scale);
+        __syncthreads();
+
+        if (tx < Br) {
+            float val32 = row_max_new;
+            #pragma unroll 2
+            for (int i = 0; i < Bc; i += 16) {
+                fp16x16_t val = HALF16(Si[(tx * kSiStride) + i]);
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val32 = fmaxf(val32, half_bits_to_fp32(val[j_idx]));
+                }
+            }
+            row_max_new = val32;
+
+            row_max_new = fmaxf(row_max_old, row_max_new);
+            rowmax_diff_exp = exp2f(row_max_old - row_max_new);
+            row_max_old = row_max_new;
+
+            #pragma unroll 4
+            for (int i = 0; i < Bc; i += 16) {
+                fp16x16_t val = HALF16(Si[(tx * kSiStride) + i]);
+                fp32x16_t val_f32;
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val_f32[j_idx] = half_bits_to_fp32(val[j_idx]);
+                }
+
+                val_f32 = val_f32 - row_max_new;
+
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val_f32[j_idx] = exp2f(val_f32[j_idx]);
+                }
+
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    row_sum += val_f32[j_idx];
+                }
+
+                #pragma unroll
+                for (int j_idx = 0; j_idx < 16; ++j_idx) {
+                    val[j_idx] = fp32_to_half_bits(val_f32[j_idx]);
+                }
+
+                HALF16W(Si[(tx * kSiStride) + i]) = val;
+            }
+            l_i = rowmax_diff_exp * l_i + row_sum;
+            alpha[tx] = rowmax_diff_exp;
+        }
+        __syncthreads();
+
+        rescale_mul_add_A_B_reg<N_WAVES, kRegTiles>(Si, Vs, alpha, fragO, kSiStride, kKVLdsStride, Br, kD, Bc);
+        __syncthreads();
+    }
+
+    if (tx < Br) {
+        inv_l[tx] = 1.0f / l_i;
+    }
+    __syncthreads();
+
+    store_O_reg<N_WAVES, kRegTiles>(fragO, o + q_offset + (Tr_i * Br) * ld_q, ld_q, inv_l, Br, kD);
+}
+
+template <int Br, int Bc, int N_WAVES>
+__global__ void __launch_bounds__(kWaveSize * N_WAVES)
 fwd_kernel_reg_o_d128(
     const half_bits_t* __restrict__ const q,
     const fp8e5m2_t* __restrict__ const k,
@@ -418,6 +553,29 @@ extern "C" bool launch_attn_fp16_fp8kv(
     hipStream_t stream)
 {
     if (d != 128) return false;
+
+    // Sentinel N_WAVES=82 selects the raw K/V LDS-staged 8-wave variant.
+    if (Br == 128 && Bc == 32 && N_WAVES == 82) {
+        const int Tr = n / Br;
+        const int Tc = n_kv / Bc;
+
+        const dim3 block(kWaveSize * 8);
+        const dim3 grid(b, h, Tr);
+
+        const int kSiStride = Bc + 8;
+        const int kKVLdsStride = d + 16;
+        const int sram_sz = Br * kSiStride * sizeof(half_bits_t) + 2 * Br * sizeof(float) + 2 * Bc * kKVLdsStride * sizeof(fp8e5m2_t);
+
+        hipLaunchKernelGGL(
+            (fwd_kernel_kv_staged_d128<128, 32, 8>),
+            grid, block, sram_sz, stream,
+            q, k, v, o,
+            Tr, Tc,
+            q_stride0, q_stride1, q_stride2,
+            kv_stride0, kv_stride1, kv_stride2,
+            scale * 1.4426950408889634f);
+        return true;
+    }
 
     const auto launch = [&](const auto tag) -> void {
         constexpr int kBr = decltype(tag)::kBr;
