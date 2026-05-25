@@ -18,9 +18,9 @@ It's a pity that AMD RDNA3/3.5 GPUs do not have faster int8 matmul than fp16, bu
 
 The kernel is written in HIP, with intrinsics and asm when needed, without abstraction levels like CK, Tensile, or Triton.
 
-The kernel computes fp16 @ fp8e5m2 -> bf16 mixed precision matmul. fp8 @ fp8 seems not achieving further speedup. We choose fp8e5m2 rather than fp8e4m3, and fp16 rather than bf16, because it's extremely fast to upcast fp8e5m2 to fp16 in the K-loop. We use fp32 accumulator in the wmma, and downcast to bf16 as the output to avoid overflow in ComfyUI workloads.
+The kernel computes fp16 @ fp8e5m2 -> fp16/bf16 mixed precision matmul. fp8 @ fp8 seems not achieving further speedup. We choose fp8e5m2 rather than fp8e4m3, and fp16 rather than bf16 for inputs, because it's extremely fast to upcast fp8e5m2 to fp16 in the K-loop. We use fp32 accumulator in the wmma, and downcast to fp16/bf16 for output depending on the model's compute dtype.
 
-The kernel requires the inputs to be aligned with the M/N/K block sizes, and there are no branches to handle OOB cases. This is satisfied in most AI models.
+The kernel requires the inputs to be aligned with the M/N/K block sizes, and there are no branches to handle OOB cases. This is satisfied in most models.
 
 We prepack the B matrix into `(K/16, N, 16)` layout to enable fast 128-bit loads from VRAM to LDS, and ensure that threads with adjacent N load adjacent 128-bit elements. Note that the B matrix (weight) is in `(N, K)` rather than `(K, N)` layout in usual ComfyUI workloads.
 
@@ -46,9 +46,12 @@ Benchmarks on Strix Halo, when the matrices are large: (The results may change w
 4. Run `python test_scaled_mm_hip.py` to test the correctness
 5. In ComfyUI, use `FeatherUNetLoader` node to load the model, which converts fp16/bf16 model to fp8e5m2 with the prepacked layout. See the [example workflows](https://github.com/woct0rdho/ComfyUI-FeatherOps/tree/master/example_workflows)
 
-For best speed, the image token count (`width / 16 * height / 16`) should be a multiple of 128.
+For best speed, the latent token count should be a multiple of 128. The latent token count is computed by:
+- Most image models with 16-channel VAE: `width / 16 * height / 16 * 16`
+- LTX 2.3 video-only: `width / 32 * height / 32 * (length + 7) / 8`. I haven't checked what's the size constraint when generating video with audio. If you did, please open an issue.
+- Wan 2.1/2.2 14B: `width / 16 * height / 16 * (length + 3) / 4`
 
-Currently tested models are Anima, Qwen-Image, Wan. You may try to run other models with the 'default' config, but it's better to create special configs that exclude the unneeded modules. LoRA and torch.compile are supported. For some workloads you may see 30~50% speedup compared to not using `FeatherUNetLoader`.
+Currently tested models are Anima, LTX 2.3, Qwen-Image, Wan 2.1/2.2 14B. You may try to run other models with the 'default' config, but it's better to create special configs that exclude the unneeded modules. LoRA and torch.compile are supported. For some workloads you may see 30~50% speedup compared to not using `FeatherUNetLoader`.
 
 Note on torch.compile: Recently ComfyUI introduced comfy-aimdo but it does not yet work with torch.compile . You may disable it with `--disable-dynamic-vram` when starting ComfyUI.
 
