@@ -62,6 +62,7 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
         "-Wall",
         "-Wextra",
         "-Werror",
+        "-Wno-shift-count-overflow",
         "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-DPy_LIMITED_API=0x03090000",
