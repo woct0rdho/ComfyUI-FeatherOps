@@ -76,6 +76,27 @@ def feather_ops(out_dtype=torch.bfloat16, excluded_names=()):
                 assert inplace_update is False  # TODO: eventually remove the inplace_update stuff
                 self.weight = nn.Parameter(weight, requires_grad=False)
 
+            def _forward_padded(self, x):
+                # The kernel requires fp16 x and produces the configured output dtype
+                dtype_orig = x.dtype
+                x = x.contiguous().to(torch.float16)
+
+                # Temporarily clear weight_function so cast_bias_weight does not apply low-VRAM patches to prepacked weight
+                saved_weight_function = self.weight_function
+                self.weight_function = []
+
+                bias_dtype = self.bias.dtype if self.bias is not None else None
+                weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True)
+                weight, scale = get_feather_plain_tensors(weight)
+                scale = scale.to(device=x.device, dtype=torch.float32)
+
+                y = scaled_mm_hip(x, weight, scale, bias, out_dtype=self.out_dtype)
+
+                uncast_bias_weight(self, weight, bias, offload_stream)
+                self.weight_function = saved_weight_function
+                y = y.to(dtype_orig)
+                return y
+
             def forward(self, x):
                 run_every_op()
 
@@ -107,28 +128,10 @@ def feather_ops(out_dtype=torch.bfloat16, excluded_names=()):
                 else:
                     x_padded = x
 
-                # The kernel requires fp16 x and produces the configured output dtype
-                x_padded = x_padded.contiguous().to(torch.float16)
-
-                # Temporarily clear weight_function so cast_bias_weight does not apply low-VRAM patches to prepacked weight
-                saved_weight_function = self.weight_function
-                self.weight_function = []
-
-                bias_dtype = self.bias.dtype if self.bias is not None else None
-                weight, bias, offload_stream = cast_bias_weight(self, x_padded, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True)
-                weight, scale = get_feather_plain_tensors(weight)
-                scale = scale.to(device=x_padded.device, dtype=torch.float32)
-
-                y = scaled_mm_hip(x_padded, weight, scale, bias, out_dtype=self.out_dtype)
-
-                uncast_bias_weight(self, weight, bias, offload_stream)
-
-                y = y.to(x.dtype)
-
+                y = self._forward_padded(x_padded)
                 y = y[:m]
 
-                self.weight_function = saved_weight_function
-                y = apply_lora_patches(x, y, saved_weight_function)
+                y = apply_lora_patches(x, y, self.weight_function)
 
                 return y.view(*x_shape_orig[:-1], y.shape[-1])
 
