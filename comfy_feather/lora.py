@@ -20,9 +20,9 @@ def apply_lora_patches(x, y, weight_functions):
             lora_B = weights[0]
             lora_A = weights[1]
 
-            rank = lora_A.shape[0]
             lora_scale = strength_patch * strength_model
             if weights[2] is not None:
+                rank = lora_A.shape[0]
                 lora_scale *= weights[2] / rank
 
             lora_A = lora_A.to(device=x.device, dtype=x.dtype)
