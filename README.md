@@ -44,14 +44,20 @@ Benchmarks on Strix Halo, when the matrices are large: (The results may change w
 2. Install torch >= 2.12 from TheRock
 3. git clone this repo to `ComfyUI/custom_nodes/`
 4. Run `python test_scaled_mm_hip.py` to test the correctness
-5. In ComfyUI, use `FeatherUNetLoader` node to load the model, which converts fp16/bf16 model to fp8e5m2 with the prepacked layout. See the [example workflows](https://github.com/woct0rdho/ComfyUI-FeatherOps/tree/master/example_workflows)
+5. In ComfyUI, use `FeatherUNetLoader` node to load the model. See the [example workflows](https://github.com/woct0rdho/ComfyUI-FeatherOps/tree/master/example_workflows)
+
+I recommend to load fp16/bf16 model, or fp8e5m2 model if you can find one, but not fp8e4m3 or fp4 model, because that would suffer from quantizing twice. For Wan, you can find fp8e5m2 models at https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled
 
 For best speed, the latent token count should be a multiple of 128. The latent token count is computed by:
 - Most image models with 16-channel VAE: `width / 16 * height / 16 * 16`
 - LTX 2.3 video-only: `width / 32 * height / 32 * (length + 7) / 8`. I haven't checked what's the size constraint when generating video with audio. If you did, please open an issue.
 - Wan 2.1/2.2 14B: `width / 16 * height / 16 * (length + 3) / 4`
 
-Currently tested models are Anima, LTX 2.3, Qwen-Image, Wan 2.1/2.2 14B. You may try to run other models with the 'default' config, but it's better to create special configs that exclude the unneeded modules. LoRA and torch.compile are supported. For some workloads you may see 30~50% speedup compared to not using `FeatherUNetLoader`.
+Currently tested models are Anima, LTX 2.3, Qwen-Image, Wan 2.1/2.2 14B. You may try to run other models with the 'default' model type, and you may need to exclude some modules in the loader if quantizing them severely degrades output quality. If you think there is some module that needs exclude, please open an issue.
+
+LoRA and torch.compile are supported.
+
+For some workloads you may see 30~50% speedup compared to not using `FeatherUNetLoader`, but your mileage may vary.
 
 Note on torch.compile: Recently ComfyUI introduced comfy-aimdo but it does not yet work with torch.compile . You may disable it with `--disable-dynamic-vram` when starting ComfyUI.
 
