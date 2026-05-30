@@ -55,23 +55,33 @@ def benchmark(N, provider):
     scale = torch.ones(N, device=device, dtype=torch.float32)
     bias = torch.randn(N, device=device, dtype=out_dtype)
 
-    if "TT" in provider:
+    input_layout = provider[-2:]
+    if provider.startswith("torch"):
+        # PyTorch calls BLAS with swapped operands for row-major outputs
+        input_layout = {
+            "TT": "NN",
+            "TN": "TN",
+            "NT": "NT",
+            "NN": "TT",
+        }[input_layout]
+
+    if input_layout == "TT":
         pass
-    elif "TN" in provider:
+    elif input_layout == "TN":
         b = b.T
-    elif "NT" in provider:
+    elif input_layout == "NT":
         a = a.T
-    elif "NN" in provider:
+    elif input_layout == "NN":
         a = a.T
         b = b.T
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 
-    if "mm" in provider:
+    if provider.startswith("torch_mm"):
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype, bias_dim=0)
-    elif "linear" in provider:
+    elif provider.startswith("torch_linear"):
         fn = lambda: providers[provider](a, b.T, bias)
-    elif "hipblaslt" in provider:
+    elif provider.startswith("hipblaslt"):
         fn = lambda: providers[provider](a, b, scale, bias, out_dtype, solution_index=-2)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
