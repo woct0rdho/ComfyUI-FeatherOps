@@ -7,13 +7,12 @@ import torch.nn.functional as F
 import triton
 
 from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16
-from kernel.naive import scaled_mm_naive
 
 providers = {
-    "torch_mm_TT": scaled_mm_naive,
-    "torch_mm_TN": scaled_mm_naive,
-    "torch_mm_NT": scaled_mm_naive,
-    "torch_mm_NN": scaled_mm_naive,
+    "torch_mm_TT": torch.mm,
+    "torch_mm_TN": torch.mm,
+    "torch_mm_NT": torch.mm,
+    "torch_mm_NN": torch.mm,
     "torch_linear_TT": F.linear,
     "torch_linear_TN": F.linear,
     "torch_linear_NT": F.linear,
@@ -78,7 +77,7 @@ def benchmark(N, provider):
         raise RuntimeError(f"Unknown provider: {provider}")
 
     if provider.startswith("torch_mm"):
-        fn = lambda: providers[provider](a, b, scale, bias, out_dtype, bias_dim=0)
+        fn = lambda: providers[provider](a, b)
     elif provider.startswith("torch_linear"):
         fn = lambda: providers[provider](a, b.T, bias)
     elif provider.startswith("hipblaslt"):
