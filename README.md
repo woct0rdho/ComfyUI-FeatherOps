@@ -53,7 +53,7 @@ For best speed, the latent token count should be a multiple of 128. The latent t
 - LTX 2.3 video-only: `width / 32 * height / 32 * (length + 7) / 8`. I haven't checked what's the size constraint when generating video with audio. If you did, please open an issue.
 - Wan 2.1/2.2 14B: `width / 16 * height / 16 * (length + 3) / 4`
 
-Currently tested models are Anima, LTX 2.3, Qwen-Image, Wan 2.1/2.2 14B. You may try to run other models with the 'default' model type, and you may need to exclude some modules in the loader if quantizing them severely degrades output quality. If you think there is some module that needs exclude, please open an issue.
+Currently tested models are Anima, Flux 2 Klein 9B, LTX 2.3, Qwen-Image, Wan 2.1/2.2 14B. You may try to run other models with the 'default' model type, and you may need to exclude some modules in the loader if quantizing them severely degrades output quality. If you think there is some module that needs exclude, please open an issue.
 
 LoRA and torch.compile are supported.
 

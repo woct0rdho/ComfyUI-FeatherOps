@@ -12,7 +12,7 @@ class FeatherUNetLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "model_type": (["default", "anima", "qwen", "wan"],),
+                "model_type": (["default", "anima", "flux2", "qwen", "wan"],),
             }
         }
 
@@ -30,6 +30,18 @@ class FeatherUNetLoader:
                 "x_embedder",
                 "final_layer",
                 "llm_adapter",
+            ]
+            out_dtype = torch.bfloat16
+        elif model_type == "flux2":
+            excluded_names = [
+                # Non-repeating modules
+                "img_in",
+                "time_in",
+                "txt_in",
+                "final_layer",
+                "double_stream_modulation_img",
+                "double_stream_modulation_txt",
+                "single_stream_modulation",
             ]
             out_dtype = torch.bfloat16
         elif model_type == "qwen":
