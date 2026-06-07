@@ -34,7 +34,7 @@ Benchmarks on Strix Halo, when the matrices are large: (The results may change w
 * Theoretical roofline is 59.4 TFLOPS
 * fp16 @ fp8e5m2 reaches 46 TFLOPS in C++
 * and 43 TFLOPS in Python with dispatch overhead, which can be reduced using torch.compile
-* torch fp16 @ fp16 (a Tensile kernel) only reaches 30 TFLOPS in Python
+* torch fp16 @ fp16 (a Tensile kernel) only reaches 36 TFLOPS in Python
 
 `doc/` contains some experiment logs. They may be outdated, and the remaining performance gap from the theoretical roofline is still not well explained. I've tried PC sampling and thread tracing but I could not fully understand the bottleneck. I guess it's either due to the hardware scheduler or the instruction prefetch, and we need better profiling or even a simulator to investigate it.
 
