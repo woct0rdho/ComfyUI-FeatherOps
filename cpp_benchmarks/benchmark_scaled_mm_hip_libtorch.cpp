@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <vector>
 
 #include <ATen/ATen.h>
@@ -115,6 +116,29 @@ Options parse_args(int argc, char** argv)
     return opts;
 }
 
+void fill_random_fp8e5m2(at::Tensor& tensor)
+{
+    static constexpr uint8_t finite_e5m2_values[] = {
+        0xbc, // -1.0
+        0xba, // -0.75
+        0xb8, // -0.5
+        0xb4, // -0.25
+        0x00, //  0.0
+        0x34, //  0.25
+        0x38, //  0.5
+        0x3a, //  0.75
+        0x3c, //  1.0
+    };
+    std::mt19937 gen(42);
+    constexpr int finite_count = static_cast<int>(sizeof(finite_e5m2_values) / sizeof(finite_e5m2_values[0]));
+    std::uniform_int_distribution<int> dist(0, finite_count - 1);
+    std::vector<uint8_t> host_data(static_cast<size_t>(tensor.numel()));
+    for (uint8_t& value : host_data) {
+        value = finite_e5m2_values[dist(gen)];
+    }
+    CHECK_HIP(hipMemcpy(tensor.data_ptr(), host_data.data(), host_data.size() * sizeof(uint8_t), hipMemcpyHostToDevice));
+}
+
 int main(int argc, char** argv)
 {
     const Options opts = parse_args(argc, argv);
@@ -150,7 +174,7 @@ int main(int argc, char** argv)
     at::Tensor d_c = at::empty({opts.m, opts.n}, options_fp16);
 
     d_a.normal_(0.0, 1.0);
-    d_b_prepacked.random_(0, 255);
+    fill_random_fp8e5m2(d_b_prepacked);
     d_scale.fill_(2.34);
     d_bias.normal_(0.0, 1.0);
     d_c.zero_();

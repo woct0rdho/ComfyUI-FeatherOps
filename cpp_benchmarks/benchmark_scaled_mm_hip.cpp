@@ -123,12 +123,24 @@ void fill_random_half(half* ptr, size_t size) {
     CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(half), hipMemcpyHostToDevice));
 }
 
-void fill_random_uint8(uint8_t* ptr, size_t size) {
+void fill_random_fp8e5m2(uint8_t* ptr, size_t size) {
+    static constexpr uint8_t finite_e5m2_values[] = {
+        0xbc, // -1.0
+        0xba, // -0.75
+        0xb8, // -0.5
+        0xb4, // -0.25
+        0x00, //  0.0
+        0x34, //  0.25
+        0x38, //  0.5
+        0x3a, //  0.75
+        0x3c, //  1.0
+    };
     std::mt19937 gen(42);
-    std::uniform_int_distribution<int> dist(0, 255);
+    constexpr int finite_count = static_cast<int>(sizeof(finite_e5m2_values) / sizeof(finite_e5m2_values[0]));
+    std::uniform_int_distribution<int> dist(0, finite_count - 1);
     std::vector<uint8_t> host_data(size);
     for (size_t i = 0; i < size; ++i) {
-        host_data[i] = static_cast<uint8_t>(dist(gen));
+        host_data[i] = finite_e5m2_values[dist(gen)];
     }
     CHECK_HIP(hipMemcpy(ptr, host_data.data(), size * sizeof(uint8_t), hipMemcpyHostToDevice));
 }
@@ -166,7 +178,7 @@ int main(int argc, char** argv)
     CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(half)));
 
     fill_random_half(d_a, a_elems);
-    fill_random_uint8(d_b_prepacked, b_elems);
+    fill_random_fp8e5m2(d_b_prepacked, b_elems);
     float host_scale = 2.34f;
     CHECK_HIP(hipMemcpy(d_scale, &host_scale, sizeof(float), hipMemcpyHostToDevice));
     fill_random_half(d_bias, opts.n);
