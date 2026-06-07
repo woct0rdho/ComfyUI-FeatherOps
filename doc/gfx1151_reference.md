@@ -263,7 +263,7 @@ Outputs:
 
 For human, you can load the `.att` file or the `ui_output_agent_*/` directory into ROCprof Compute Viewer to visualize the overlap between memory operations (LDS/Global) and compute (WMMA) on a timeline.
 
-For AI, you can write python scripts to analyze the `wave_*.json` and `code.json` pairs. You can plot the timeline using matplotlib, and use your visual ability to assess it.
+For AI, you can write Python scripts to analyze the `wave_*.json` and `code.json` pairs. You can plot the timeline using matplotlib, and use your visual ability to assess it.
 
 Pitfalls:
 - Single-Wave Perspective: A trace timeline only plots the execution of one specific wave on one specific SIMD. If you see a massive sync stall (e.g. `s_waitcnt vmcnt`), that single wave is indeed completely stalled.

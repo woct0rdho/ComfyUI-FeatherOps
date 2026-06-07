@@ -1,5 +1,7 @@
 # ComfyUI-FeatherOps
 
+**Update:** I've figured out how to tune a regular fp16 matmul to reach 45 TFLOPS on gfx1151 using TensileLite. This repo may be retired in near future.
+
 ## How it works
 
 The idea is from https://github.com/SuriyaaMM/feather . On GPUs without native fp8, when doing matmul, we can load fp8 data to smem (LDS) then upcast to fp16, rather than upcast the whole matrix to fp16 then load it to smem. This saves the VRAM -> smem bandwidth.
