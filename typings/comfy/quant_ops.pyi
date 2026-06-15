@@ -1,0 +1,13 @@
+import torch
+
+class QuantizedLayout: ...
+
+class QuantizedTensor:
+    _qdata: torch.Tensor
+    _params: object
+    _layout_cls: str
+    params: object
+    def __init__(self, qdata: torch.Tensor, layout_cls: str, params: object) -> None: ...
+    def dequantize(self) -> torch.Tensor: ...
+
+def register_layout_class(name: str, cls: type[QuantizedLayout]) -> None: ...

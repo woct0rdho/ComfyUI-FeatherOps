@@ -1,9 +1,15 @@
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_weight
 from torch import nn
 
-from ..kernel.hip.hip_kernel import scaled_mm_hip
+if TYPE_CHECKING:
+    from kernel.hip.hip_kernel import scaled_mm_hip
+else:
+    from ..kernel.hip.hip_kernel import scaled_mm_hip
+
 from .lora import apply_lora_patches
 from .quant import get_feather_plain_tensors, is_feather_quantized_weight, make_feather_quantized_weight, quantize_feather_weight
 
@@ -97,7 +103,11 @@ def feather_ops(out_dtype=torch.bfloat16, excluded_names=()):
                 y = y.to(dtype_orig)
                 return y
 
-            def forward(self, x):
+            def forward(self, input: torch.Tensor) -> torch.Tensor:
+                # The parameter is named `input` for proper override from `nn.Linear`
+                x = input
+                del input
+
                 run_every_op()
 
                 if not self.is_quantized:

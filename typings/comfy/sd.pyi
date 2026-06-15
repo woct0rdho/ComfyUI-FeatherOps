@@ -1,0 +1,3 @@
+from collections.abc import Mapping
+
+def load_diffusion_model(unet_path: str, model_options: Mapping[str, object] | None = None) -> object: ...
