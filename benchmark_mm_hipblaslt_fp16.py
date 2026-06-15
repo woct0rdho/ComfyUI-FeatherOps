@@ -8,21 +8,20 @@ import triton
 
 from kernel.hip.hipblaslt_kernel_fp16 import mm_hipblaslt_fp16
 
-providers = {
-    "torch_mm_TT": torch.mm,
-    "torch_mm_TN": torch.mm,
-    "torch_mm_NT": torch.mm,
-    "torch_mm_NN": torch.mm,
-    "torch_linear_TT": F.linear,
-    "torch_linear_TN": F.linear,
-    "torch_linear_NT": F.linear,
-    "torch_linear_NN": F.linear,
-    "hipblaslt_TT": mm_hipblaslt_fp16,
-    "hipblaslt_TN": mm_hipblaslt_fp16,
-    "hipblaslt_NT": mm_hipblaslt_fp16,
-    "hipblaslt_NN": mm_hipblaslt_fp16,
-}
-provider_names = list(providers)
+provider_names = [
+    "torch_mm_TT",
+    "torch_mm_TN",
+    "torch_mm_NT",
+    "torch_mm_NN",
+    "torch_linear_TT",
+    "torch_linear_TN",
+    "torch_linear_NT",
+    "torch_linear_NN",
+    "hipblaslt_TT",
+    "hipblaslt_TN",
+    "hipblaslt_NT",
+    "hipblaslt_NN",
+]
 
 
 @triton.testing.perf_report(
@@ -77,11 +76,11 @@ def benchmark(N, provider):
         raise RuntimeError(f"Unknown provider: {provider}")
 
     if provider.startswith("torch_mm"):
-        fn = lambda: providers[provider](a, b)
+        fn = lambda: torch.mm(a, b)
     elif provider.startswith("torch_linear"):
-        fn = lambda: providers[provider](a, b.T, bias)
+        fn = lambda: F.linear(a, b.T, bias)
     elif provider.startswith("hipblaslt"):
-        fn = lambda: providers[provider](a, b, scale, bias, out_dtype, solution_index=-2)
+        fn = lambda: mm_hipblaslt_fp16(a, b, scale, bias, out_dtype, solution_index=-2)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 

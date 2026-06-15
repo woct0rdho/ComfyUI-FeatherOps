@@ -1,13 +1,11 @@
-from typing import Optional
-
 import torch
 
 
 def scaled_mm_naive(
     a: torch.Tensor,
     b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     b_prepacked: bool = False,
     bias_dim: int = 1,

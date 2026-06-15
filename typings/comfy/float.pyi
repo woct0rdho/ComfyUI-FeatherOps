@@ -1,0 +1,3 @@
+import torch
+
+def stochastic_rounding(x: torch.Tensor, dtype: torch.dtype, seed: int | None = None) -> torch.Tensor: ...

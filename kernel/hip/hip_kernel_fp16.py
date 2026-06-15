@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 
 import torch
 from torch._inductor.kernel.custom_op import register_custom_op_autotuning
@@ -14,7 +13,7 @@ load_hip_stable_extension("mm_hip_fp16_ext", cur_dir, "hip_kernel_fp16.cu")
 def _configured_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     block_warps_m: int,
     block_warps_n: int,
@@ -41,7 +40,7 @@ def _configured_op(
 def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     block_warps_m: int,
     block_warps_n: int,
@@ -92,7 +91,7 @@ _CONFIGS = sorted(_CONFIGS, key=lambda x: (x[0], x[1], x[3], x[4], x[2]))
 def _autotuned_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     block_warps_m: int = 0,
     block_warps_n: int = 0,
@@ -109,7 +108,7 @@ def _autotuned_op(
 def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     block_warps_m: int = 0,
     block_warps_n: int = 0,
@@ -126,13 +125,13 @@ register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensor
 def mm_hip_fp16(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     if torch.compiler.is_compiling():
         return _autotuned_op(a, b_prepacked, bias, out_dtype)
 
-    def run_fn(cfg):
+    def run_fn(cfg: tuple[int, int, int, int, int]) -> torch.Tensor:
         return _configured_op(a, b_prepacked, bias, out_dtype, *cfg)
 
     best_cfg = old_autotune(

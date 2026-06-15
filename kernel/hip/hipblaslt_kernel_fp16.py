@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from typing import Optional
 
 import torch
 from torch.utils.cpp_extension import _import_module_from_library, load
@@ -8,7 +7,7 @@ from torch.utils.cpp_extension import _import_module_from_library, load
 from .utils import get_rocm_lib_dirs
 
 
-def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: str):
+def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: str) -> None:
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
 
@@ -24,7 +23,8 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
 
     if not should_rebuild:
         try:
-            return _import_module_from_library(name, build_dir, is_python_module=False)
+            _import_module_from_library(name, build_dir, is_python_module=False)
+            return
         except ImportError:
             pass
 
@@ -32,9 +32,10 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
     try:
         import _rocm_sdk_core
 
-        rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
-        if os.path.exists(rocm_sdk_inc):
-            includes.append(rocm_sdk_inc)
+        if _rocm_sdk_core.__file__ is not None:
+            rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
+            if os.path.exists(rocm_sdk_inc):
+                includes.append(rocm_sdk_inc)
     except ImportError:
         pass
 
@@ -83,7 +84,7 @@ def _is_hipblaslt_n_or_t_layout(x: torch.Tensor) -> bool:
     return (x.stride(0) == 1 and x.stride(1) == rows) or (x.stride(1) == 1 and x.stride(0) == cols)
 
 
-def _validate_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
+def _validate_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype) -> None:
     if out_dtype != torch.float16:
         raise RuntimeError("hipBLASLt fp16 wrapper only supports out_dtype=torch.float16")
     if a.device.type != "cuda" or b.device.type != "cuda":
@@ -104,8 +105,8 @@ def _validate_inputs(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype):
 def _op(
     a: torch.Tensor,
     b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     alpha_scalar: float,
     use_relu: bool,
@@ -129,8 +130,8 @@ def _op(
 def _(
     a: torch.Tensor,
     b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     alpha_scalar: float,
     use_relu: bool,
@@ -142,8 +143,8 @@ def _(
 def mm_hipblaslt_fp16(
     a: torch.Tensor,
     b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     *,
     use_relu: bool = False,
