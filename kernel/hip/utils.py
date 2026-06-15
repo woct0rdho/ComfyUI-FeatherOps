@@ -1,6 +1,6 @@
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import triton
@@ -19,14 +19,15 @@ def get_rocm_lib_dirs() -> list[str]:
     for mod_name in ("_rocm_sdk_devel", "_rocm_sdk_core"):
         try:
             mod = __import__(mod_name)
-            mod_dir = os.path.dirname(mod.__file__)
-            rocm_lib_dirs.append(os.path.join(mod_dir, "lib"))
+            if mod.__file__ is not None:
+                mod_dir = os.path.dirname(mod.__file__)
+                rocm_lib_dirs.append(os.path.join(mod_dir, "lib"))
         except ImportError:
             continue
     return [d for d in rocm_lib_dirs if os.path.isdir(d)]
 
 
-def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
+def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str) -> None:
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
 
@@ -42,7 +43,8 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
 
     if not should_rebuild:
         try:
-            return _import_module_from_library(name, build_dir, is_python_module=False)
+            _import_module_from_library(name, build_dir, is_python_module=False)
+            return
         except ImportError:
             pass
 
@@ -50,9 +52,10 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
     try:
         import _rocm_sdk_core
 
-        rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
-        if os.path.exists(rocm_sdk_inc):
-            includes.append(rocm_sdk_inc)
+        if _rocm_sdk_core.__file__ is not None:
+            rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
+            if os.path.exists(rocm_sdk_inc):
+                includes.append(rocm_sdk_inc)
     except ImportError:
         pass
 
@@ -95,7 +98,7 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str):
     Path(ninja_log).touch(exist_ok=True)
 
 
-def _config_compatible(cfg, M, N, K):
+def _config_compatible(cfg: tuple[int, int, int, int, int], M: int, N: int, K: int) -> bool:
     warps_m, warps_n, unroll_k, repeat_m, repeat_n = cfg
     block_m = 16 * warps_m * repeat_m
     block_n = 16 * warps_n * repeat_n
@@ -119,10 +122,10 @@ def _size_hint(value: int) -> int:
 
 
 def generate_autotune_configs(
-    fake_tensors: Dict[str, torch.Tensor],
-    configs: List[Tuple[int, int, int, int, int]],
+    fake_tensors: dict[str, torch.Tensor],
+    configs: list[tuple[int, int, int, int, int]],
     b_dim: int,
-) -> List[CustomOpConfig]:
+) -> list[CustomOpConfig]:
     a = fake_tensors["a"]
     b_prepacked = fake_tensors["b_prepacked"]
     M = _size_hint(a.shape[0])
@@ -144,7 +147,7 @@ def generate_autotune_configs(
     ]
 
 
-def get_compatible_config(a: torch.Tensor, b_prepacked: torch.Tensor, b_dim: int, configs: List[Tuple[int, int, int, int, int]]) -> Tuple[int, int, int, int, int]:
+def get_compatible_config(a: torch.Tensor, b_prepacked: torch.Tensor, b_dim: int, configs: list[tuple[int, int, int, int, int]]) -> tuple[int, int, int, int, int]:
     M = _size_hint(a.shape[0])
     N = _size_hint(b_prepacked.shape[b_dim])
     K = _size_hint(a.shape[1])
@@ -162,10 +165,10 @@ def old_autotune(
     M: int,
     N: int,
     K: int,
-    configs: List[Tuple[int, int, int, int, int]],
-    run_fn: Callable[[Tuple[int, int, int, int, int]], Any],
-    *extra_keys: Any,
-) -> Tuple[int, int, int, int, int]:
+    configs: list[tuple[int, int, int, int, int]],
+    run_fn: Callable[[tuple[int, int, int, int, int]], object],
+    *extra_keys: object,
+) -> tuple[int, int, int, int, int]:
     key = (M, N, K, *extra_keys)
     cached = _AUTOTUNE_CACHE.get(key)
     if cached is not None:

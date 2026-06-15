@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 
 import torch
 from torch._inductor.kernel.custom_op import register_custom_op_autotuning
@@ -14,8 +13,8 @@ load_hip_stable_extension("scaled_mm_hip_ext", cur_dir, "hip_kernel.cu")
 def _configured_op(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     block_warps_m: int,
     block_warps_n: int,
@@ -44,8 +43,8 @@ def _configured_op(
 def _(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
     block_warps_m: int,
     block_warps_n: int,
@@ -137,8 +136,8 @@ register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensor
 def scaled_mm_hip(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     if torch.compiler.is_compiling():
@@ -152,7 +151,7 @@ def scaled_mm_hip(
             bias is not None,
         )
 
-    def run_fn(cfg):
+    def run_fn(cfg: tuple[int, int, int, int, int]) -> torch.Tensor:
         return _configured_op(a, b_prepacked, scale, bias, out_dtype, *cfg)
 
     best_cfg = old_autotune(

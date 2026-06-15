@@ -10,12 +10,7 @@ from kernel.naive import scaled_mm_naive
 
 scaled_mm_naive_compiled = torch.compile(scaled_mm_naive, fullgraph=True, dynamic=False, mode="max-autotune")
 
-providers = {
-    "torch": scaled_mm_naive,
-    "torch_compiled": scaled_mm_naive_compiled,
-    "hip": mm_hip_fp16,
-}
-provider_names = list(providers)
+provider_names = ["torch", "torch_compiled", "hip"]
 
 
 @triton.testing.perf_report(
@@ -47,10 +42,12 @@ def benchmark(N, provider):
     # Prepacking is done once and excluded from do_bench
     b_prepacked = prepack_b_for_mm_fp16(b)
 
-    if provider in {"torch", "torch_compiled"}:
-        fn = lambda: providers[provider](a, b, None, bias, out_dtype)
+    if provider == "torch":
+        fn = lambda: scaled_mm_naive(a, b, None, bias, out_dtype)
+    elif provider == "torch_compiled":
+        fn = lambda: scaled_mm_naive_compiled(a, b, None, bias, out_dtype)
     elif provider == "hip":
-        fn = lambda: providers[provider](a, b_prepacked, bias, out_dtype)
+        fn = lambda: mm_hip_fp16(a, b_prepacked, bias, out_dtype)
     else:
         raise RuntimeError(f"Unknown provider: {provider}")
 

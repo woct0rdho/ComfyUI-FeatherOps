@@ -1,7 +1,8 @@
 import os
+from collections.abc import Callable, Mapping
 from itertools import product
 from math import sqrt
-from typing import Any, Callable, Optional
+from typing import Protocol, cast
 
 import torch
 import triton
@@ -23,11 +24,27 @@ else:
     DEFAULT_NUM_WARPS = [8]
     DEFAULT_NUM_STAGES = [3, 4]
 
+
+class _TritonDriverUtils(Protocol):
+    get_device_properties: Callable[[int], Mapping[str, int]]
+
+
+class _TritonDriver(Protocol):
+    utils: _TritonDriverUtils
+
+
 # Currently get_device_properties cannot be traced by torch.compile
-SMEM_SIZE = triton.runtime.driver.active.utils.get_device_properties(torch.cuda.current_device())["max_shared_mem"]
+SMEM_SIZE = cast(_TritonDriver, triton.runtime.driver.active).utils.get_device_properties(torch.cuda.current_device())["max_shared_mem"]
 
 
-def _get_forced_triton_config() -> Optional[triton.Config]:
+class _HasDType(Protocol):
+    dtype: torch.dtype
+
+
+_SmemCriteria = Callable[[int, int, int, int, torch.dtype, torch.dtype, int], bool]
+
+
+def _get_forced_triton_config() -> triton.Config | None:
     """
     Optional one-config override to make Triton and HIP fixed-config comparisons easy.
     Format:
@@ -57,7 +74,7 @@ def get_autotune_configs() -> list[triton.Config]:
     if forced is not None:
         return [forced]
 
-    configs = []
+    configs: list[triton.Config] = []
     for m, n, k, g, w, s in product(
         DEFAULT_BLOCK_SIZES_M,
         DEFAULT_BLOCK_SIZES_N,
@@ -100,19 +117,19 @@ def exceeds_smem_capacity(
     return size > smem_size
 
 
-def _common_prune_criteria(smem_criteria: Callable, config: triton.Config, kwargs: dict[str, Any]) -> bool:
+def _common_prune_criteria(smem_criteria: _SmemCriteria, config: triton.Config, kwargs: Mapping[str, object]) -> bool:
     num_stages = config.num_stages
-    BLOCK_SIZE_M = config.kwargs["BLOCK_SIZE_M"]
-    BLOCK_SIZE_N = config.kwargs["BLOCK_SIZE_N"]
-    BLOCK_SIZE_K = config.kwargs["BLOCK_SIZE_K"]
-    a_dtype = kwargs["a_ptr"].dtype
-    b_dtype = kwargs["b_ptr"].dtype
+    BLOCK_SIZE_M = cast(int, config.kwargs["BLOCK_SIZE_M"])
+    BLOCK_SIZE_N = cast(int, config.kwargs["BLOCK_SIZE_N"])
+    BLOCK_SIZE_K = cast(int, config.kwargs["BLOCK_SIZE_K"])
+    a_dtype = cast(_HasDType, kwargs["a_ptr"]).dtype
+    b_dtype = cast(_HasDType, kwargs["b_ptr"]).dtype
     if smem_criteria(num_stages, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, a_dtype, b_dtype, SMEM_SIZE):
         return True
 
-    M = kwargs["M"]
-    N = kwargs["N"]
-    K = kwargs["K"]
+    M = cast(int, kwargs["M"])
+    N = cast(int, kwargs["N"])
+    K = cast(int, kwargs["K"])
     if M % BLOCK_SIZE_M != 0:
         return True
     if N % BLOCK_SIZE_N != 0:
@@ -143,7 +160,7 @@ def _common_prune_criteria(smem_criteria: Callable, config: triton.Config, kwarg
     return False
 
 
-def prune_configs(smem_criteria: Callable, configs: list[triton.Config], args, **kwargs) -> list[triton.Config]:
+def prune_configs(smem_criteria: _SmemCriteria, configs: list[triton.Config], args: Mapping[str, object], **_kwargs: object) -> list[triton.Config]:
     forced = _get_forced_triton_config()
     if forced is not None:
         return [forced]

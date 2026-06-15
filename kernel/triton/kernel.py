@@ -1,5 +1,4 @@
 from functools import partial
-from typing import Optional
 
 import torch
 import triton
@@ -10,7 +9,7 @@ from .autotune import exceeds_smem_capacity, get_autotune_configs, prune_configs
 
 # Flush denormalized values to signed zero, and ignore nan
 @triton.jit
-def fp8e4m3fn_to_fp16(x):
+def fp8e4m3fn_to_fp16(x: tl.tensor) -> tl.tensor:
     x_u16 = x.to(tl.uint8, bitcast=True).to(tl.uint16)
     sign = (x_u16 & 0x80) << 8
     exp_mant = (x_u16 & 0x7F) << 7
@@ -52,7 +51,7 @@ def _scaled_mm_kernel_interior(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
-) -> None:
+):
     pid = tl.program_id(axis=0)
     num_pid_m = M // BLOCK_SIZE_M
     num_pid_n = N // BLOCK_SIZE_N
@@ -123,8 +122,8 @@ def _scaled_mm_kernel_interior(
 def scaled_mm_triton(
     a: torch.Tensor,
     b: torch.Tensor,
-    scale: Optional[torch.Tensor],
-    bias: Optional[torch.Tensor],
+    scale: torch.Tensor | None,
+    bias: torch.Tensor | None,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     assert a.is_cuda

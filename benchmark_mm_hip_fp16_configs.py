@@ -2,7 +2,6 @@
 
 import argparse
 import statistics
-from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -10,8 +9,8 @@ import triton
 from kernel.hip.hip_kernel_fp16 import _CONFIGS, mm_hip_fp16_configured, prepack_b_for_mm_fp16
 
 
-def _parse_shapes(text: str) -> List[Tuple[int, int, int]]:
-    shapes = []
+def _parse_shapes(text: str) -> list[tuple[int, int, int]]:
+    shapes: list[tuple[int, int, int]] = []
     for chunk in text.split(";"):
         chunk = chunk.strip()
         if not chunk:
@@ -19,12 +18,13 @@ def _parse_shapes(text: str) -> List[Tuple[int, int, int]]:
         parts = [p.strip() for p in chunk.split(",")]
         if len(parts) != 3:
             raise ValueError(f"Invalid shape '{chunk}', expected 3 comma-separated ints: M,N,K")
-        shapes.append(tuple(int(p) for p in parts))
+        m, n, k = (int(p) for p in parts)
+        shapes.append((m, n, k))
     return shapes
 
 
-def _parse_configs(text: str) -> List[Tuple[int, int, int, int, int]]:
-    configs = []
+def _parse_configs(text: str) -> list[tuple[int, int, int, int, int]]:
+    configs: list[tuple[int, int, int, int, int]] = []
     for chunk in text.split(";"):
         chunk = chunk.strip()
         if not chunk:
@@ -32,18 +32,19 @@ def _parse_configs(text: str) -> List[Tuple[int, int, int, int, int]]:
         parts = [p.strip() for p in chunk.split(",")]
         if len(parts) != 5:
             raise ValueError(f"Invalid config '{chunk}', expected 5 comma-separated ints")
-        configs.append(tuple(int(p) for p in parts))
+        block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n = (int(p) for p in parts)
+        configs.append((block_warps_m, block_warps_n, unroll_k, repeat_m, repeat_n))
     return configs
 
 
 def _run_config(
     a: torch.Tensor,
     b_prepacked: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    cfg: Tuple[int, int, int, int, int],
+    bias: torch.Tensor | None,
+    cfg: tuple[int, int, int, int, int],
     rep: int,
     warmup: int,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     def run_kernel():
         mm_hip_fp16_configured(a, b_prepacked, bias, torch.float16, *cfg)
 
@@ -53,7 +54,7 @@ def _run_config(
     return avg_ms, std_ms
 
 
-def _format_cfg(cfg: Tuple[int, int, int, int, int]) -> str:
+def _format_cfg(cfg: tuple[int, int, int, int, int]) -> str:
     return f"({cfg[0]},{cfg[1]},{cfg[2]},{cfg[3]},{cfg[4]})"
 
 
