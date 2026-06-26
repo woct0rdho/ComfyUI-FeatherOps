@@ -1,12 +1,14 @@
 # ComfyUI-FeatherOps
 
+**Update:** I've figured out how to tune a regular fp16 matmul to reach 45 TFLOPS on gfx1151 using TensileLite. This repo may be retired in near future.
+
 ## How it works
 
 The idea is from https://github.com/SuriyaaMM/feather . On GPUs without native fp8, when doing matmul, we can load fp8 data to smem (LDS) then upcast to fp16, rather than upcast the whole matrix to fp16 then load it to smem. This saves the VRAM -> smem bandwidth.
 
 However, this is helpful only when the matrices are small, or when doing mat-vec multiplication (as in batch-1 LLM decoding). When the matrices go larger (as in diffusion models), the compute time goes by O(N^3), while the load time only goes by O(N^2), so the speedup from optimizing the VRAM -> smem load diminishes.
 
-On Nvidia consumer Pascal (GTX 10xx, not P100), Turing, and Ampere GPUs, int8 models (see https://github.com/BobJohnson24/ComfyUI-INT8-Fast ) are preferable to fp8 models, which actually reduce the compute time with faster int8 matmul than fp16.
+On Nvidia consumer Pascal (GTX 10xx, not P100, and not Volta), Turing, and Ampere GPUs, int8 models (see https://github.com/BobJohnson24/ComfyUI-INT8-Fast and https://github.com/Comfy-Org/comfy-kitchen/pull/37 ) are preferable to fp8 models, which actually reduce the compute time with faster int8 matmul than fp16.
 
 It's a pity that AMD RDNA3/3.5 GPUs do not have faster int8 matmul than fp16, but we can surprisingly see speedup with fp8 in large matmul. Although the load from VRAM to LDS is not the bottleneck, it takes less instructions to load fp8 than fp16 from LDS to VGPR, which improves compute-load overlap in the K-loop. Also, keeping fp8 rather than fp16 in LDS reduces LDS usage per workgroup and improves occupancy.
 
