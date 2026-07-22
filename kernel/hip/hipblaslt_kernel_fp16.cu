@@ -1,11 +1,17 @@
+#include <__clang_cuda_math_forward_declares.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
+
+// Thrust emits a gfx1100/gfx1101 clock warning for gfx1151.
+// This kernel does not use the affected timing APIs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-W#warnings"
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/c/shim.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
-
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
-#include <hipblaslt/hipblaslt-ext.hpp>
+#pragma clang diagnostic pop
 
 #include <cstdint>
 #include <mutex>
@@ -451,7 +457,7 @@ void mm_hipblaslt_fp16(
                     std::lock_guard<std::mutex> lock(g_context_mutex);
                     g_algo_cache[cache_key] = best_algo;
                     initialized = true;
-                    printf("hipBLASLt auto-tuning complete for M=%ld, N=%ld, K=%ld, layout=%s%s: best solution_index=%d (%.3f ms)\n", M, N, K, a_layout.name, b_layout.name, hipblaslt_ext::getIndexFromAlgo(best_algo), best_ms / 10.0f);
+                    printf("hipBLASLt auto-tuning complete for M=%lld, N=%lld, K=%lld, layout=%s%s: best solution_index=%d (%.3f ms)\n", static_cast<long long>(M), static_cast<long long>(N), static_cast<long long>(K), a_layout.name, b_layout.name, hipblaslt_ext::getIndexFromAlgo(best_algo), best_ms / 10.0f);
                 }
             }
         }

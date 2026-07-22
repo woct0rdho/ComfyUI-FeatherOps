@@ -45,7 +45,9 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str) -> 
         try:
             _import_module_from_library(name, build_dir, is_python_module=False)
             return
-        except ImportError:
+        except (ImportError, OSError):
+            # Re-enter the build path when a prior build was incomplete or a
+            # dependency was unavailable during the cached import.
             pass
 
     includes = []
@@ -72,7 +74,7 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str) -> 
     ]
 
     extra_ldflags = []
-    for lib_dir in dict.fromkeys(get_rocm_lib_dirs()):
+    for lib_dir in get_rocm_lib_dirs():
         extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
 
     load(
@@ -81,6 +83,8 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str) -> 
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cflags
         + [
+            # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
+            "-nohipwrapperinc",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
             "-U__HIP_NO_HALF2_OPERATORS__",

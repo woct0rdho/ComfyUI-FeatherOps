@@ -1,12 +1,18 @@
+#include <__clang_cuda_math_forward_declares.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+
 #ifndef NO_PYTORCH
+// Thrust emits a gfx1100/gfx1101 clock warning for gfx1151.
+// This kernel does not use the affected timing APIs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-W#warnings"
 #include <torch/csrc/stable/accelerator.h>
 #include <torch/csrc/stable/c/shim.h>
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
+#pragma clang diagnostic pop
 #endif
-
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <optional>
