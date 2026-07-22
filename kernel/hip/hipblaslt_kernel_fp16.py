@@ -25,7 +25,9 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
         try:
             _import_module_from_library(name, build_dir, is_python_module=False)
             return
-        except ImportError:
+        except (ImportError, OSError):
+            # Re-enter the build path when a prior build was incomplete or a
+            # dependency was unavailable during the cached import.
             pass
 
     includes = []
@@ -47,13 +49,18 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
         "-Werror",
         "-Wno-deprecated-copy-with-user-provided-copy",
         "-Wno-ignored-qualifiers",
+        "-Wno-unused-function",
         "-Wno-unused-parameter",
         "-DPy_LIMITED_API=0x03090000",
     ]
 
-    extra_ldflags = ["-lhipblaslt"]
-    for lib_dir in dict.fromkeys(get_rocm_lib_dirs()):
-        extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
+    if os.name == "nt":
+        extra_ldflags = ["libhipblaslt.dll.a"]
+        extra_ldflags.extend(f"/LIBPATH:{lib_dir}" for lib_dir in get_rocm_lib_dirs())
+    else:
+        extra_ldflags = ["-lhipblaslt"]
+        for lib_dir in get_rocm_lib_dirs():
+            extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
 
     load(
         name=name,
@@ -61,6 +68,8 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
         extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cflags
         + [
+            # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
+            "-nohipwrapperinc",
             "-U__HIP_NO_HALF_OPERATORS__",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF2_OPERATORS__",
