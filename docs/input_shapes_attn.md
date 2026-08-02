@@ -8,7 +8,7 @@ Machine-readable rows are saved in `tmp_attn_fp8kv_analysis/shape_data/input_sha
 - Internal attention matmuls such as `Q @ K.T` and `softmax(QK) @ V` are not recorded.
 - Shapes use canonical head-split layout: `q=[batch, heads, query_tokens, head_dim]` and `k/v=[batch, heads, key_value_tokens, head_dim]`.
 - Counts are per single model forward call with batch size 1. Classifier-free-guidance batching would multiply batch size.
-- Wan and LTX 2.3 use exact fused attention sequence lengths, not the GEMM-rounded row counts used in `doc/input_shapes.md`.
+- Wan, LTX 2.3, and H3 use exact fused attention sequence lengths, not the GEMM-rounded row counts used in the GEMM shape documents.
 - Z-Image uses the same padded text/image sequence lengths as its GEMM rows because ComfyUI pads both streams to multiples of 32 before fused attention.
 - Krea 2 uses a TextFusion adapter before the main DiT; its layerwise attention uses batch 16 and sequence length 12 for the 12 tapped Qwen3-VL hidden states.
 
@@ -61,6 +61,9 @@ Machine-readable rows are saved in `tmp_attn_fp8kv_analysis/shape_data/input_sha
 | LTX 2.3 | Main video blocks | `640x480x40` | text cross | 48 | `q=[1,32,1500,128]`, `k/v=[1,32,1024,128]` |
 | LTX 2.3 | Main video blocks | `1280x720x80` | self | 48 | `q/k/v=[1,32,8800,128]` |
 | LTX 2.3 | Main video blocks | `1280x720x80` | text cross | 48 | `q=[1,32,8800,128]`, `k/v=[1,32,1024,128]` |
+| H3 | Token refiner | `prompt_16` | self | 2 | `q/k/v=[1,56,16,128]` |
+| H3 | Main omni-transformer | `640x480x40` | joint text+audio+video self | 50 | `q/k/v=[1,56,5302,128]` |
+| H3 | Main omni-transformer | `1280x720x80` | joint text+audio+video self | 50 | `q/k/v=[1,56,25156,128]` |
 
 ## Medium Attention Shapes
 
@@ -93,6 +96,7 @@ These rows have both `query_tokens` and `key_value_tokens` between 1,000 and 10,
 | LTX 2.3 | Main video blocks | `640x480x40` | text cross | 48 | `[1,32,1500,128]` | `[1,32,1024,128]` |
 | LTX 2.3 | Main video blocks | `1280x720x80` | self | 48 | `[1,32,8800,128]` | `[1,32,8800,128]` |
 | LTX 2.3 | Main video blocks | `1280x720x80` | text cross | 48 | `[1,32,8800,128]` | `[1,32,1024,128]` |
+| H3 | Main omni-transformer | `640x480x40` | joint text+audio+video self | 50 | `[1,56,5302,128]` | `[1,56,5302,128]` |
 
 ## Model Notes
 
@@ -104,3 +108,4 @@ These rows have both `query_tokens` and `key_value_tokens` between 1,000 and 10,
 - Ideogram 4 uses single-stream masked self-attention over packed `[text, image]` tokens; image-only rows cover `context is None`.
 - Wan T2V has one video self-attention and one text cross-attention call per layer.
 - LTX 2.3 rows document the no-audio video workload; audio-only and audio/video cross-attention paths are excluded.
+- H3 first applies two 56-head self-attention calls to the 16 text rows, then each of its 50 main blocks attends over one packed text/audio/video sequence. Requested 40- and 80-frame clips become 56 and 90 H3 frames, producing exact packed lengths `16+186+5100=5302` and `16+300+24840=25156`. Keyframe and reference rows are excluded.

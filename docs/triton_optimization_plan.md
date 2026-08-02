@@ -42,28 +42,17 @@
 
 ## Stable Findings (carry forward)
 
-1. Baseline Triton had avoidable hot-path index overhead.
-   - `%M/%N` (`arith.remsi`) appeared in hot path before interior specialization.
-2. Dominant remaining bottleneck is B operand path quality.
-   - Improving B shared layout vectorization (`vec=1 -> vec=2`) helps, but B conversion/reorder pressure remains the main optimization axis.
-3. Permute pressure remains high and sticky.
-   - Kept variants still show high static `v_perm_b32` (`128` to `188`).
-4. gfx1151 is highly schedule-sensitive.
-   - Source rewrites that look simpler can worsen `s_waitcnt` and regress heavily.
-5. Source-level P2 rewrites are near saturation.
-   - Best kept source delta (Step07) gave only a small metric win with no structural ISA change.
-6. Forced B shared-order override in compiler is currently a do-not-repeat path.
-   - On gfx1151 it triggered a spill cliff (`VGPR=256`, scratch traffic, private segment allocation) and severe regression.
-7. Even simplified B shared layout forcing (`vec=1`, `order=[0,1]`) still spills.
-   - It reduces spill volume vs Step08 but remains far slower than Step07 and keeps `VGPR=256`.
-8. Forcing Triton away from buffer ops is not a shortcut to HIP parity.
-   - It makes opcodes look more HIP-like (`global_load/global_store`) but triggers severe spill and register-pressure regression.
-9. Non-k B-path vectorization can help if order is preserved.
-   - Moving B shared layout from `vec=1` to `vec=2` with preserved `order=[1,0]` improved fixed `N=8192` performance without spills.
-10. Increasing non-k B vec width from `2` to `4` is not a reliable next lever for this kernel.
-   - TTGIR changed (`vec=4`) but final AMDGCN binary hash matched Step11 (`vec=2`), and repeat metric did not beat gate.
-11. Swizzle phase tuning (`perPhase/maxPhase`) can regress without spills.
-   - `vec=2, perPhase=2, maxPhase=8` raised wait pressure and VGPR usage and regressed runtime despite zero scratch/private segment.
+- Baseline Triton had avoidable hot-path index overhead. `%M/%N` (`arith.remsi`) appeared in hot path before interior specialization.
+- Dominant remaining bottleneck is B operand path quality. Improving B shared layout vectorization (`vec=1 -> vec=2`) helps, but B conversion/reorder pressure remains the main optimization axis.
+- Permute pressure remains high and sticky. Kept variants still show high static `v_perm_b32` (`128` to `188`).
+- gfx1151 is highly schedule-sensitive. Source rewrites that look simpler can worsen `s_waitcnt` and regress heavily.
+- Source-level P2 rewrites are near saturation. Best kept source delta (Step07) gave only a small metric win with no structural ISA change.
+- Forced B shared-order override in compiler is currently a do-not-repeat path. On gfx1151 it triggered a spill cliff (`VGPR=256`, scratch traffic, private segment allocation) and severe regression.
+- Even simplified B shared layout forcing (`vec=1`, `order=[0,1]`) still spills. It reduces spill volume vs Step08 but remains far slower than Step07 and keeps `VGPR=256`.
+- Forcing Triton away from buffer ops is not a shortcut to HIP parity. It makes opcodes look more HIP-like (`global_load/global_store`) but triggers severe spill and register-pressure regression.
+- Non-k B-path vectorization can help if order is preserved. Moving B shared layout from `vec=1` to `vec=2` with preserved `order=[1,0]` improved fixed `N=8192` performance without spills.
+- Increasing non-k B vec width from `2` to `4` is not a reliable next lever for this kernel. TTGIR changed (`vec=4`) but final AMDGCN binary hash matched Step11 (`vec=2`), and repeat metric did not beat gate.
+- Swizzle phase tuning (`perPhase/maxPhase`) can regress without spills. `vec=2, perPhase=2, maxPhase=8` raised wait pressure and VGPR usage and regressed runtime despite zero scratch/private segment.
 
 ## Compiler Knob Status (do not repeat without new precondition)
 
@@ -193,7 +182,7 @@ Conclusion:
 - Profiling/codegen deltas vs Step11 baseline:
   - Triton profile median `46.532 -> 46.619 ms` (neutral/slightly worse).
   - No spill regression: rocprof `VGPR=216`, private segment fixed size `0`.
-  - TTGIR changed (`#shared1 vec=2 -> vec=4`), but final AMDGCN hash was identical to Step11 (`f2ef3faf7b0a29ed96044ffbf7f3f3e551b03a492ab5f75338d8ab02a59dcdb6`), with unchanged static counters (`v_perm_b32=188`, `s_waitcnt=117`).
+  - TTGIR changed (`#shared1 vec=2 -> vec=4`), but final AMDGCN hash was identical to Step11, with unchanged static counters (`v_perm_b32=188`, `s_waitcnt=117`).
 - Reject reason: no stable metric improvement and no backend codegen delta worth keeping.
 - Action taken: reverted local Triton back to Step11 vec2 setting, rebuilt wheel, reinstalled local Triton.
 - Artifacts: `triton_hip_compare_fixed_step13/*`.
@@ -239,16 +228,16 @@ Conclusion:
 
 ## Non-Negotiable Run Protocol
 
-1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
-2. Per-step order:
-   - `python test_scaled_mm.py`
-   - `python benchmark_scaled_mm.py`
-   - If it regresses, explain the reason by inspecting the generated code and profiling.
-3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
-4. If a new baseline is kept, commit the kernel immediately.
-5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
-6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
+- Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+- Per-step order:
+  - `python test_scaled_mm.py`
+  - `python benchmark_scaled_mm.py`
+  - If it regresses, explain the reason by inspecting the generated code and profiling.
+- Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+- If a new baseline is kept, commit the kernel immediately.
+- After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+- Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+- Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
 ## Active Checklist
 
@@ -268,15 +257,15 @@ Conclusion:
 
 ## Next Plan (Step14: HIP-parity-oriented compiler follow-up)
 
-1. Keep Step11 compiler baseline as the active reference (local Triton patch applied).
-2. Avoid repeating forced B shared-order override path unless there is a new precondition that addresses spill risk.
-3. Scope next compiler experiments to HIP-parity-oriented changes that preserve no-spill guardrails:
-   - `.amdhsa_next_free_vgpr < 256`
-   - `.amdhsa_private_segment_fixed_size == 0`
-4. Keep default `AMDGCN_USE_BUFFER_OPS=1`; no more env-level buffer-op toggles without a new precondition.
-5. New baseline for compiler-path gating is Step11 fixed repeat (`45.028 ms`).
-6. Candidate directions:
-   - target B conversion/permute lowering in compiler passes (e.g., `OptimizeDotOperands`) while preserving Step11 shared-order behavior,
-   - reduce wait-heavy scheduling side effects in non-k B operand lowering without increasing VGPR.
-7. Rerun fixed protocol for each new compiler change and gate on beating Step11 (`45.028 ms`) without correctness regression.
-8. If no guarded compiler variant improves metric, document an upstream follow-up item with minimal repro and side-by-side Triton/HIP codegen evidence.
+- Keep Step11 compiler baseline as the active reference (local Triton patch applied).
+- Avoid repeating forced B shared-order override path unless there is a new precondition that addresses spill risk.
+- Scope next compiler experiments to HIP-parity-oriented changes that preserve no-spill guardrails:
+  - `.amdhsa_next_free_vgpr < 256`
+  - `.amdhsa_private_segment_fixed_size == 0`
+- Keep default `AMDGCN_USE_BUFFER_OPS=1`; no more env-level buffer-op toggles without a new precondition.
+- New baseline for compiler-path gating is Step11 fixed repeat (`45.028 ms`).
+- Candidate directions:
+  - target B conversion/permute lowering in compiler passes (e.g., `OptimizeDotOperands`) while preserving Step11 shared-order behavior,
+  - reduce wait-heavy scheduling side effects in non-k B operand lowering without increasing VGPR.
+- Rerun fixed protocol for each new compiler change and gate on beating Step11 (`45.028 ms`) without correctness regression.
+- If no guarded compiler variant improves metric, document an upstream follow-up item with minimal repro and side-by-side Triton/HIP codegen evidence.

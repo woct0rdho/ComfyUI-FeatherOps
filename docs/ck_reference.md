@@ -10,16 +10,15 @@ This file keeps facts and implementation details of the CK kernel.
 
 ## End-to-End Flow in `ck_kernel.cu`
 
-1. `fp8_to_half_kernel`: converts full `B` from fp8(e4m3fn) to fp16 in global memory.
-2. CK GEMM: `gemm_impl_wmma_noswap<...>()` instantiates `DeviceGemmWmma_CShuffle<...>`.
-3. Optional epilogue: `scale_bias_kernel`.
+- `fp8_to_half_kernel`: converts full `B` from fp8(e4m3fn) to fp16 in global memory.
+- CK GEMM: `gemm_impl_wmma_noswap<...>()` instantiates `DeviceGemmWmma_CShuffle<...>`.
+- Optional epilogue: `scale_bias_kernel`.
 
 Important: CK GEMM here receives fp16 `B` (already upcast), not in-kernel fp8->fp16 fused into GEMM.
 
 ## Concrete CK GEMM Template Instance
 
 From `kernel/ck/ck_kernel.cu` (both padded and non-padded paths share the same core tuning):
-
 - `BlockSize=256`
 - `MPerBlock=128`
 - `NPerBlock=256`
@@ -119,8 +118,8 @@ If needed later, next step is to extract/disassemble the AMDGPU code object from
 
 ## Direct Implications for HIP Kernel Work
 
-- CK’s A-path uses three coordinated pieces together:
-  1. vectorized global read,
-  2. vectorized LDS write,
-  3. `M+1` LDS padding.
+- CK's A-path uses three coordinated pieces together:
+  - vectorized global read,
+  - vectorized LDS write,
+  - `M+1` LDS padding.
 - Matching only one of these in HIP is usually insufficient; parity work should treat them as one bundle.
