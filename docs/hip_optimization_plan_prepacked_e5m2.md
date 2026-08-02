@@ -25,42 +25,42 @@
 ### PC Sampling
 
 Extensive PC sampling was conducted, moving from legacy `SQ_IND` (which read stale `SQ_WAVE_INST` buffers) to precise `ttmp0:1` host-trap, and finally zero-skid hardware stochastic sampling. With the optimal `(1,8,4,8,2)` configuration, the pure stall distribution is:
-- **LDS Read (`ds_load_b128`):** 50% of samples
-- **FP Convert (`v_perm_b32`):** 15%
-- **Sync (`s_waitcnt` / barrier):** 14%
-- **WMMA:** 10%
+- LDS Read (`ds_load_b128`): 50% of samples
+- FP Convert (`v_perm_b32`): 15%
+- Sync (`s_waitcnt` / barrier): 14%
+- WMMA: 10%
 
-**Crucial Insight (Issue vs. Execution Latency):** Hardware stochastic sampling records the instruction the program counter (PC) is currently pointing to, which is the instruction *waiting to be issued*, not necessarily the instruction currently executing in the pipeline.
-1. **The `v_perm` Fetch Stall:** Even though `v_wmma` executes in 32 cycles and `v_perm_b32` executes in 1 cycle, `v_perm_b32` receives significantly more PC samples! This happens because `v_perm_b32` with inline literal constants (e.g., `0x30c020c`) is a massive 96-bit (3 DWORD) instruction. Fetching 32 consecutive massive instructions for 8 concurrent waves completely chokes the sequencer's instruction fetch frontend. The PC gets stuck pointing at `v_perm_b32` waiting for instruction memory. This front-end starvation physically robs the pipeline of the clock cycles needed to issue `v_wmma`.
-2. **The LDS Read Queue Stall:** `ds_load_b128` instructions account for 50% of all samples. A single `ds_load_b128` for a full wave (32 threads) requests 512 bytes, which takes the hardware LDS unit 4 clock cycles (at 128 bytes/cycle bandwidth) to process. With 8 waves constantly issuing these large loads, the internal LDS memory instruction queue becomes fully saturated. The sequencer must stall and wait for the LDS unit to drain its queue before it can issue the next `ds_load`. During this structural stall, the PC remains pointing at the blocked `ds_load` instruction, racking up massive sample counts.
+Crucial Insight (Issue vs. Execution Latency): Hardware stochastic sampling records the instruction the program counter (PC) is currently pointing to, which is the instruction *waiting to be issued*, not necessarily the instruction currently executing in the pipeline.
+- The `v_perm` Fetch Stall: Even though `v_wmma` executes in 32 cycles and `v_perm_b32` executes in 1 cycle, `v_perm_b32` receives significantly more PC samples! This happens because `v_perm_b32` with inline literal constants (e.g., `0x30c020c`) is a massive 96-bit (3 DWORD) instruction. Fetching 32 consecutive massive instructions for 8 concurrent waves completely chokes the sequencer's instruction fetch frontend. The PC gets stuck pointing at `v_perm_b32` waiting for instruction memory. This front-end starvation physically robs the pipeline of the clock cycles needed to issue `v_wmma`.
+- The LDS Read Queue Stall: `ds_load_b128` instructions account for 50% of all samples. A single `ds_load_b128` for a full wave (32 threads) requests 512 bytes, which takes the hardware LDS unit 4 clock cycles (at 128 bytes/cycle bandwidth) to process. With 8 waves constantly issuing these large loads, the internal LDS memory instruction queue becomes fully saturated. The sequencer must stall and wait for the LDS unit to drain its queue before it can issue the next `ds_load`. During this structural stall, the PC remains pointing at the blocked `ds_load` instruction, racking up massive sample counts.
 
 ### Thread Tracing
 
 Cycle-accurate thread tracing was used to plot execution timelines, revealing the true underlying bottlenecks that statistical sampling obscured:
-1. **Global Memory Wait (The `vmcnt` Gap):** Although PC sampling showed very few `global_load` samples (1%), thread tracing proved that individual waves experience massive `s_waitcnt` (sync) stalls waiting on `vmcnt`. A single wave's timeline reveals a **3,500-cycle bubble** between outer chunk iterations where it completely halts waiting for global memory to return from L2/VRAM. However, as detailed below, this single-wave stall does not translate to global starvation.
-2. **Instruction Fetch Bottleneck (`v_perm_b32`):** The FP8->FP16 conversion uses `v_perm_b32` with inline 32-bit literal constants (e.g., `0x010c000cu`). This makes it a 96-bit (3 DWORD) instruction. When multiple waves attempt to unroll 16 of these massive instructions simultaneously, it overwhelms the SIMD instruction cache and fetch/decode frontend. What should take 16 cycles stretches into hundreds of wall-clock cycles, starving the VALU and heavily delaying WMMA issue. The apparent 1:4 time ratio of convert vs WMMA on the timeline (compared to the 1:32 theoretical ratio) is driven by this fetch stall, making it a severe secondary bottleneck.
+- Global Memory Wait (The `vmcnt` Gap): Although PC sampling showed very few `global_load` samples (1%), thread tracing proved that individual waves experience massive `s_waitcnt` (sync) stalls waiting on `vmcnt`. A single wave's timeline reveals a 3,500-cycle bubble between outer chunk iterations where it completely halts waiting for global memory to return from L2/VRAM. However, as detailed below, this single-wave stall does not translate to global starvation.
+- Instruction Fetch Bottleneck (`v_perm_b32`): The FP8->FP16 conversion uses `v_perm_b32` with inline 32-bit literal constants (e.g., `0x010c000cu`). This makes it a 96-bit (3 DWORD) instruction. When multiple waves attempt to unroll 16 of these massive instructions simultaneously, it overwhelms the SIMD instruction cache and fetch/decode frontend. What should take 16 cycles stretches into hundreds of wall-clock cycles, starving the VALU and heavily delaying WMMA issue. The apparent 1:4 time ratio of convert vs WMMA on the timeline (compared to the 1:32 theoretical ratio) is driven by this fetch stall, making it a severe secondary bottleneck.
 
 ### The Final Bottleneck
 
 Through thread tracing and hardware occupancy analysis of the chosen autotune config `(1,8,4,8,2)`, we have proven the kernel is near the absolute limit of the hardware:
-1. **Hardware Latency Hiding:** While an individual wave stalls for 3,500 cycles on global memory fetches, the `(1,8,4,8,2)` configuration achieves 50% occupancy. It uses 184 VGPRs (fitting 8 waves per SIMD within the 1536 limit) and 32 KB of LDS per 8-wave workgroup (fitting 4 workgroups into the 128 KB per-WGP limit). This allows 8 resident waves per SIMD. The hardware scheduler seamlessly context-switches among these 8 waves during memory stalls. Combined with macro-level scheduling staggering across the 80 SIMDs, the global memory latency is well hidden by the hardware without needing an explicit software pipeline.
-2. **FP Convert:** RDNA3.5 (`gfx1151`) lacks native `fp8` instructions. Unpacking `fp8` data requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma` (matrix core). Thread tracing reveals that the VALU unpacking consumes **23%** of the math pipeline execution time, creating a hard ceiling of **77%** for matrix math (WMMA) execution time.
-   - Theoretical Peak (assuming 100% WMMA time): 59.4 TFLOPS
-   - Hard Cap (due to 77% WMMA time): 45.7 TFLOPS
-   - Actually Achieved: 44.0 TFLOPS
+- Hardware Latency Hiding: While an individual wave stalls for 3,500 cycles on global memory fetches, the `(1,8,4,8,2)` configuration achieves 50% occupancy. It uses 184 VGPRs (fitting 8 waves per SIMD within the 1536 limit) and 32 KB of LDS per 8-wave workgroup (fitting 4 workgroups into the 128 KB per-WGP limit). This allows 8 resident waves per SIMD. The hardware scheduler seamlessly context-switches among these 8 waves during memory stalls. Combined with macro-level scheduling staggering across the 80 SIMDs, the global memory latency is well hidden by the hardware without needing an explicit software pipeline.
+- FP Convert: RDNA3.5 (`gfx1151`) lacks native `fp8` instructions. Unpacking `fp8` data requires `v_perm_b32` (VALU), which cannot execute concurrently with `v_wmma` (matrix core). Thread tracing reveals that the VALU unpacking consumes 23% of the math pipeline execution time, creating a hard ceiling of 77% for matrix math (WMMA) execution time.
+  - Theoretical Peak (assuming 100% WMMA time): 59.4 TFLOPS
+  - Hard Cap (due to 77% WMMA time): 45.7 TFLOPS
+  - Actually Achieved: 44.0 TFLOPS
 
 ## Non-Negotiable Run Protocol
 
-1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
-2. Per-step order:
-   - `python test_scaled_mm_hip.py`
-   - `python benchmark_scaled_mm_hip.py`
-   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
-3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
-4. If a new baseline is kept, commit the kernel immediately.
-5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
-6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
+- Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+- Per-step order:
+  - `python test_scaled_mm_hip.py`
+  - `python benchmark_scaled_mm_hip.py`
+  - If it regresses, explain the reason by inspecting the generated code and/or profiling.
+- Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+- If a new baseline is kept, commit the kernel immediately.
+- After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+- Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+- Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
 ## Condensed Experiment Ledger
 

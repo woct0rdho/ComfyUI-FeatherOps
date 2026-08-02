@@ -45,6 +45,7 @@ Use the active interpreter explicitly so collection and execution use the same e
 ```bash
 python -m pytest \
   Tensile/Tests/unit/test_CustomSchedule.py \
+  Tensile/Tests/unit/test_CustomSchedule_LayoutAutoDetection.py \
   Tensile/Tests/unit/test_ValidatePack.py \
   Tensile/Tests/unit/test_validateParameterTypes.py
 ```
@@ -54,7 +55,6 @@ For local-read pack, WMMA v1 d16, or one-iteration VGPR-layout changes, run:
 ```bash
 python -m pytest -q \
   Tensile/Tests/unit/test_local_read_pack_allocation.py \
-  Tensile/Tests/unit/test_compact_one_iter_wmma_layout.py \
   Tensile/Tests/unit/characterization/LocalRead/test_r3_localread_char.py \
   Tensile/Tests/unit/test_initc_iter_wmma.py \
   Tensile/Tests/unit/test_occupancy.py \
@@ -71,6 +71,25 @@ Architecture and GPU markers apply at different scopes:
 - `test_storeD_roundtrip.py`: contains GPU execution and option-driven cases. Review its fixtures and selected nodes rather than treating the whole file as gfx950-gated.
 
 A skipped architecture-specific subset does not mean the rest of a selected module failed. Check pytest's pass/skip summary and the marker on the selected class or function.
+
+For GL2 prefetch and the newer cooperative-cluster paths, run the focused regression set:
+
+```bash
+python -m pytest -q \
+  Tensile/Tests/unit/test_gl2_prefetch_offset.py \
+  Tensile/Tests/unit/test_prefetchgl2_streamk_guard.py \
+  Tensile/Tests/unit/test_subtile_gl2_prefetch.py \
+  Tensile/Tests/unit/characterization/_codegen/test_cluster_padding_gfx1250_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_streamk_cluster_gfx1250_char.py
+```
+
+Coverage and hardware requirements for this set:
+- `test_gl2_prefetch_offset.py` is the direct production address-generation verifier. It covers TLU and non-TLU tensors, address increments, strided batches, MX scales, FP4/FP8 byte widths, sparse metadata, whole-cluster fan-out, and edge/non-power-of-two cases. It runs only on a real gfx1250 GPU.
+- `test_prefetchgl2_streamk_guard.py` validates the DP-first StreamK (`StreamK==3`) PrefetchGL2 guard with both `StreamKForceDPOnly` modes. It uses gfx1250 assembler/capability data but does not require a gfx1250 GPU. It skips if the installed `amdclang++` cannot describe gfx1250.
+- `test_subtile_gl2_prefetch.py` is a Python-only scheduler test and does not require a GPU.
+- The two `_codegen` tests validate gfx1250 cluster decoding, padded boundary clusters, and StreamK cluster handling through generated assembly. They require a toolchain that can emit gfx1250 code, but do not launch a GPU kernel.
+
+On gfx1151, the direct address verifier is expected to skip all of its gfx1250 cases. The guard, scheduler, and codegen tests can still pass when the ROCm toolchain supports gfx1250.
 
 ## Run `rocisa` Tests
 
@@ -97,5 +116,17 @@ python -m pytest \
   --gpu-targets gfx1151 \
   Tensile/Tests/common/gemm/gfx11/fp16_tn_gfx11.yaml
 ```
+
+For the generalized/sparse GL2 path, add the gfx1250 sparse common test to the prebuilt-client workflow:
+
+```bash
+python -m pytest \
+  --prebuilt-client ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
+  --global-parameters CheckASMCodeSize=True \
+  --gpu-targets gfx1250 \
+  Tensile/Tests/common/sparse/gfx1250/spmm_tdm_gl2prefetch.yaml
+```
+
+This is code-generation coverage for sparse metadata plus GL2 prefetch. It does not replace the real-GPU address verifier.
 
 For routine local codegen edits, start with targeted unit tests plus direct TensileLite generation/validation of the HHH/HHS candidates described in `doc/tensile_fp16_nt_hhh.md` and `doc/tensile_fp16_nt_hhs.md`.

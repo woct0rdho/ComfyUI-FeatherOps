@@ -159,7 +159,7 @@ The table keeps decision-relevant hot-loop results. Full per-probe details and C
 
 | Kernel/Path | Median GFLOP/s | Mean GFLOP/s | Notes |
 | --- | ---: | ---: | --- |
-| TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10, SIA3, no store priority | `45252.9` | `45491.6` | **Current best no-`ForceStaticWGM8`.** Aggregated over 3 passes (30 total samples). `ScheduleIterAlg=3`, `StorePriorityOpt=False`, `NumElementsPerBatchStore=10`, `PGR1/PLR1/VWB2/1LDSB1`. Resources: vgpr=219, sgpr=74, LDS=8192 |
+| TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10, SIA3, no store priority | `45252.9` | `45491.6` | Current best no-`ForceStaticWGM8`. Aggregated over 3 passes (30 total samples). `ScheduleIterAlg=3`, `StorePriorityOpt=False`, `NumElementsPerBatchStore=10`, `PGR1/PLR1/VWB2/1LDSB1`. Resources: vgpr=219, sgpr=74, LDS=8192 |
 | TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10, SIA3 | `40968.9` | `40880.1` | SIA3 with store priority on, same resources. ~10% slower sister config |
 | TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10 | `38292.3` | `38375.1` | Best repeat-confirmed SIA2 config in the original NEPBS sweep |
 | TensileLite scale/bias VWB2 forced static-WGM8, NEPBS8 | `40483.9` | `40432.8` | Historical best for `8192^3` with `ForceStaticWGM8=True` |

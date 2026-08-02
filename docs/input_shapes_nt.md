@@ -30,6 +30,10 @@ Saved in `~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/shape_data/`:
 - `current_nt_hhs_intersection_large_grid_target.csv`: overlap between current NT HHS and target union.
 - `per_k_summary.csv`: per-K compact summary for current NT, target union, and TN HHS.
 - `manifest.json`: source-file metadata, dimensions, counts-by-K, and duplicate details.
+- `h3_gemm_shapes.csv`: normalized H3 forward, full-weight-gradient, and theoretical rank-16 LoRA rows.
+- `h3_gemm_shapes_manifest.json`: H3 geometry, pruned-AdaLN assumptions, checkpoint shape counts, and layout notes.
+- `tn_gemm_shapes.csv` and `tn_gemm_shapes_manifest.json`: derived base and unmerged rank-16 LoRA forward TN rows, with training-layout overrides.
+- `nn_gemm_shapes.csv` and `nn_gemm_shapes_manifest.json`: derived base and rank-16 LoRA input-gradient NN rows, including the Krea 2 batched alternate.
 
 ### Large-Grid Target Dimension Sets
 
@@ -405,6 +409,47 @@ Summary of LTX 2.3 rows:
 - Full-weight training creates 640 `NT` parameter-gradient GEMM rows per video size with exact pattern `[M=in, N=out, batch=1, K=B]`.
 - Rank-16 LoRA training creates 1280 `NT` parameter-gradient rows per video size because both LoRA factors are included: down maps to `[M=in, N=16, batch=1, K=B]`; up maps to `[M=16, N=out, batch=1, K=B]`.
 
+### H3
+
+Sources checked:
+- ComfyUI H3 model and conditioning code under `~/ComfyUI/comfy/ldm/minimax/model.py`, `~/ComfyUI/comfy/text_encoders/minimax.py`, `~/ComfyUI/comfy/model_base.py`, `~/ComfyUI/comfy/model_detection.py`, `~/ComfyUI/comfy/supported_models.py`, `~/ComfyUI/comfy/latent_formats.py`, and `~/ComfyUI/comfy_extras/nodes_minimax_h3.py`.
+- Dequantized logical tensor shapes from `~/ComfyUI/models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors`.
+- Theoretical training and LoRA target paths under `~/musubi-tuner/src/musubi_tuner/minimax_h3/model.py`, `~/musubi-tuner/src/musubi_tuner/minimax_h3/packing.py`, `~/musubi-tuner/src/musubi_tuner/minimax_h3_train_network.py`, and `~/musubi-tuner/src/musubi_tuner/networks/lora_minimax_h3.py`.
+
+Assumptions: batch size 1, requested video sizes `640x480x40` and `1280x720x80`, a short 16-token prompt, no first/last keyframes or reference inputs, LoRA rank 16, external Qwen3-VL-32B text-encoder weights excluded, and attention-kernel matmuls excluded. The local INT8 ConvRot weights are treated as ordinary dequantized BF16 matrices; quantization scales and ConvRot metadata are not GEMMs.
+
+H3 geometry and packed rows:
+- H3's valid video frame grid is `17*n+5`. ComfyUI rounds the requested 40 and 80 frame inputs upward to 56 and 90 frames respectively. Musubi's dataset path rounds source clips downward instead, so use the effective H3 frame count shown below when reproducing these rows in training.
+- H3 uses 24 video latent channels, spatial `/16`, temporal latent frames `2 + 5*((frames-5)//17)`, and video patch size `(1,2,2)`. The effective video token grid is therefore spatially `/32`.
+- The target latent uses the requested width and height directly. ComfyUI's 768-short-edge canvas adaptation is only used for reference videos, so it does not change these T2VA target rows.
+- For `1280x720x80`, the 720-pixel height produces 45 latent rows; ComfyUI pads that latent axis to 46 before 2x2 patchification.
+
+| Requested input | Effective H3 frames | Latent grid `[T,H,W]` | Video rows exact / used | Audio rows exact / used | Packed rows exact / used |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `640x480x40` | 56 | `[17,30,40]` | 5100 / 5120 | 186 / 256 | 5302 / 5376 |
+| `1280x720x80` | 90 | `[27,46,80]` | 24840 / 25088 | 300 / 512 | 25156 / 25344 |
+
+Audio rows are `2 * audio_latent_frames` at 40 Hz. Packed rows are `16 text + audio + video`. The saved GEMM rows round video, audio, and packed activation rows independently up to multiples of 256; fused attention uses the exact packed row counts documented in `input_shapes_attn.md`.
+
+H3 config and checkpoint facts:
+- H3 is a single-stream audio-video transformer with hidden width 5376, 50 main DiT blocks, 2 text-token refiner blocks, 56 attention heads, head dimension 128, attention inner width 7168, FFN width 14336, text input width 5120, video patch width 96, and audio patch width 32.
+- The pruned checkpoint has 264 logical 2D Linear/GEMM weights: `[21504,5376] x52`, `[5376,7168] x52`, `[28672,5376] x52`, `[5376,14336] x52`, `[96768,8] x50`, plus one each of `[5376,96]`, `[5376,32]`, `[5376,5120]`, `[10752,8]`, `[96,5376]`, and `[32,5376]`.
+- `adaln_t_table [1025,8]` is an interpolation table, not a GEMM weight. The pruned AdaLN projections therefore use input width 8; this is different from the unpruned full-AdaLN H3 architecture and is intentional for the supplied checkpoint.
+- H3 packs one text span, audio rows, and video rows into one main sequence. Keyframe rows would add one spatial video frame per supplied keyframe; Ref2VA reference rows are input-dependent and are excluded from this fixed baseline.
+- The external Qwen3-VL-32B conditioning checkpoint is not included in this diffusion-model shape set.
+
+Forward-pass layout check:
+- No default H3 forward `NT` GEMMs were found. Contiguous video/text/packed-stream inputs use `TN`.
+- In the no-reference ComfyUI T2VA path, `pack_audio` returns a `[2*audio_latent_frames,32]` channel-major view with stride `(1,2*audio_latent_frames)`. `audio_patch_proj` therefore has confirmed `TT` rows; H3's TT cases are recorded in `input_shapes_tt.md`. Condition/reference audio assembly and the Musubi training `torch.cat` path materialize contiguous inputs and use `TN`.
+- Full-weight gradients use `NT` `[M=in, N=out, batch=1, K=B]`. The theoretical rank-16 LoRA factor gradients use down `[M=in, N=16, batch=1, K=B]` and up `[M=16, N=out, batch=1, K=B]`.
+
+Exact machine-readable rows are saved in `~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/shape_data/h3_gemm_shapes.csv`, with geometry, checkpoint, and training notes in `h3_gemm_shapes_manifest.json`.
+
+Summary of H3 rows:
+- Per requested video size, the forward rows cover all 264 logical checkpoint Linear weights: 263 `TN` weights and one `TT` audio input projection.
+- Theoretical full-weight training creates 264 `NT` parameter-gradient GEMM rows per video size.
+- The documented rank-16 LoRA scope follows the Musubi default target pattern: only the 50 main blocks' `qkv_proj`, `out_proj`, `fc1`, and `fc2` are adapted. That is 200 target weights and 400 factor-gradient rows per size. An all-linear theoretical LoRA expansion would add the remaining 64 weights, but is not included in the saved LoRA rows.
+
 ## Recommended NT HHS Tuning Plan
 
 ### Normalized Workload CSV Schema
@@ -417,31 +462,30 @@ The exact TensileLite shape columns remain `m,n,batch,k` in `[M,N,batch,K]` orde
 
 ### Planning Summary
 
-The ComfyUI workloads analyzed here produce no default forward `NT` GEMMs for the model Linears; forward Linears are `TN`. The `NT` tuning target is therefore mainly full-weight and LoRA parameter-gradient GEMMs.
+The ComfyUI workloads analyzed here produce no default forward `NT` GEMMs for the model Linears; ordinary forward Linears are `TN`, with confirmed strided `TT` exceptions documented separately. Training input gradients use `NN` for the corresponding base and LoRA factor matrices. Exact TN and NN datasets are documented in `input_shapes_tn.md` and `input_shapes_nn.md`; the `NT` tuning target here remains full-weight and LoRA parameter-gradient GEMMs.
 
-Aggregating `NT` rows from SDXL, Anima, Qwen, Z-Image, Krea 2, Ideogram 4, Klein 9B, Wan, and LTX 2.3 gives:
-- 637 normalized CSV rows.
-- 406 unique exact `NT` shapes.
-- 25,275 weighted `NT` shape occurrences after applying each row's `count`.
+Aggregating `NT` rows from SDXL, Anima, Qwen, Z-Image, Krea 2, Ideogram 4, Klein 9B, Wan, LTX 2.3, and H3 gives:
+- 683 normalized CSV rows.
+- 441 unique exact `NT` shapes.
+- 26,603 weighted `NT` shape occurrences after applying each row's `count`.
 - Current NT HHS exact table covers only 6 of those unique shapes, or 1,060 weighted occurrences.
 - The large-grid target union covers 62 of those unique shapes, or 5,828 weighted occurrences.
 
 Important workload dimensions not covered by the current large-grid dimension sets:
-- Extra `M` values: `[68, 1280, 2560, 3584, 3840, 4608, 5120, 6144, 6912, 10240, 12288, 13824, 16384, 53248]`.
-- Extra `N` values: `[4608, 5120, 6144, 6912, 10240, 11520, 12288, 13824, 15360, 16384, 18432, 24576, 30720, 36864]`.
-- Extra `K` activation-row values: `[192, 1536, 2304, 4112, 4128, 4608, 8960, 9216, 9232, 9248, 9728, 12032, 40960, 72192]`.
+- Extra `M` values: `[68, 96, 1280, 2560, 3584, 3840, 4608, 5120, 5376, 6144, 6912, 7168, 10240, 12288, 13824, 14336, 16384, 53248]`.
+- Extra `N` values: `[96, 4608, 5120, 5376, 6144, 6912, 10240, 10752, 11520, 12288, 13824, 15360, 16384, 18432, 21504, 24576, 28672, 30720, 36864, 96768]`.
+- Extra `K` activation-row values: `[192, 1536, 2304, 4112, 4128, 4608, 5120, 5376, 8960, 9216, 9232, 9248, 9728, 12032, 25088, 25344, 40960, 72192]`.
 
 The `M` extensions matter for `NT` specifically. Values like `1280` exist as `N` in the inherited large grid, but `NT` parameter gradients often put feature/input dimensions on `M`, so an `N`-only value is not enough.
 
 ### Recommended Shape Set
 
 Tune NT HHS on the union of these tiers:
+- Base large grid: all 9,681 shapes from `large_grid_target_union_shapes.csv`. This brings NT HHS to the same broad coverage already used by the tuned HHS/BBS TN/NN work.
+- Exact workload misses: all unique `NT` shapes from the normalized `*_gemm_shapes.csv` files that are not already in the large-grid target union. This adds 379 shapes and gives exact coverage for the two analyzed sizes per model.
+- Banded workload anchors: add K-banded variants of the workload shapes so nearby image/video sizes can choose a sensible tuned solution instead of falling back to a distant exact shape. Use this K mapping for the workload-derived rows: keep `1`, `16`, `32`, `192`, `512`, `1024`, `1536`, `2304`, `4096`, `5120`, `9216`, `25088`, and `40960`; map `4112`, `4128`, and `4608 -> 4096`; map `5376 -> 5120`; map `8960`, `9232`, `9248`, and `9728 -> 9216`; map `12032 -> 12288`; map `25344 -> 25088`; map `72192 -> 73728`.
 
-1. Base large grid: all 9,681 shapes from `large_grid_target_union_shapes.csv`. This brings NT HHS to the same broad coverage already used by the tuned HHS/BBS TN/NN work.
-2. Exact workload misses: all unique `NT` shapes from the normalized `*_gemm_shapes.csv` files that are not already in the large-grid target union. This adds 344 shapes and gives exact coverage for the two analyzed sizes per model.
-3. Banded workload anchors: add K-banded variants of the workload shapes so nearby image/video sizes can choose a sensible tuned solution instead of falling back to a distant exact shape. Use this K mapping for the workload-derived rows: keep `1`, `16`, `32`, `192`, `512`, `1024`, `1536`, `2304`, `4096`, `9216`, and `40960`; map `4112`, `4128`, and `4608 -> 4096`; map `8960`, `9232`, `9248`, and `9728 -> 9216`; map `12032 -> 12288`; map `72192 -> 73728`.
-
-The combined recommended set has 10,072 unique exact shapes: the 9,681-shape large grid plus 391 workload/banded additions.
+The combined recommended set has 10,127 unique exact shapes: the 9,681-shape large grid plus 446 workload/banded additions.
 
 Do not expand the workload extensions into a full Cartesian product of every observed `M`, `N`, and `K`. Keep the workload `M,N` pairs from the CSV rows and only add the K-banded variants above. The existing large grid already provides broad canonical coverage; the workload extension is for high-value missing feature pairs and token-row bands.
 
@@ -449,8 +493,8 @@ Do not expand the workload extensions into a full Cartesian product of every obs
 
 Minimum viable NT HHS update:
 - Tune the 9,681-shape large-grid target union first.
-- Add the high-weight workload misses with `K in {1536, 2304, 4096, 4112, 4128, 9216, 9232, 9248, 12288, 73728}`.
-- Add skinny LoRA rank-16 shapes where `M=16` or `N=16` for feature sizes `[1280, 1536, 2048, 2560, 3072, 3840, 4096, 4608, 5120, 6144, 6912, 10240, 11520, 12288, 13824, 15360, 16384, 18432, 24576, 36864]`.
+- Add the high-weight workload misses with `K in {1536, 2304, 4096, 4112, 4128, 5120, 5376, 9216, 9232, 9248, 12288, 25088, 25344, 73728}`.
+- Add skinny LoRA rank-16 shapes where `M=16` or `N=16` for feature sizes `[1280, 1536, 2048, 2560, 3072, 3840, 4096, 4608, 5120, 5376, 6144, 6912, 7168, 10240, 11520, 12288, 13824, 14336, 15360, 16384, 18432, 21504, 24576, 28672, 36864]`.
 
 High-priority K bands:
 - `K=1536`: LTX 2.3 small-video rows; especially `(M,N)` pairs `(4096,16)`, `(16,4096)`, `(4096,4096)`, `(4096,32)`, `(16,32)`, `(16384,4096)`, and `(4096,16384)`.
@@ -459,8 +503,11 @@ High-priority K bands:
 - `K=9216`/`K=9232`/`K=9248`: high-resolution image rows, nearby LTX/Klein rows, and Ideogram 4/Z-Image/Krea 2 conditional rows; especially `(16,3072)`, `(3072,16)`, `(3072,3072)`, `(4096,4096)`, `(4608,4608)`, `(12288,4608)`, `(3840,3840)`, `(10240,3840)`, `(6144,6144)`, and `(16384,6144)`.
 - `K=12288`: Wan `640x480x40` video band; especially `(5120,16)`, `(16,5120)`, `(5120,5120)`, `(5120,13824)`, and `(13824,5120)`.
 - `K=73728`: Wan `1280x720x80` video band; use the same Wan feature pairs as `K=12288`.
+- `K=5120`/`K=5376`: H3 `640x480x40` packed/video bands; especially `(5376,16)`, `(16,5376)`, `(5376,21504)`, `(7168,5376)`, `(5376,28672)`, and `(14336,5376)`.
+- `K=25088`/`K=25344`: H3 `1280x720x80` packed/video bands; use the same H3 feature pairs as `K=5120`/`K=5376`.
 
 Lower-priority or deferrable items:
 - Exact `K=4112`/`K=9232` Ideogram 4 and Krea 2 rows, `K=4128`/`K=9248` Z-Image rows, and `K=4608`/`K=9728` Klein rows can be covered by nearby `K=4096` and `K=9216` anchors if tuning budget is tight.
 - Small-token Z-Image context-refiner rows with `K=32`, Krea 2 TextFusion layer-stack rows with `K=192`, Krea 2 projector rows with `K=40960`, and timestep/global rows with `K=1` are low arithmetic work or very skinny. Keep them in the full recommended set, but deprioritize them in a constrained tuning run after the larger token-row bands are covered.
-- Very low-count odd feature sizes such as `M=68`, `M=3584`, `M=53248`, `N=30720`, and exact patch/unpatch one-offs can be deferred unless profiling shows them hot.
+- H3's pruned-AdaLN `K=2` gradients and tiny audio/patch projection rows are low arithmetic work; keep them in the full recommended set but prioritize the packed main-block rows first.
+- Very low-count odd feature sizes such as `M=68`, `M=96`, `M=3584`, `M=53248`, `N=96`, `N=30720`, and exact patch/unpatch one-offs can be deferred unless profiling shows them hot.

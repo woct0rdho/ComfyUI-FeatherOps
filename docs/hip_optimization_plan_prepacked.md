@@ -21,7 +21,6 @@
 ## Current Bottleneck Model
 
 From target-kernel-only profiling (`P11-B6a`, forced `1,8,2,2,8,2`, `N=8192`):
-
 - Avg kernel time: `27.755 ms` (`39.61 TFLOPS`).
 - Theoretical peak (59.4 TFLOPS) lower-bound time: `18.510 ms`.
 - Gap to peak-time bound: `+9.245 ms` (`+49.9%`).
@@ -33,22 +32,21 @@ From target-kernel-only profiling (`P11-B6a`, forced `1,8,2,2,8,2`, `N=8192`):
   - VALU 58.2%, LDS 13.6%, OTHER 28.3% (`SQ_WAVE32_INSTS` basis).
 
 Interpretation:
-
 - Dominant limiter is on-chip issue/scheduling pressure (decode/VALU + control/other), not DRAM.
 - LDS is non-trivial but no longer the primary limiter for the winner path.
 
 ## Non-Negotiable Run Protocol
 
-1. Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
-2. Per-step order:
-   - `python test_scaled_mm_hip.py`
-   - `python benchmark_scaled_mm_hip.py`
-   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
-3. Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
-4. If a new baseline is kept, commit the kernel immediately.
-5. After every experiment, update this file with findings, keep/reject, regression reason, next steps.
-6. Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-7. Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
+- Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
+- Per-step order:
+  - `python test_scaled_mm_hip.py`
+  - `python benchmark_scaled_mm_hip.py`
+  - If it regresses, explain the reason by inspecting the generated code and/or profiling.
+- Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
+- If a new baseline is kept, commit the kernel immediately.
+- After every experiment, update this file with findings, keep/reject, regression reason, next steps.
+- Do not repeat experiments already completed in this file unless there is a clearly new precondition.
+- Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
 
 ## Condensed Experiment Ledger
 

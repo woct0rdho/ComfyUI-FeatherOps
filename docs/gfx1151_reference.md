@@ -41,7 +41,7 @@ Examples:
 - `192 VGPR allocated per wave` -> `floor(1536/192) = 8 waves per SIMD` -> `50%` occupancy limit by VGPR.
 - `65536 bytes LDS per workgroup` and `4 waves per workgroup` -> `floor(131072/65536) = 2 workgroups per WGP` -> `floor(2 * 4 / 4) = 2 waves per SIMD` -> `12.5%` occupancy limit by LDS.
 
-Note on LDS capacity: A WGP has **128 KB** of physical LDS (64 KB per CU). However, the architecture restricts a single workgroup to allocating a maximum of **64 KB**. Therefore, tools like rocminfo and sysfs will report 64 KB (the software allocation limit per-workgroup, which corresponds to the per-CU physical size), but a WGP can physically fit two such 64 KB workgroups simultaneously. Occupancy bottlenecks on LDS only when the combined LDS requests of all active workgroups exceed the 128 KB per-WGP limit.
+Note on LDS capacity: A WGP has 128 KB of physical LDS (64 KB per CU). However, the architecture restricts a single workgroup to allocating a maximum of 64 KB. Therefore, tools like rocminfo and sysfs will report 64 KB (the software allocation limit per-workgroup, which corresponds to the per-CU physical size), but a WGP can physically fit two such 64 KB workgroups simultaneously. Occupancy bottlenecks on LDS only when the combined LDS requests of all active workgroups exceed the 128 KB per-WGP limit.
 
 ## WMMA Facts
 
@@ -134,7 +134,7 @@ $ROCM_PATH/bin/rocprofv3 \
 
 ### Interpreting PC Sampling Data
 
-For stochastic PC sampling, a critical architectural detail is that it records the instruction the program counter (PC) is currently pointing to, which is the instruction **waiting to be issued**. It does not necessarily record instructions currently executing in the pipeline. Host-trap PC sampling can also report nearby instructions because it is interrupt/skid based.
+For stochastic PC sampling, a critical architectural detail is that it records the instruction the program counter (PC) is currently pointing to, which is the instruction waiting to be issued. It does not necessarily record instructions currently executing in the pipeline. Host-trap PC sampling can also report nearby instructions because it is interrupt/skid based.
 
 If an instruction has a high sample count, it means the sequencer spent a long time stalled trying to issue that instruction, not necessarily that the instruction took a long time to compute.
 
