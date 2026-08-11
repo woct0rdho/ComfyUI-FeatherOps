@@ -86,7 +86,7 @@ def _scaled_mm_kernel_interior(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     if K % BLOCK_SIZE_K == 0:
-        for _ in range(0, K // BLOCK_SIZE_K):
+        for _ in range(K // BLOCK_SIZE_K):
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs)
             b = fp8e4m3fn_to_fp16(b)

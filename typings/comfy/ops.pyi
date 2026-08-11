@@ -1,9 +1,10 @@
 from collections.abc import Callable
+from typing import TypeAlias
 
 import torch
 from torch import nn
 
-_TensorTransform = Callable[[torch.Tensor], torch.Tensor]
+_TensorTransform: TypeAlias = Callable[[torch.Tensor], torch.Tensor]
 
 class disable_weight_init:
     class Linear(nn.Linear):
