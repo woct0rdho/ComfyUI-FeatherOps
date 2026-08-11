@@ -125,12 +125,12 @@ def benchmark_decomposed():
         attn_hip_prepacked(q, k_fp8, v_fp8)
         torch.cuda.synchronize()
 
-        quant_kernel_ms, _, _ = _bench_ms(lambda: quantize_kv_e5m2_out(k, v, k_fp8, v_fp8))
-        quant_alloc_ms, _, _ = _bench_ms(lambda: quantize_kv_e5m2(k, v))
-        prepacked_ms, _, _ = _bench_ms(lambda: attn_hip_prepacked(q, k_fp8, v_fp8))
-        end_to_end_ms, _, _ = _bench_ms(lambda: attn_hip(q, k, v))
+        quant_kernel_ms, _, _ = _bench_ms(lambda k=k, v=v, k_fp8=k_fp8, v_fp8=v_fp8: quantize_kv_e5m2_out(k, v, k_fp8, v_fp8))
+        quant_alloc_ms, _, _ = _bench_ms(lambda k=k, v=v: quantize_kv_e5m2(k, v))
+        prepacked_ms, _, _ = _bench_ms(lambda q=q, k_fp8=k_fp8, v_fp8=v_fp8: attn_hip_prepacked(q, k_fp8, v_fp8))
+        end_to_end_ms, _, _ = _bench_ms(lambda q=q, k=k, v=v: attn_hip(q, k, v))
 
-        attn_tflops = lambda ms: 4 * BATCH * HEADS * n**2 * HEAD_DIM / ms * 1e-9
+        attn_tflops = lambda ms, n=n: 4 * BATCH * HEADS * n**2 * HEAD_DIM / ms * 1e-9
         row = {
             "N": n,
             "quant_kernel_ms": quant_kernel_ms,

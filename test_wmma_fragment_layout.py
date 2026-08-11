@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import torch
 
 from kernel_attn.hip.hip_kernel import wmma_fragment_probe
@@ -18,7 +20,7 @@ def main() -> None:
     diff = (out - expected).abs()
     max_diff = diff.max().item()
     if max_diff != 0:
-        idx = diff.argmax().item()
+        idx = int(diff.argmax().item())
         tile = idx // 256
         rem = idx % 256
         row = rem // 16
