@@ -6,10 +6,11 @@ target-version = "py310"
 [tool.ruff.lint]
 exclude = ["tmp*/"]
 extend-select = ["I"]
-ignore = ["E731"]
 
 [tool.ruff.lint.per-file-ignores]
-"**/__init__.py" = ["F401"]
+# The repository name contains a hyphen, so Ruff derives an invalid module
+# name for package initializers even though the package layout is intentional.
+"**/__init__.py" = ["F401", "N999"]
 
 [tool.ty.analysis]
 replace-imports-with-any = ["triton", "triton.**"]

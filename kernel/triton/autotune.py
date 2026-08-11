@@ -154,10 +154,7 @@ def _common_prune_criteria(smem_criteria: _SmemCriteria, config: triton.Config, 
         return True
     if BLOCK_SIZE_M * BLOCK_SIZE_K < min_block_size_M * min_block_size_K:
         return True
-    if BLOCK_SIZE_N * BLOCK_SIZE_K < min_block_size_N * min_block_size_K:
-        return True
-
-    return False
+    return BLOCK_SIZE_N * BLOCK_SIZE_K < min_block_size_N * min_block_size_K
 
 
 def prune_configs(smem_criteria: _SmemCriteria, configs: list[triton.Config], args: Mapping[str, object], **_kwargs: object) -> list[triton.Config]:

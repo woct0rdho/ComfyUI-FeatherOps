@@ -91,10 +91,7 @@ def _config_compatible(cfg: tuple[int, int, int, int, int], M: int, N: int, K: i
         return False
 
     is_large = K >= 3072 and min(M, N) >= 3072 and max(M, N) >= 4096
-    if is_large and (block_m < 64 or block_n < 64):
-        return False
-
-    return True
+    return not (is_large and (block_m < 64 or block_n < 64))
 
 
 def _size_hint(value: int) -> int:
@@ -168,7 +165,7 @@ def old_autotune(
     best_ms = None
 
     for cfg in candidates:
-        ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup_ms, rep=rep_ms)
+        ms = triton.testing.do_bench(lambda cfg=cfg: run_fn(cfg), warmup=warmup_ms, rep=rep_ms)
         if best_ms is None or ms < best_ms:
             best_ms = ms
             best_cfg = cfg

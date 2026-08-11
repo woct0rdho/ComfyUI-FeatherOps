@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import torch
 
 from kernel.convert import bf16_to_fp16
