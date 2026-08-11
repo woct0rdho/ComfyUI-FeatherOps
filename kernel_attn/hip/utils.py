@@ -1,14 +1,14 @@
 import os
-from typing import Callable, Dict, List, Tuple
+from collections.abc import Callable
 
 import torch
 import triton
 from torch._inductor.kernel.custom_op import CustomOpConfig
 from torch.fx.experimental.symbolic_shapes import optimization_hint
 
-AttnConfig = Tuple[int, int, int]
+AttnConfig = tuple[int, int, int]
 
-CONFIGS: List[AttnConfig] = [
+CONFIGS: list[AttnConfig] = [
     (64, 64, 16),
     (64, 64, 8),
     (64, 128, 16),
@@ -36,7 +36,7 @@ def size_hint(value: int) -> int:
         return optimization_hint(value)
 
 
-def get_compatible_config(q: torch.Tensor, k: torch.Tensor, configs: List[AttnConfig]) -> AttnConfig:
+def get_compatible_config(q: torch.Tensor, k: torch.Tensor, configs: list[AttnConfig]) -> AttnConfig:
     n = size_hint(q.shape[2])
     n_kv = size_hint(k.shape[2])
     d = size_hint(q.shape[3])
@@ -46,7 +46,7 @@ def get_compatible_config(q: torch.Tensor, k: torch.Tensor, configs: List[AttnCo
     raise RuntimeError(f"No compatible config for n={n} n_kv={n_kv} d={d}")
 
 
-def generate_autotune_configs(fake_tensors: Dict[str, torch.Tensor], configs: List[AttnConfig]) -> List[CustomOpConfig]:
+def generate_autotune_configs(fake_tensors: dict[str, torch.Tensor], configs: list[AttnConfig]) -> list[CustomOpConfig]:
     q = fake_tensors["q"]
     k = fake_tensors["k"]
     n = size_hint(q.shape[2])
@@ -68,7 +68,7 @@ def old_autotune(
     n: int,
     n_kv: int,
     d: int,
-    configs: List[AttnConfig],
+    configs: list[AttnConfig],
     run_fn: Callable[[AttnConfig], torch.Tensor],
     op_name: str,
 ) -> AttnConfig:
@@ -88,7 +88,7 @@ def old_autotune(
     best_ms = None
 
     for cfg in candidates:
-        ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup_ms, rep=rep_ms)
+        ms = triton.testing.do_bench(lambda cfg=cfg: run_fn(cfg), warmup=warmup_ms, rep=rep_ms)
         if best_ms is None or ms < best_ms:
             best_ms = ms
             best_cfg = cfg
