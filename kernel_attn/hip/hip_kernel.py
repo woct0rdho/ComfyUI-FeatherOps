@@ -14,6 +14,7 @@ _extension_sources = [
     "featherattn_query_tail.cu",
     "featherattn_key_tail.cu",
     "featherattn_query_key_tail.cu",
+    "featherattn_strided.cu",
 ]
 _extension_cuda_flags = [
     f"-I{_ck_tile_root / 'include'}",

@@ -148,7 +148,15 @@ struct AttentionKernel
         int32_t num_heads;
         int32_t head_start;
         int32_t launch_heads;
+#if defined(FEATHER_ATTN_STRIDED_NHD)
+        int32_t group_index;
+        int32_t group_count;
+#endif
     };
+
+#if defined(FEATHER_ATTN_STRIDED_NHD)
+    static_assert(kNHD && sizeof(Kargs) == 64);
+#endif
 
     CK_TILE_DEVICE static index_t VLdsOffset(index_t d_row, index_t n_chunk)
     {
@@ -199,6 +207,20 @@ struct AttentionKernel
         index_t kv_head_offset;
         if constexpr(kNHD)
         {
+#if defined(FEATHER_ATTN_STRIDED_NHD)
+            const index_t local_head = block % kargs.launch_heads;
+            const index_t head =
+                kargs.group_index + local_head * kargs.group_count;
+            if(head >= kargs.num_heads)
+                return;
+            const index_t tile_batch = block / kargs.launch_heads;
+            q_tile                   = tile_batch % q_tiles;
+            const index_t batch      = tile_batch / q_tiles;
+            q_head_offset =
+                (batch * kargs.n_q * kargs.num_heads + head) * kHeadDim;
+            kv_head_offset =
+                (batch * kargs.n_kv * kargs.num_heads + head) * kHeadDim;
+#else
             const index_t local_head = block % kargs.launch_heads;
             const index_t head       = kargs.head_start + local_head;
             const index_t tile_batch = block / kargs.launch_heads;
@@ -208,6 +230,7 @@ struct AttentionKernel
                 (batch * kargs.n_q * kargs.num_heads + head) * kHeadDim;
             kv_head_offset =
                 (batch * kargs.n_kv * kargs.num_heads + head) * kHeadDim;
+#endif
         }
         else
         {
@@ -479,6 +502,39 @@ struct AttentionKernel
     }
 };
 
+#if defined(FEATHER_ATTN_STRIDED_NHD)
+template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV>
+bool LaunchVariant(const StridedLaunchParams& params)
+{
+    static_assert(kHeadDim == 64 && kNHD);
+    using Kernel = AttentionKernel<kHeadDim, kNHD, kPadQ, kPadKV>;
+    constexpr float q_scale_log2 =
+        kHeadDim == 64 ? 0.18033688011112042f : 0.12751743082459868f;
+    const typename Kernel::Kargs kargs{
+        reinterpret_cast<const fp16_t*>(params.q_ptr),
+        reinterpret_cast<const fp16_t*>(params.k_ptr),
+        reinterpret_cast<const fp16_t*>(params.v_ptr),
+        reinterpret_cast<fp16_t*>(params.o_ptr),
+        q_scale_log2,
+        params.n_q,
+        params.n_kv,
+        params.num_heads,
+        0,
+        params.launch_heads,
+        params.group_index,
+        params.group_count};
+    static_assert(sizeof(kargs) == 64);
+    const auto kernel = ck_tile::make_kernel<8, ck_tile::gfx115_t>(
+        Kernel{},
+        dim3(params.grid_size),
+        dim3(Kernel::kBlockSize),
+        0,
+        kargs);
+    (void)hipGetLastError();
+    ck_tile::launch_kernel(ck_tile::stream_config{params.stream}, kernel);
+    return hipPeekAtLastError() == hipSuccess;
+}
+#else
 template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV>
 bool LaunchVariant(const LaunchParams& params)
 {
@@ -507,5 +563,6 @@ bool LaunchVariant(const LaunchParams& params)
     ck_tile::launch_kernel(ck_tile::stream_config{params.stream}, kernel);
     return hipPeekAtLastError() == hipSuccess;
 }
+#endif
 
 } // namespace feather_attn
