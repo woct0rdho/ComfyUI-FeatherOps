@@ -12,17 +12,26 @@ struct LaunchParams
     void* o_ptr;
     int32_t n_q;
     int32_t n_kv;
+    int32_t num_heads;
     uint32_t grid_size;
     hipStream_t stream;
 };
 
-extern "C" bool feather_attn_d64_aligned(const LaunchParams& params);
-extern "C" bool feather_attn_d128_aligned(const LaunchParams& params);
-extern "C" bool feather_attn_d64_query_tail(const LaunchParams& params);
-extern "C" bool feather_attn_d128_query_tail(const LaunchParams& params);
-extern "C" bool feather_attn_d64_key_tail(const LaunchParams& params);
-extern "C" bool feather_attn_d128_key_tail(const LaunchParams& params);
-extern "C" bool feather_attn_d64_query_key_tail(const LaunchParams& params);
-extern "C" bool feather_attn_d128_query_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d64_aligned(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d128_aligned(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d64_aligned(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d128_aligned(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d64_query_tail(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d128_query_tail(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d64_query_tail(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d128_query_tail(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d64_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d128_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d64_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d128_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d64_query_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_hnd_d128_query_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d64_query_key_tail(const LaunchParams& params);
+extern "C" bool feather_attn_nhd_d128_query_key_tail(const LaunchParams& params);
 
 } // namespace feather_attn

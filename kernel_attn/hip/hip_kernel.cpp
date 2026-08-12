@@ -30,7 +30,9 @@ bool IsContiguous4D(const torch::stable::Tensor& tensor)
     __int128 expected_stride = 1;
     for(int64_t dim = 3; dim >= 0; --dim)
     {
-        if(expected_stride > INT64_MAX ||
+        if(expected_stride > INT64_MAX)
+            return false;
+        if(tensor.size(dim) != 1 &&
            tensor.stride(dim) != static_cast<int64_t>(expected_stride))
             return false;
         expected_stride *= tensor.size(dim);
@@ -55,25 +57,33 @@ bool IsInt32HalfAddressable(const torch::stable::Tensor& tensor)
 
 using Launcher = bool (*)(const feather_attn::LaunchParams&);
 
-Launcher SelectLauncher(int64_t head_dim, bool pad_q, bool pad_kv)
+Launcher SelectLauncher(int64_t head_dim, bool nhd, bool pad_q, bool pad_kv)
 {
     if(head_dim == 64)
     {
         if(pad_q && pad_kv)
-            return feather_attn::feather_attn_d64_query_key_tail;
+            return nhd ? feather_attn::feather_attn_nhd_d64_query_key_tail
+                       : feather_attn::feather_attn_hnd_d64_query_key_tail;
         if(pad_q)
-            return feather_attn::feather_attn_d64_query_tail;
+            return nhd ? feather_attn::feather_attn_nhd_d64_query_tail
+                       : feather_attn::feather_attn_hnd_d64_query_tail;
         if(pad_kv)
-            return feather_attn::feather_attn_d64_key_tail;
-        return feather_attn::feather_attn_d64_aligned;
+            return nhd ? feather_attn::feather_attn_nhd_d64_key_tail
+                       : feather_attn::feather_attn_hnd_d64_key_tail;
+        return nhd ? feather_attn::feather_attn_nhd_d64_aligned
+                   : feather_attn::feather_attn_hnd_d64_aligned;
     }
     if(pad_q && pad_kv)
-        return feather_attn::feather_attn_d128_query_key_tail;
+        return nhd ? feather_attn::feather_attn_nhd_d128_query_key_tail
+                   : feather_attn::feather_attn_hnd_d128_query_key_tail;
     if(pad_q)
-        return feather_attn::feather_attn_d128_query_tail;
+        return nhd ? feather_attn::feather_attn_nhd_d128_query_tail
+                   : feather_attn::feather_attn_hnd_d128_query_tail;
     if(pad_kv)
-        return feather_attn::feather_attn_d128_key_tail;
-    return feather_attn::feather_attn_d128_aligned;
+        return nhd ? feather_attn::feather_attn_nhd_d128_key_tail
+                   : feather_attn::feather_attn_hnd_d128_key_tail;
+    return nhd ? feather_attn::feather_attn_nhd_d128_aligned
+               : feather_attn::feather_attn_hnd_d128_aligned;
 }
 
 } // namespace
@@ -82,7 +92,8 @@ void AttnFp16Feather(
     const torch::stable::Tensor& q,
     const torch::stable::Tensor& k,
     const torch::stable::Tensor& v,
-    torch::stable::Tensor& o)
+    torch::stable::Tensor& o,
+    int64_t layout)
 {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && o.is_cuda(),
                     "q, k, v, and o must be CUDA tensors");
@@ -99,21 +110,28 @@ void AttnFp16Feather(
     STD_TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && o.dim() == 4,
                     "q, k, v, and o must be 4D");
 
+    STD_TORCH_CHECK(layout == 0 || layout == 1,
+                    "layout must be 0 (HND) or 1 (NHD)");
+    const bool nhd      = layout == 1;
     const int64_t batch = q.size(0);
-    const int64_t heads = q.size(1);
-    const int64_t n_q   = q.size(2);
+    const int64_t heads = q.size(nhd ? 2 : 1);
+    const int64_t n_q   = q.size(nhd ? 1 : 2);
     const int64_t d     = q.size(3);
-    const int64_t n_kv  = k.size(2);
+    const int64_t n_kv  = k.size(nhd ? 1 : 2);
     STD_TORCH_CHECK(batch > 0 && heads > 0 && n_q > 0 && n_kv > 0,
                     "batch, heads, N_Q, and N_KV must be positive");
     STD_TORCH_CHECK(d == 64 || d == 128, "head dimension must be 64 or 128");
     STD_TORCH_CHECK(k.size(0) == batch && v.size(0) == batch && o.size(0) == batch,
                     "batch size mismatch");
-    STD_TORCH_CHECK(k.size(1) == heads && v.size(1) == heads && o.size(1) == heads,
+    const int64_t head_axis = nhd ? 2 : 1;
+    const int64_t seq_axis  = nhd ? 1 : 2;
+    STD_TORCH_CHECK(k.size(head_axis) == heads &&
+                        v.size(head_axis) == heads &&
+                        o.size(head_axis) == heads,
                     "head count mismatch");
     STD_TORCH_CHECK(k.size(3) == d && v.size(3) == d && o.size(3) == d,
                     "head dimension mismatch");
-    STD_TORCH_CHECK(v.size(2) == n_kv && o.size(2) == n_q,
+    STD_TORCH_CHECK(v.size(seq_axis) == n_kv && o.size(seq_axis) == n_q,
                     "sequence length mismatch");
     STD_TORCH_CHECK(IsContiguous4D(q) && IsContiguous4D(k) &&
                         IsContiguous4D(v) && IsContiguous4D(o),
@@ -141,11 +159,13 @@ void AttnFp16Feather(
         o.mutable_data_ptr(),
         static_cast<int32_t>(n_q),
         static_cast<int32_t>(n_kv),
+        static_cast<int32_t>(heads),
         static_cast<uint32_t>(grid_size),
         stream};
 
     (void)hipGetLastError();
-    const bool launched = SelectLauncher(d, n_q % 128 != 0, n_kv % 64 != 0)(params);
+    const bool launched =
+        SelectLauncher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0)(params);
     const hipError_t launch_error = hipGetLastError();
     STD_TORCH_CHECK(launched && launch_error == hipSuccess,
                     "FeatherAttn launch failed: ",
@@ -159,7 +179,8 @@ STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
         "Tensor q, "
         "Tensor k, "
         "Tensor v, "
-        "Tensor(a!) out"
+        "Tensor(a!) out, "
+        "int layout"
         ") -> ()");
 }
 

@@ -112,7 +112,7 @@ struct SoftmaxOps
     }
 };
 
-template <index_t kHeadDimValue, bool kPadQ, bool kPadKV>
+template <index_t kHeadDimValue, bool kNHD, bool kPadQ, bool kPadKV>
 struct AttentionKernel
 {
     using Wmma = SoftmaxOps::Wmma;
@@ -143,6 +143,7 @@ struct AttentionKernel
         float q_scale_log2;
         int32_t n_q;
         int32_t n_kv;
+        int32_t num_heads;
     };
 
     CK_TILE_DEVICE static index_t VLdsOffset(index_t d_row, index_t n_chunk)
@@ -188,18 +189,37 @@ struct AttentionKernel
         index_t q_tiles          = kargs.n_q / kBlockM;
         if constexpr(kPadQ)
             q_tiles += kargs.n_q % kBlockM != 0;
-        const index_t block          = ck_tile::get_block_1d_id();
-        const index_t q_tile         = block % q_tiles;
-        const index_t q_start        = q_tile * kBlockM;
-        const index_t head_linear    = block / q_tiles;
-        const index_t q_head_offset  = head_linear * kargs.n_q * kHeadDim;
-        const index_t kv_head_offset = head_linear * kargs.n_kv * kHeadDim;
+        const index_t block = ck_tile::get_block_1d_id();
+        index_t q_tile;
+        index_t q_head_offset;
+        index_t kv_head_offset;
+        if constexpr(kNHD)
+        {
+            const index_t head       = block % kargs.num_heads;
+            const index_t tile_batch = block / kargs.num_heads;
+            q_tile                   = tile_batch % q_tiles;
+            const index_t batch      = tile_batch / q_tiles;
+            q_head_offset =
+                (batch * kargs.n_q * kargs.num_heads + head) * kHeadDim;
+            kv_head_offset =
+                (batch * kargs.n_kv * kargs.num_heads + head) * kHeadDim;
+        }
+        else
+        {
+            q_tile                    = block % q_tiles;
+            const index_t head_linear = block / q_tiles;
+            q_head_offset  = head_linear * kargs.n_q * kHeadDim;
+            kv_head_offset = head_linear * kargs.n_kv * kHeadDim;
+        }
+        const index_t q_start = q_tile * kBlockM;
+        const index_t q_row_stride = kNHD ? kargs.num_heads * kHeadDim : kHeadDim;
+        const index_t kv_row_stride = q_row_stride;
         const fp16_t* const q_tile_ptr =
-            kargs.q_ptr + q_head_offset + q_start * kHeadDim;
+            kargs.q_ptr + q_head_offset + q_start * q_row_stride;
         const fp16_t* const k_head_ptr = kargs.k_ptr + kv_head_offset;
         const fp16_t* const v_head_ptr = kargs.v_ptr + kv_head_offset;
         fp16_t* const o_tile_ptr =
-            kargs.o_ptr + q_head_offset + q_start * kHeadDim;
+            kargs.o_ptr + q_head_offset + q_start * q_row_stride;
 
         ck_tile::static_for<0, kDTiles / 2, 1>{}([&](auto i) {
             constexpr index_t d_tile_in_group = i.value * 2;
@@ -209,12 +229,12 @@ struct AttentionKernel
             {
                 if(q_start + q_row < kargs.n_q)
                     q = *reinterpret_cast<const ck_tile::fp16x16_t*>(
-                        q_tile_ptr + q_row * kHeadDim + d_tile * kDPerWmma);
+                        q_tile_ptr + q_row * q_row_stride + d_tile * kDPerWmma);
             }
             else
             {
                 q = *reinterpret_cast<const ck_tile::fp16x16_t*>(
-                    q_tile_ptr + q_row * kHeadDim + d_tile * kDPerWmma);
+                    q_tile_ptr + q_row * q_row_stride + d_tile * kDPerWmma);
             }
 
             ck_tile::uint8x16_t q8;
@@ -248,13 +268,14 @@ struct AttentionKernel
                 {
                     if(key_start + k_row < kargs.n_kv)
                         k = *reinterpret_cast<const ck_tile::fp16x8_t*>(
-                            k_head_ptr + (key_start + k_row) * kHeadDim +
+                            k_head_ptr + (key_start + k_row) * kv_row_stride +
                             k_chunk * kKPack);
                 }
                 else
                 {
                     k = *reinterpret_cast<const ck_tile::fp16x8_t*>(
-                        k_head_ptr + (key_start + k_row) * kHeadDim + k_chunk * kKPack);
+                        k_head_ptr + (key_start + k_row) * kv_row_stride +
+                        k_chunk * kKPack);
                 }
                 *reinterpret_cast<ck_tile::fp16x8_t*>(
                     kv_lds + QKOps::LdsOffset<kHeadDim>(k_row, k_chunk)) = k;
@@ -359,13 +380,15 @@ struct AttentionKernel
                 {
                     if(key_start + v_n_base + row.value < kargs.n_kv)
                         v_rows[row.value] = *reinterpret_cast<const ck_tile::fp16x8_t*>(
-                            v_head_ptr + (key_start + v_n_base + row.value) * kHeadDim +
+                            v_head_ptr +
+                            (key_start + v_n_base + row.value) * kv_row_stride +
                             v_d_base);
                 }
                 else
                 {
                     v_rows[row.value] = *reinterpret_cast<const ck_tile::fp16x8_t*>(
-                        v_head_ptr + (key_start + v_n_base + row.value) * kHeadDim +
+                        v_head_ptr +
+                        (key_start + v_n_base + row.value) * kv_row_stride +
                         v_d_base);
                 }
             });
@@ -426,12 +449,12 @@ struct AttentionKernel
                 if constexpr(kPadQ)
                 {
                     if(q_start + row < kargs.n_q)
-                        o_tile_ptr[row * kHeadDim + col] =
+                        o_tile_ptr[row * q_row_stride + col] =
                             ck_tile::type_convert<fp16_t>(output[d_tile.value][i.value]);
                 }
                 else
                 {
-                    o_tile_ptr[row * kHeadDim + col] =
+                    o_tile_ptr[row * q_row_stride + col] =
                         ck_tile::type_convert<fp16_t>(output[d_tile.value][i.value]);
                 }
             });
@@ -439,11 +462,11 @@ struct AttentionKernel
     }
 };
 
-template <index_t kHeadDim, bool kPadQ, bool kPadKV>
+template <index_t kHeadDim, bool kNHD, bool kPadQ, bool kPadKV>
 bool LaunchVariant(const LaunchParams& params)
 {
     static_assert(kHeadDim == 64 || kHeadDim == 128);
-    using Kernel = AttentionKernel<kHeadDim, kPadQ, kPadKV>;
+    using Kernel = AttentionKernel<kHeadDim, kNHD, kPadQ, kPadKV>;
     constexpr float q_scale_log2 =
         kHeadDim == 64 ? 0.18033688011112042f : 0.12751743082459868f;
     const typename Kernel::Kargs kargs{
@@ -453,7 +476,8 @@ bool LaunchVariant(const LaunchParams& params)
         reinterpret_cast<fp16_t*>(params.o_ptr),
         q_scale_log2,
         params.n_q,
-        params.n_kv};
+        params.n_kv,
+        params.num_heads};
     const auto kernel = ck_tile::make_kernel<8, ck_tile::gfx115_t>(
         Kernel{},
         dim3(params.grid_size),
