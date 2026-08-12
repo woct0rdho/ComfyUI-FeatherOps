@@ -649,39 +649,39 @@ Barrier waits are approximately `12.1%/4.8%` of wave cycles for HND D=64/D=128 a
 
 #### Optimization 10A: Bounded LLC-Aware NHD Grouping
 
-This is the highest-priority memory optimization. Keep the accepted head-fast NHD mapping as the baseline. Test a bounded head/query-tile grouping policy that restores same-head K/V reuse without concentrating all concurrently active CTAs on one head.
+**Status: accepted for D=128 NHD; rejected for D=64.** The retained implementation keeps the Phase 9 head-fast mapping inside each launch and divides the physical head range into sequential launch subsets. Physical NHD strides continue to use the full head count; `head_start` and `launch_heads` affect only block decomposition. HND remains one launch.
 
-Use FlashAttention-CK's RDNA policy as the starting model:
+The automatic policy is deliberately narrower than the initial model:
 
 ```text
-per_head_KV_bytes = N_KV * (D_K * sizeof(K) + D_V * sizeof(V))
-                  = 4 * N_KV * D for FP16 MHA
-nominal_group     = floor(LLC_bytes / per_head_KV_bytes)
+per_head_KV_bytes = 4 * N_KV * D
+activate only for D=128 and total_KV_bytes >= 1.5 * 32 MiB
+group_size = floor(32 MiB / per_head_KV_bytes)
+require 4 <= group_size < H; otherwise use one launch
 ```
 
-On gfx1151, use a 32 MiB LLC budget. Representative H=32 groups are:
+This bounds every complete group K/V set by the 32 MiB LLC and handles the modeled `H=56,N=16384,D=128` edge with four-head groups and 14 launches rather than CK's over-capacity seven-head group. Checked wide host arithmetic and signed-int32 device indexing remain intact.
 
-| N | D | Per-head K/V | Candidate heads/group | Groups | Group K/V set |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 4096 | 128 | 2 MiB | 16 | 2 | 32 MiB |
-| 8192 | 64 | 2 MiB | 16 | 2 | 32 MiB |
-| 8192 | 128 | 4 MiB | 8 | 4 | 32 MiB |
-| 16384 | 64 | 4 MiB | 8 | 4 | 32 MiB |
-| 16384 | 128 | 8 MiB | 4 | 8 | 32 MiB |
+The focused `{4,8,16}` sweep rejected grouping for D=64. At `H=32,N=16384`, groups `{4,8,16}` regressed by `72.0%`, `54.9%`, and `24.8%`; smaller contiguous head subsets revive the partition-pressure behavior that the Phase 9 head-fast grid fixed. D=64 therefore always uses one launch.
 
-Do not copy CK's maximum-eight-groups floor unconditionally. For `H=56,N=16384,D=128`, that floor produces seven heads per group and a 56 MiB K/V working set, which exceeds this GPU's LLC. Prefer an LLC-resident smaller group even when it creates more than eight groups, or disable grouping if launch overhead outweighs locality.
+A paired 30-sample D=128 NHD qualification compared the automatic policy with an explicitly ungrouped launch. It won all nine benchmark shapes, with a `1.135x` geometric-mean speedup factor. The largest focused gains were `28.4%` at `H=32,N=8192` and `27.6%` at `H=32,N=16384`; the two H=16 cases that were already cache-favorable changed by only `+0.40%` and `+0.06%`.
 
-The device kernel and tile remain unchanged. The host or grid decomposition may add a group descriptor or a bounded swizzle, but it must retain signed-int32 proofs and independent tail/layout specialization. Candidate mappings must maintain several head offsets among concurrently scheduled CTAs; an unrestricted head-major swizzle is rejected because the original query-tile-fast NHD schedule already demonstrated severe partition aliasing.
+Isolated profiler passes sum counters across all sublaunches in one API call and use the final two post-warmup calls:
 
-Measure candidate group sizes `{4,8,16}` only where the complete group K/V set fits the LLC budget. For each candidate record:
-- benchmark median and p20/p80 interval;
-- `FETCH_SIZE` and GCEA read bandwidth from isolated passes;
-- request-based `L2CacheHit` without converting it to bytes;
-- GCEA per-instance bank/arbiter counters only as comparative diagnostics;
-- SIMD utilization and resource metadata;
-- all 36 authoritative benchmark rows after a candidate passes its focused cases.
+| Shape | Policy | Group | Time | `FETCH_SIZE` | L2 request hit |
+| --- | --- | ---: | ---: | ---: | ---: |
+| H32/N8192/D128 | Ungrouped | 32 | 46.125 ms | 7.581 GiB | 6.68% |
+| H32/N8192/D128 | Accepted | 8 | 36.721 ms | 2.810 GiB | 54.00% |
+| H32/N16384/D128 | Ungrouped | 32 | 197.248 ms | 31.435 GiB | 2.71% |
+| H32/N16384/D128 | Accepted | 4 | 167.441 ms | 14.822 GiB | 34.75% |
+| H56/N16384/D128 | Ungrouped | 56 | 275.769 ms | 56.078 GiB | N/A |
+| H56/N16384/D128 | Accepted | 4 | 249.111 ms | 23.361 GiB | N/A |
 
-Expected, unvalidated range: `0-5%` for cases already near HND performance and `5-15%` for the worst long/intermediate NHD regimes. HND throughput is an empirical upper reference, not a guaranteed grouped-NHD result. Reject a mapping that improves one power-of-two head/stride case but regresses another supported head count by more than the Phase 6 policy.
+The independent H32/N16384 GCEA pass reports `31.529 GiB` ungrouped and `13.543 GiB` grouped, corroborating the traffic reduction. GCEA and `FETCH_SIZE` came from separate profiler runs and are not expected to match exactly. Per-sublaunch `SIMD_UTILIZATION` cannot be combined into a meaningful whole-call percentage because rocprof can report values above one on later sequential launches; it is excluded from the acceptance claim.
+
+The complete 36-case matrix passes. D=128 NHD is now `0.972x-1.376x` AITER, versus `0.972x-1.084x` in Phase 9, and its geometric-mean throughput improves `1.113x` over the Phase 9 table. HND and D=64 geometric means change by only `+0.7%`, `+0.4%`, and `+0.1%`, respectively. The public contract passes `168/168`, including arbitrary heads, independent tails, and batch two. Fresh metadata for all 16 kernels reports at most 191 used/192 allocated VGPRs, 32 KiB LDS, zero private memory, and zero spills; Kargs is 48 bytes.
+
+Artifacts are under `~/tmp/feather_attn/phase10_group_*`, including the focused sweep, paired qualification, profile summary, contract log, metadata, and complete matrix. Phase 10A becomes the production baseline for subsequent experiments.
 
 #### Optimization 10B: Persistent Linear Online `(m,l)` State
 
@@ -752,15 +752,14 @@ CK Tile's async and transpose-load pipelines are scheduling references, not drop
 
 #### Phase 10 Execution Order And Gates
 
-1. Prototype bounded NHD grouping without changing the device key loop. Start with `H=32,N in {8192,16384},D in {64,128}` and include `H=56,N=16384,D=128` as the over-capacity policy case.
-2. Retain grouping only if measured controller traffic falls and focused timing improves without a supported-head regression. Then run the 36-case matrix and layout bit-equivalence tests.
-3. Implement persistent linear `(m,l)` for D=64. Re-run correctness, resource metadata, ISA counts, focused PC sampling, and the D=64 matrix.
-4. Attempt D=128 `(m,l)` only if the generated D=64 recurrence is clearly beneficial and a compile fixture indicates no resource-tier regression.
-5. Test one D=64 Q-decode/dependency experiment at a time.
-6. Revisit barrier/waitcnt placement after the recurrence and decode schedules settle.
-7. Stop when a candidate fails its resource, correctness, or repeatable timing gate. Do not combine failed ideas to hide their individual attribution.
+1. **Done:** bounded D=128 NHD grouping passed traffic, correctness, resource, and complete-matrix gates. D=64 grouping was measured and rejected.
+2. Implement persistent linear `(m,l)` for D=64. Re-run correctness, resource metadata, ISA counts, focused PC sampling, and the D=64 matrix.
+3. Attempt D=128 `(m,l)` only if the generated D=64 recurrence is clearly beneficial and a compile fixture indicates no resource-tier regression.
+4. Test one D=64 Q-decode/dependency experiment at a time.
+5. Revisit barrier/waitcnt placement after the recurrence and decode schedules settle.
+6. Stop when a candidate fails its resource, correctness, or repeatable timing gate. Do not combine failed ideas to hide their individual attribution.
 
-The production baseline remains the Phase 9 implementation until a Phase 10 candidate passes correctness, resource qualification, focused profiler attribution, and the complete benchmark surface.
+Phase 10A is the production baseline while later Phase 10 candidates are evaluated independently against it.
 
 ## Stop Rules
 
@@ -821,7 +820,7 @@ Add one row per isolated experiment. Include links or paths to profile artifacts
 | R10a | Done | Post-qualification static ISA, PC sampling, and 40-pass counter review | Read-only review; no kernel change | Qualified Phase 9 resources | Feather executes `1.264-1.557x` AITER VALU work | Dependency, barrier, waitcnt, and traffic regimes identified | Use findings to order Phase 10 |
 | R10b | Done | Long-NHD Feather/AITER traffic and roofline profile at `H=32,N=16384` | Read-only review; no kernel change | Qualified Phase 9 resources | D64 Feather `22.584 TFLOPS`, `174.64 GB/s` | D128 Feather `22.306 TFLOPS`, `171.56 GB/s` | Confirm no-reuse K/V stream and grouping opportunity |
 | R10c | Done | FlashAttention-CK LLC grouping policy model for gfx1151 | Source/model review | No kernel change | Candidate groups bounded by 32 MiB LLC | CK eight-group floor can exceed LLC at `H=56,N=16384,D=128` | Test bounded grouping, not unrestricted head-major order |
-| F10a | Planned | Bounded LLC-aware NHD head/query grouping | Must preserve layout/correctness contract | Device resources unchanged; checked host/grid arithmetic required | Focus `H=32,N=8192/16384` | Complete matrix after focused pass | Accept only with lower measured traffic and repeatable timing gain |
+| F10a | Done | D=128-only bounded LLC-aware NHD head groups; D64 grouping rejected | 168/168 contract; grouped output bit-identical to ungrouped | 191 used/192 allocated max; 32 KiB LDS; zero private/spills | D128 NHD `0.972-1.171x` AITER | D128 NHD up to `1.376x` AITER; H32/N16384 traffic `31.435 -> 14.822 GiB` | Accept as production baseline; retain one launch for D64 |
 | F10b | Planned | Persistent linear online `(m,l)` state, D=64 first | Re-run public and baseline-relative numerical gates | D64 must remain within gates; D128 must stay at most 192 VGPRs with zero scratch | Expected `2-6%`, unvalidated | Long and intermediate sequences | Normalize once in epilogue; reject resource-tier regression |
 | F10c | Planned | D=64 decoded-Q/dependency-chain reduction | Re-run D=64 correctness | Aligned HND target at most 168 allocated VGPRs; all tails at most 192 | Expected `1-4%`, unvalidated | D=64 only | Do not apply to D=128 |
 | F10d | Planned | Barrier/waitcnt instruction rescheduling | Full recurrence and phase-order correctness | No second K/V LDS buffer; four correctness barriers retained | Expected `0-3%`, low confidence | Evaluate after F10b/F10c | Keep only with ISA proof and repeatable gain |

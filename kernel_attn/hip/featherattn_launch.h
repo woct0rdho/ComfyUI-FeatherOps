@@ -13,6 +13,8 @@ struct LaunchParams
     int32_t n_q;
     int32_t n_kv;
     int32_t num_heads;
+    int32_t head_start;
+    int32_t launch_heads;
     uint32_t grid_size;
     hipStream_t stream;
 };
