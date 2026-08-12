@@ -19,11 +19,88 @@ The accepted implementation has one block shape and two head-dimension specializ
 | External output type | FP16 |
 | Q storage inside the kernel | FP8 E5M2 |
 | K, P, and V arithmetic/storage | FP16 |
-| Score and output accumulators | FP32 |
+| QK and persistent output accumulators | FP32 |
 
 Do not add another block size, an autotune table, or a generalized FeatherAttn policy matrix without a separate measured justification. Tail support and the D=64/D=128 specializations share this block shape.
 
-The correctness, resource, and two-layout performance qualification through Phase 9 is complete. Phase 10 is complete. Bounded D=128 NHD LLC grouping and one-fragment D=64 HND decoded-Q caching passed every gate and form the production baseline. Linear D=64 online-softmax state, D=64 NHD Q caching, and D=64 V-load scheduling were measured independently and rejected by their timing gates.
+The correctness, resource, and two-layout performance qualification through Phase 11 is complete. The cumulative production baseline is commit `01454e3`: bounded D=128 NHD LLC grouping, expanded D=64 HND decoded-Q caching, and partition-aware D=64 NHD strided grouping passed every gate. Linear D=64 online-softmax state, progressive LDS scheduling, D=64 V-load scheduling, alternate arithmetic, larger block shapes, DPP alpha fan-out, and mixed-PV accumulation were measured independently and rejected by their applicable static, resource, or timing gates.
+
+Phase 11 was a separately justified follow-up campaign derived from a findings-only review of the qualified production images, profiler artifacts, AITER, CK Tile, FlashAttention-CK, SageAttention, and the gfx1151 ISA. It began from a byte-for-byte frozen Phase 10C baseline and accepted only Optimization 11B's additional D=64 HND decoded-Q caching and Optimization 11C's guarded partition-aware D=64 NHD reuse schedule. Pure FP16 WMMA score accumulation and persistent FP16 output accumulation remain excluded. QK scores and the cross-key-tile output state remain FP32; the bounded 11H tile-local FP16 PV probe passed correctness but failed timing and was removed.
+
+## Final Benchmarks
+
+This is the sole authoritative full benchmark matrix in this document. It measures commit `01454e3` on gfx1151 with `benchmark_attn_hip.py`, batch one, FP16 inputs, heads `{16,32,56}`, sequence lengths `{4096,8192,16384}`, head dimensions `{64,128}`, and physically contiguous tensors in the selected layout. Each provider uses `triton.testing.do_bench` with `warmup=25` and `rep=100`. Throughput is `4 * B * H * N^2 * D / time`; `Feather / AITER` is the throughput ratio, so values above `1.000x` favor FeatherAttn. For HND, AITER receives zero-copy transposed views while FeatherAttn consumes HND directly.
+
+Raw output is `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
+
+| Layout | D | AITER geometric mean TFLOPS | FeatherAttn geometric mean TFLOPS | Feather / AITER geometric mean | Feather wins |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HND | 64 | 30.941 | 34.071 | 1.101x | 9/9 |
+| HND | 128 | 31.354 | 34.078 | 1.087x | 8/9 |
+| NHD | 64 | 29.248 | 30.643 | 1.048x | 6/9 |
+| NHD | 128 | 26.322 | 30.434 | 1.156x | 8/9 |
+| All | 64/128 | 29.397 | 32.258 | 1.097x | 31/36 |
+
+### HND
+
+| D | H | N | AITER TFLOPS | FeatherAttn TFLOPS | Feather / AITER |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 16 | 4096 | 33.981 | 35.898 | 1.056x |
+| 64 | 16 | 8192 | 32.144 | 33.999 | 1.058x |
+| 64 | 16 | 16384 | 31.747 | 33.580 | 1.058x |
+| 64 | 32 | 4096 | 32.698 | 34.870 | 1.066x |
+| 64 | 32 | 8192 | 31.047 | 33.793 | 1.088x |
+| 64 | 32 | 16384 | 29.395 | 33.654 | 1.145x |
+| 64 | 56 | 4096 | 29.749 | 33.776 | 1.135x |
+| 64 | 56 | 8192 | 28.972 | 33.386 | 1.152x |
+| 64 | 56 | 16384 | 29.140 | 33.761 | 1.159x |
+| 128 | 16 | 4096 | 35.015 | 34.262 | 0.978x |
+| 128 | 16 | 8192 | 32.737 | 33.444 | 1.022x |
+| 128 | 16 | 16384 | 31.653 | 34.120 | 1.078x |
+| 128 | 32 | 4096 | 31.800 | 34.731 | 1.092x |
+| 128 | 32 | 8192 | 30.872 | 33.641 | 1.090x |
+| 128 | 32 | 16384 | 30.822 | 34.419 | 1.117x |
+| 128 | 56 | 4096 | 28.927 | 34.007 | 1.176x |
+| 128 | 56 | 8192 | 30.109 | 33.727 | 1.120x |
+| 128 | 56 | 16384 | 30.628 | 34.372 | 1.122x |
+
+### NHD
+
+| D | H | N | AITER TFLOPS | FeatherAttn TFLOPS | Feather / AITER |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 16 | 4096 | 32.908 | 32.522 | 0.988x |
+| 64 | 16 | 8192 | 32.007 | 31.376 | 0.980x |
+| 64 | 16 | 16384 | 31.943 | 31.197 | 0.977x |
+| 64 | 32 | 4096 | 31.037 | 31.258 | 1.007x |
+| 64 | 32 | 8192 | 28.596 | 29.960 | 1.048x |
+| 64 | 32 | 16384 | 22.754 | 29.088 | 1.278x |
+| 64 | 56 | 4096 | 29.068 | 30.820 | 1.060x |
+| 64 | 56 | 8192 | 28.092 | 29.749 | 1.059x |
+| 64 | 56 | 16384 | 28.228 | 29.959 | 1.061x |
+| 128 | 16 | 4096 | 31.842 | 31.202 | 0.980x |
+| 128 | 16 | 8192 | 30.660 | 30.811 | 1.005x |
+| 128 | 16 | 16384 | 24.062 | 30.240 | 1.257x |
+| 128 | 32 | 4096 | 26.009 | 30.367 | 1.168x |
+| 128 | 32 | 8192 | 21.718 | 30.168 | 1.389x |
+| 128 | 32 | 16384 | 21.566 | 27.393 | 1.270x |
+| 128 | 56 | 4096 | 26.901 | 30.890 | 1.148x |
+| 128 | 56 | 8192 | 27.655 | 31.598 | 1.143x |
+| 128 | 56 | 16384 | 28.485 | 31.454 | 1.104x |
+
+### LDS Bank Conflicts
+
+Fresh single-counter profiles of the final production dispatches confirm that both AITER and FeatherAttn are at or near zero LDS bank conflict. On gfx1151, ROCProfiler defines `LDSBankConflict` as the percentage `100 * SQC_LDS_BANK_CONFLICT / SQC_LDS_IDX_ACTIVE`, where `0%` is optimal. It is normalized over active LDS indexing and is not a direct whole-kernel slowdown percentage.
+
+| Layout | D | H | N | AITER conflict | FeatherAttn conflict |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HND | 64 | 16 | 4096 | 0.000% | 0.000% |
+| HND | 128 | 16 | 4096 | 2.849% | 2.702% |
+| NHD | 64 | 16 | 4096 | 0.000% | 0.000% |
+| NHD | 128 | 16 | 4096 | 2.849% | 2.702% |
+| NHD | 64 | 32 | 16384 | 0.000% | 0.000% |
+| NHD | 128 | 32 | 16384 | 2.855% | 2.702% |
+
+D=64 is conflict-free at the counter's resolution, including every captured constituent launch of the partition-aware strided H32/N16384 path. D=128 has a small repeatable residual in both kernels; FeatherAttn is slightly lower than AITER rather than worse. Every dispatch within each profile reported the same value. Earlier pressure profiles put FeatherAttn D=128 `ALUStalledByLDS` at only `0.026-0.029%`, so the residual conflict is not a material bottleneck. Raw per-dispatch results are under `~/tmp/feather_attn/phase11_final/lds_bank_conflicts/`.
 
 ## Objective
 
@@ -88,18 +165,7 @@ Forcing the unchanged AITER kernel to 192 VGPRs generated 216 bytes of private m
 
 `H=24` is not part of the new supported-head benchmark contract; this result only established the resource argument. These numbers are exploratory controls, not permanent benchmark claims. Record new same-run baselines for all six `(H, S)` combinations in `{16, 32, 56} x {4096, 8192}` before each performance experiment because ROCm version, clock, and thermal state materially affect this machine.
 
-The Phase 0 event-based control run used 5 warmups and 30 measured launches per provider. Full p20/p80 intervals and environment metadata are in `~/tmp/feather_attn/phase0/controls.json`.
-
-| H | S | AITER ms | Legacy end-to-end ms | Legacy prepacked ms |
-| ---: | ---: | ---: | ---: | ---: |
-| 16 | 4096 | 4.304 | 5.800 | 5.563 |
-| 16 | 8192 | 17.843 | 22.634 | 22.356 |
-| 32 | 4096 | 10.373 | 11.502 | 11.141 |
-| 32 | 8192 | 50.089 | 45.357 | 44.623 |
-| 56 | 4096 | 17.615 | 20.882 | 20.128 |
-| 56 | 8192 | 68.594 | 87.053 | 85.012 |
-
-Every generated AITER control used eight waves, 32,768 bytes of dynamic LDS, 233 used VGPRs, and zero private segment. The `H=32, S=8192` ordering differs from the surrounding shapes and must be remeasured during final qualification rather than treated as a stable legacy win.
+The Phase 0 event-based control run used 5 warmups and 30 measured launches per provider. Its six-shape legacy timing table, p20/p80 intervals, and environment metadata remain in `~/tmp/feather_attn/phase0/controls.json`; those historical speeds are superseded by the final matrix above. Every generated AITER control used eight waves, 32,768 bytes of dynamic LDS, 233 used VGPRs, and zero private segment.
 
 ## Implementation Substrate Decision
 
@@ -478,7 +544,7 @@ Acceptance gates:
 
 The expected opportunity is approximately 3-10%, not the nominal 33% increase from six to eight resident waves. Added Q LDS traffic and permutation issue can consume part of the occupancy gain. If the qualified kernel remains slower than AITER after scheduling work, stop rather than adding FP8 K/P/V complexity.
 
-Historical Phase 5/6 event matrices qualified the transposed-score HND core and justified extending the benchmark surface to `S=16384`. Their raw samples remain under `~/tmp/feather_attn/phase5/` and `phase6/`, but their full tables are superseded by the final two-layout matrix in Phase 9.
+Historical Phase 5/6 event matrices qualified the transposed-score HND core and justified extending the benchmark surface to `S=16384`. Their raw samples remain under `~/tmp/feather_attn/phase5/` and `phase6/`, but their full tables are superseded by Final Benchmarks.
 
 PyTorch `scaled_dot_product_attention` cannot serve as the production-shape oracle in the current PyTorch/ROCm environment: it returns `hipErrorInvalidValue` before FeatherAttn launches for all six aligned shapes. Preserve that failed-oracle artifact at `~/tmp/feather_attn/phase5/aligned_public_correctness.json`; do not classify it as a FeatherAttn correctness failure. Use chunked FP32 `QK -> softmax -> PV` reference computation for the final elementwise gate so the full attention matrix is never materialized.
 
@@ -528,7 +594,7 @@ D=64 resource metadata passes every gate:
 
 The aligned D=64 static body contains 32 FP16 WMMAs, 68 `ds_load_b128`, four `ds_store_b128`, eight `ds_store_b32`, 80 `v_perm_b32`, zero `v_permlane16_b32`, 18 `v_permlanex16_b32`, 34 exponentials, one logarithm, four barriers, and zero `ds_bpermute_b32`. Eight `N_KV=4096` profile dispatches each report 152 allocated VGPRs, 16,384 bytes LDS, zero scratch, `VALUInsts=29979.0`, and `LDSBankConflict=0.0`. Metadata, ISA, and profiler artifacts are under `~/tmp/feather_attn/`.
 
-The combined HND/NHD and D=64/D=128 public contract suite passes `168/168` cases. Historical D=64-only timing and profiling artifacts remain under `~/tmp/feather_attn/d64_benchmark/`; the current cross-layout performance results are reported once in Phase 9.
+The combined HND/NHD and D=64/D=128 public contract suite passes `168/168` cases. Historical D=64-only timing and profiling artifacts remain under `~/tmp/feather_attn/d64_benchmark/`; current cross-layout performance is reported only in Final Benchmarks.
 
 ### Phase 9: Native HND/NHD Layouts (Complete)
 
@@ -538,53 +604,7 @@ The first correct NHD implementation assigned consecutive grid blocks to query t
 
 All 16 final kernels remain within the resource gates. HND metadata is unchanged. NHD D=64 uses 130 VGPRs for aligned/query-tail and 151 for KV/combined tails; NHD D=128 uses 191 VGPRs for every tail mode. NHD uses 16,384 bytes LDS for D=64 and 32,768 bytes for D=128, with zero private memory and zero SGPR/VGPR spills in every variant.
 
-The final benchmark uses `triton.testing.do_bench` with 25 ms warmup and a 100 ms measurement budget per provider. Inputs are physically contiguous in the row's selected layout. For HND, AITER receives zero-copy transposed views because its interface interprets tensors as NHD; FeatherAttn receives HND directly. Throughput is `4 * B * H * N^2 * D / time`, and the ratio is FeatherAttn throughput divided by AITER throughput. Raw output is under `~/tmp/feather_attn/layout_benchmark/final/`.
-
-#### HND
-
-| D | H | N | AITER TFLOPS | FeatherAttn TFLOPS | Feather / AITER |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 16 | 4096 | 33.779 | 34.762 | 1.029x |
-| 64 | 16 | 8192 | 32.154 | 33.132 | 1.030x |
-| 64 | 16 | 16384 | 31.706 | 32.684 | 1.031x |
-| 64 | 32 | 4096 | 32.752 | 33.829 | 1.033x |
-| 64 | 32 | 8192 | 31.054 | 32.753 | 1.055x |
-| 64 | 32 | 16384 | 29.330 | 32.877 | 1.121x |
-| 64 | 56 | 4096 | 29.752 | 33.083 | 1.112x |
-| 64 | 56 | 8192 | 28.669 | 32.654 | 1.139x |
-| 64 | 56 | 16384 | 29.092 | 33.013 | 1.135x |
-| 128 | 16 | 4096 | 35.019 | 34.032 | 0.972x |
-| 128 | 16 | 8192 | 32.479 | 33.154 | 1.021x |
-| 128 | 16 | 16384 | 31.884 | 33.639 | 1.055x |
-| 128 | 32 | 4096 | 31.553 | 34.570 | 1.096x |
-| 128 | 32 | 8192 | 30.660 | 33.315 | 1.087x |
-| 128 | 32 | 16384 | 30.756 | 34.443 | 1.120x |
-| 128 | 56 | 4096 | 28.917 | 33.700 | 1.165x |
-| 128 | 56 | 8192 | 29.855 | 33.180 | 1.111x |
-| 128 | 56 | 16384 | 30.574 | 34.399 | 1.125x |
-
-#### NHD
-
-| D | H | N | AITER TFLOPS | FeatherAttn TFLOPS | Feather / AITER |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 16 | 4096 | 32.804 | 32.601 | 0.994x |
-| 64 | 16 | 8192 | 32.044 | 31.360 | 0.979x |
-| 64 | 16 | 16384 | 32.026 | 31.204 | 0.974x |
-| 64 | 32 | 4096 | 31.057 | 31.048 | 1.000x |
-| 64 | 32 | 8192 | 28.517 | 29.866 | 1.047x |
-| 64 | 32 | 16384 | 22.933 | 22.553 | 0.983x |
-| 64 | 56 | 4096 | 29.143 | 30.747 | 1.055x |
-| 64 | 56 | 8192 | 27.870 | 29.572 | 1.061x |
-| 64 | 56 | 16384 | 28.193 | 29.860 | 1.059x |
-| 128 | 16 | 4096 | 31.736 | 30.862 | 0.972x |
-| 128 | 16 | 8192 | 30.291 | 30.885 | 1.020x |
-| 128 | 16 | 16384 | 23.565 | 25.010 | 1.061x |
-| 128 | 32 | 4096 | 26.290 | 28.430 | 1.081x |
-| 128 | 32 | 8192 | 22.097 | 23.943 | 1.084x |
-| 128 | 32 | 16384 | 21.521 | 22.293 | 1.036x |
-| 128 | 56 | 4096 | 26.945 | 27.243 | 1.011x |
-| 128 | 56 | 8192 | 27.565 | 27.068 | 0.982x |
-| 128 | 56 | 16384 | 28.409 | 27.657 | 0.974x |
+The Phase 9 full benchmark established that both physical layouts were viable and exposed the long-NHD partition problem that Phase 10 and 11 later addressed. Its raw output remains under `~/tmp/feather_attn/layout_benchmark/final/`, but the historical 36-row table is intentionally omitted. See Final Benchmarks for the current production TFLOPS and AITER ratios.
 
 ### Phase 10: Post-Qualification Performance Review And Optimization Plan
 
@@ -649,7 +669,7 @@ Barrier waits are approximately `12.1%/4.8%` of wave cycles for HND D=64/D=128 a
 
 #### Optimization 10A: Bounded LLC-Aware NHD Grouping
 
-**Status: accepted for D=128 NHD; rejected for D=64.** The retained implementation keeps the Phase 9 head-fast mapping inside each launch and divides the physical head range into sequential launch subsets. Physical NHD strides continue to use the full head count; `head_start` and `launch_heads` affect only block decomposition. HND remains one launch.
+Status: accepted for D=128 NHD; rejected for D=64. The retained implementation keeps the Phase 9 head-fast mapping inside each launch and divides the physical head range into sequential launch subsets. Physical NHD strides continue to use the full head count; `head_start` and `launch_heads` affect only block decomposition. HND remains one launch.
 
 The automatic policy is deliberately narrower than the initial model:
 
@@ -685,7 +705,7 @@ Artifacts are under `~/tmp/feather_attn/phase10_group_*`, including the focused 
 
 #### Optimization 10B: Persistent Linear Online `(m,l)` State
 
-**Status: rejected for D=64; D=128 not attempted.** FeatherAttn reconstructs a log-domain state on every key tile:
+Status: rejected for D=64; D=128 not attempted. FeatherAttn reconstructs a log-domain state on every key tile:
 
 ```text
 old_term  = exp2(old_lse - new_max)
@@ -699,9 +719,9 @@ lane_lse  = new_max + log2(combined)
 Replace this with the AITER/FlashAttention linear online state:
 
 ```text
-new_max = max(running_max, tile_max)
-alpha   = exp2(running_max - new_max)
-beta    = exp2(tile_max - new_max)
+new_max     = max(running_max, tile_max)
+alpha       = exp2(running_max - new_max)
+beta        = exp2(tile_max - new_max)
 running_sum = alpha * running_sum + beta * tile_sum
 output      = alpha * output + beta * P @ V
 running_max = new_max
@@ -723,7 +743,7 @@ The recurrence therefore failed the repeatable timing gate before profiler attri
 
 #### Optimization 10C: D=64 Q Decode And Dependency Reduction
 
-**Status: accepted for D=64 HND only; rejected for NHD.** D=64 has 136 allocated VGPRs in aligned NHD and 152 in aligned HND, zero measured LDS bank conflicts, and proportionally more fixed softmax/conversion work than D=128. It is the only dimension where selective Q-fragment caching or a longer-lived decoded fragment is currently reasonable.
+Status: accepted for D=64 HND only; rejected for NHD. D=64 has 136 allocated VGPRs in aligned NHD and 152 in aligned HND, zero measured LDS bank conflicts, and proportionally more fixed softmax/conversion work than D=128. It is the only dimension where selective Q-fragment caching or a longer-lived decoded fragment is currently reasonable.
 
 Test one narrowly scoped change at a time:
 - retain one decoded FP16 Q fragment across its four QK WMMAs while consuming and overwriting it promptly;
@@ -745,7 +765,7 @@ The decisive 60-sample, randomized, same-stream exact-code-object comparison win
 
 #### Optimization 10D: Barrier And Waitcnt Scheduling
 
-**Status: D64 V-load hoist rejected; no production change.** Evaluate this only after 10B and the D=64 portion of 10C, because both can change the dependency graph. Keep the single phase-reused K/V LDS buffer and the four correctness barriers. Do not remove a barrier unless a formal producer/consumer argument covers all eight waves and the next overwrite phase.
+Status: D64 V-load hoist rejected; no production change. Evaluate this only after 10B and the D=64 portion of 10C, because both can change the dependency graph. Keep the single phase-reused K/V LDS buffer and the four correctness barriers. Do not remove a barrier unless a formal producer/consumer argument covers all eight waves and the next overwrite phase.
 
 Permitted experiments are instruction scheduling changes:
 - move independent pointer arithmetic before LDS waits;
@@ -770,13 +790,269 @@ A randomized 80-sample same-stream comparison of exact baseline/candidate code o
 
 #### Phase 10 Execution Order And Gates
 
-1. **Done:** bounded D=128 NHD grouping passed traffic, correctness, resource, and complete-matrix gates. D=64 grouping was measured and rejected.
-2. **Rejected:** persistent linear `(m,l)` for D=64 passed focused correctness/resources and transformed the ISA, but regressed the complete D=64 matrix. D=128 was not attempted.
-3. **Done:** one D=64 decoded-Q fragment cached across key tiles passes for HND. The NHD specialization retains the Phase 10A schedule.
-4. **Rejected:** moving D64 V global loads before the K-to-V LDS barrier preserved correctness/resources and changed ISA scheduling, but regressed the focused timing set.
-5. **Stop:** Phase 10A and the HND-only Phase 10C cache are the accepted production changes. The remaining modeled on-chip candidates failed their independent timing gates.
+- Done: bounded D=128 NHD grouping passed traffic, correctness, resource, and complete-matrix gates. D=64 grouping was measured and rejected.
+- Rejected: persistent linear `(m,l)` for D=64 passed focused correctness/resources and transformed the ISA, but regressed the complete D=64 matrix. D=128 was not attempted.
+- Done: one D=64 decoded-Q fragment cached across key tiles passes for HND. The NHD specialization retains the Phase 10A schedule.
+- Rejected: moving D64 V global loads before the K-to-V LDS barrier preserved correctness/resources and changed ISA scheduling, but regressed the focused timing set.
+- Stop: Phase 10A and the HND-only Phase 10C cache are the accepted production changes. The remaining modeled on-chip candidates failed their independent timing gates.
 
 Phase 10A plus the HND-only Phase 10C cache form the completed production baseline. Rejected candidates remain documented with their independent attribution.
+
+### Phase 11: Separately Justified Follow-Up Campaign
+
+Status: complete. Phase 10 reached its documented stop condition, and Phase 11 opened a separate campaign because the qualified production images exposed two distinct remaining bottleneck regimes with separately testable causes. Optimization 11B and 11C were accepted; every other generated-kernel experiment was rejected and restored. Modeled speedups below remain historical planning bounds unless followed by measured results.
+
+#### Production Baseline And Bottleneck Split
+
+The campaign's initial baseline was commit `31faf96`, using exact active gfx1151 images extracted from rebuilt `.cuda.o` fatbins. The cumulative final baseline is commit `01454e3`, where 11C was implemented and qualified on top of accepted 11B. The historical Phase 10C wrapper matrix is `~/tmp/feather_attn/phase10c_hnd_qcache_full_matrix.csv`; candidate acceptance used saved baseline and candidate code objects on one stream rather than cross-run wrapper timing.
+
+The execution freeze is under `~/tmp/feather_attn/phase11_baseline_freeze/`. The active images extracted from the current `.cuda.o` `.hip_fatbin` sections match all four qualified Phase 10C images byte-for-byte. `Kargs` remains 56 bytes.
+
+| Regime | Production evidence | Current conclusion |
+| --- | --- | --- |
+| D=64 HND | `32.007-34.576 TFLOPS`; the accepted first decoded-Q cache adds `1.294%` geometrically with 9/9 wins | Primarily on-chip instruction and dependency limited |
+| D=128 HND | `31.992-33.781 TFLOPS`; 191 used/192 allocated VGPRs and 32 KiB LDS | On-chip limited, but structurally pinned at both resource gates |
+| Long D=64 NHD | `H=32,N=16384` is `22.399 TFLOPS` versus `32.478 TFLOPS` for HND; the unchanged NHD profile fetched `15.837 GiB` at `174.64 GB/s` | Primarily controller-traffic and cross-CTA-reuse limited |
+| Grouped D=128 NHD | `H=32,N=16384` is `27.248 TFLOPS` versus `33.781 TFLOPS` for HND; grouping reduced fetch `31.435 -> 14.822 GiB` | Existing grouping captures a real LLC opportunity, but residual cache and on-chip limits remain |
+
+The on-chip diagnosis is specific:
+- the active gfx1151 images already contain extensive `v_dual_*` instructions, so generic VOPD enablement is not an optimization;
+- `ALUStalledByLDS` remains only `0.024-0.043%`, LDS issue waits remain below `0.08%`, and D=64 has zero measured bank conflicts;
+- the dominant opportunity is longer distance between LDS issue and first use, plus fewer dependent address, conversion, and lane-broadcast chains;
+- Feather frequently consumes each two-load QK or PV batch after `s_waitcnt lgkmcnt(0)`, while the active AITER control begins with eight outstanding LDS loads and consumes them with descending `lgkmcnt(6/4/2/0)` waits.
+
+The traffic diagnosis is also specific:
+- long D=64 NHD measured traffic is effectively the no-cross-CTA K/V stream implied by the `128x64` schedule;
+- the theoretical no-reuse intensity is about `128 FLOP/byte`, and measured traffic intensity is about `129 FLOP/byte`;
+- contiguous D=64 head groups are not a fallback: at `H=32,N=16384`, group sizes `{4,8,16}` regressed by `72.0%`, `54.9%`, and `24.8%`;
+- any new D=64 grouping experiment must preserve head diversity within each LLC-bounded sequential launch and prove its effect with timing and traffic counters rather than infer a partition mechanism from undocumented per-instance counters.
+
+#### Phase 11 Numerical And Resource Policy
+
+The public operation, layout contract, tail variants, and signed-int32 device-indexing proof remain unchanged. Internal rounding and temporary arithmetic precision may change when that creates a demonstrably shorter or less resource-intensive active instruction sequence. Permission to change internal arithmetic does not permit an undocumented or shape-specific correctness exception.
+
+Phase 11 must preserve these arithmetic boundaries:
+- QK score accumulation remains FP32;
+- the persistent normalized PV output and every cross-key-tile output update remain FP32;
+- do not use `v_wmma_f16_16x16x16_f16` for QK or feed the persistent output through it; Optimization 11H alone may use that instruction for a zero-initialized `Bc=64` PV partial that is widened after exactly four `K=16` updates;
+- K, P, and V remain FP16 WMMA operands;
+- an RTZ packed conversion, FP16 temporary exponential, or other approximation is acceptable only if the complete operation passes the Phase 11 correctness policy and realistic activation checks;
+- do not replace a one-instruction hardware exponential with a polynomial unless the extracted active ISA proves a lower total instruction and dependency cost.
+
+Use the current public thresholds first: `rtol=atol=0.10` for `N_KV < 1024` and `0.05` otherwise. An arithmetic candidate that fails only the long-sequence `0.05` threshold may request a uniform Phase 11 relaxation in this order:
+- retry all `N_KV >= 1024` cases at `rtol=atol=0.075`;
+- if still justified by a material timing or resource win, retry at an absolute Phase 11 cap of `rtol=atol=0.10`;
+- never exceed `0.10`, create per-shape tolerances, or loosen only the failing tensor elements.
+
+A relaxed candidate is not accepted merely because every element falls inside the new envelope. It must also show finite outputs, no NaN/Inf regressions, bounded maximum normalized error, no material deterioration of relative L2 or high-percentile absolute error versus the production kernel, and realistic activation/model-quality checks. Record both the production-threshold failure count and relaxed-threshold result. If a relaxed candidate is retained, update the public test threshold uniformly and document the arithmetic change and measured speedup in the ledger.
+
+The existing resource gates remain hard: at most 192 allocated VGPRs, at most 32,768 bytes LDS, zero private/scratch memory, zero spills, and no material new bank conflict. D=128 starts at 191 used VGPRs and 32 KiB LDS, so a D=128 candidate must first remove resources before adding persistent state or buffering. D=64 is the default feasibility target.
+
+#### Phase 11 Common Qualification Gates
+
+Apply these gates to every candidate before it can become cumulative:
+- Exact active image: rebuild all affected specializations, extract `.hip_fatbin`, unbundle the gfx1151 image, and inspect that image rather than stale `.cuda.o.0.hipv4-*` sidecars. If Kargs changes, rederive and validate its by-value ABI size.
+- Correctness: run a focused aligned/tail/layout/batch-two screen first, then the complete `168/168` public contract for any candidate that changes generated kernel behavior. Arithmetic candidates must report production-threshold and any approved relaxed-threshold results plus error-distribution comparisons.
+- Resources: inspect every affected aligned/query-tail/KV-tail/combined-tail image. Reject any allocated-VGPR or LDS gate violation, private segment, scratch, spill, or sequence-dependent workgroup resource.
+- Attribution: require the intended ISA transformation and collect only counters that test the hypothesis. Fewer source operations without the expected active-image change do not qualify.
+- Close timing: alternate exact baseline and candidate code objects on one stream and the same tensors. A local schedule change should provide at least a `0.5%` target-domain geometric-mean win, win a majority of the paired cases, and show no repeatable regression larger than `1%` before the wrapper matrix.
+- Structural timing: an additional block shape or launch policy must provide at least a `5%` geometric-mean win over the production dispatch on the domain where it would be selected. It must not alter non-target dispatches.
+- Traffic candidates: sum byte counters across constituent launches, keep `FETCH_SIZE`, GCEA read size, and request-based `L2CacheHit` separate, and require both lower controller traffic and lower wall time. Do not aggregate per-sublaunch `SIMD_UTILIZATION`.
+- Final matrix: rerun the authoritative 36-case wrapper matrix after every candidate promoted past focused timing. Do not combine two unaccepted candidates; independently qualify each against the same production baseline first.
+
+#### Optimization 11A: Progressive LDS Issue And Consumption
+
+Status: rejected and restored to production. Start with D=64 aligned HND and NHD as separate code-object candidates. Keep the current LDS layouts, rotating V mapping, single K/V buffer, and all four phase barriers.
+
+For QK, issue the four independent `k_lo/k_hi` pairs for one `d_tile` before the first WMMA, then consume the eight outstanding LDS operations with descending waits such as `lgkmcnt(6/4/2/0)`. For PV, independently test the same schedule across the four D=64 output fragments. Do not combine QK and PV rescheduling until each has its own timing result.
+
+The source-level loop order is not the acceptance condition. The active image must show:
+- a larger batch of independent `ds_load_b128` instructions before first use;
+- nonzero descending `lgkmcnt` thresholds before the final drain;
+- unchanged WMMA count, barrier count, and global-memory traffic;
+- no increase in bank conflicts or LDS queue-full attribution.
+
+The expected gain is low single digit and unvalidated. The primary profiler targets are normalized wait-count exposure, ALU dependency, LDS issue exposure, `VALUInsts`, and `SQ_INSTS_LDS_sum`. If four load pairs cross the resource gate in a tail variant, retry a two-pair schedule before rejecting the whole idea.
+
+The first QK candidate issued all four K pairs before consumption. The extracted D=64 active image showed the intended eight-read batch with descending waits, normally `lgkmcnt(6/4/2/0)`, while D=128 remained byte-identical to production. It was spill-free with zero private memory; D=64 HND aligned/query/KV/combined-tail used `{145,145,168,168}` VGPRs and NHD used at most 149. Focused aligned outputs were bitwise identical, but the 60-sample exact-code-object comparison regressed HND by `2.263%` geometrically and NHD by `1.149%`, with 1/6 wins overall. The two-pair fallback was also spill-free and used at most 169 VGPRs. It won 5/6 focused cases but improved only `0.312%` geometrically for HND and `0.239%` for NHD, below the `0.5%` gate, and regressed long H32/N16384 NHD by `0.85%`. Reject both QK schedules and restore the production QK loop before testing PV independently.
+
+The independent four-fragment PV candidate also emitted the intended eight-read batch and `lgkmcnt(6/4/2/0)` consumption. D=64 HND aligned/query/KV/combined-tail used `{172,172,177,176}` VGPRs and NHD used 152; all images had zero private memory and spills, and D=128 remained byte-identical. Focused outputs were bitwise identical. Exact-code-object timing regressed HND by `3.165%` geometrically with 0/3 wins; NHD was mixed at `+0.371%`, with only 1/3 wins and two regressions. Reject PV progressive issue without a two-pair retry because the four-pair form passed resources but failed timing materially. Restore the complete production QK/PV loop before 11B.
+
+#### Optimization 11B: Additional D=64 HND Decoded-Q Caching
+
+Status: accepted; HND only. The first persistent D=64 HND decoded-Q fragment already reduced dynamic VALU and LDS dependency work and won all nine HND benchmark rows. The accepted extension caches all four fragments for aligned, query-tail, and combined-tail kernels and caps the KV-tail kernel at three fragments. NHD retains its production decode path.
+
+Each decoded `Wmma::AVecType` is logically eight VGPRs. First-order used-VGPR estimates, before compiler scheduling, are:
+- aligned and query-tail: cache all four fragments, approximately `147 + 24 = 171` used VGPRs;
+- combined-tail: cache all four fragments, approximately `162 + 24 = 186`;
+- KV-tail: cap the experiment at three total cached fragments, approximately `172 + 16 = 188`.
+
+These are feasibility estimates, not resource claims. Exact extracted metadata decides acceptance. Keep NHD on its current decode path because the all-layout Phase 10C candidate regressed long H32 NHD cases. Qualify 11B independently from 11A because both consume the same D=64 register headroom; combine them only if each wins alone and the combined image remains within 192 allocated VGPRs.
+
+The extracted D=64 HND aligned/query/KV/combined-tail images use `{175,175,171,171}` VGPRs, 16 KiB LDS, zero private memory, and zero spills. D=64 NHD remains at `{130,130,151,151}` VGPRs, and byte-level ELF symbol comparison confirms that every D=64 NHD and D=128 kernel body is identical to the frozen Phase 10C image. `Kargs` remains 56 bytes. The candidate passes the complete public contract at `168/168`; exact-code-object checks are bitwise identical.
+
+The first 60-sample focused bracket improved HND by `0.918%` geometrically with 3/3 wins. The first nine-shape bracket was noisy at `+0.523%` with 8/9 wins, so acceptance used an independent 100-sample bracket: all nine HND shapes won by `0.60-0.92%`, for a `+0.789%` geometric mean. On the isolated H16/N4096 attribution dispatch, `VALUInsts` fell `28,719 -> 27,745` (`-3.39%`), `SQ_INSTS_VALU_sum` fell by the same proportion, and `SQ_INSTS_LDS_sum` fell `20,197,376 -> 19,423,232` (`-3.83%`), while `LDSBankConflict` remained zero. Accept the HND-only cache extension and use its exact rebuilt images as the cumulative baseline for 11C and later experiments.
+
+#### Optimization 11C: Strided LLC-Bounded D=64 NHD Head Groups
+
+Status: accepted with a partition-aware activation policy. Retain sequential launches and the 32 MiB hard working-set cap, but replace contiguous physical head subsets with a bijective strided permutation that spreads each launch across the complete head range.
+
+One candidate mapping is:
+
+```text
+group_size  = floor(32 MiB / per_head_KV_bytes)
+group_count = ceil(H / group_size)
+physical_head(group, local) = group + local * group_count
+```
+
+Only physical heads below `H` participate, so partial final groups remain valid and no head is duplicated or omitted. Physical NHD tensor strides continue to use the full head count. The device mapping therefore needs an explicit group stride or equivalent checked argument; do not reinterpret `head_start` as contiguous if the mapping is strided.
+
+Start with `H=32,N=16384,D=64`, where an eight-head group occupies exactly 32 MiB and the production gap is largest. Then test `H=32,N=8192` and the H=16/H=56 long cases. Keep D=128 on the accepted Phase 10A grouping policy unless a separate D=128 schedule A/B test justifies changing it.
+
+Reject 11C unless the same candidate simultaneously:
+- reduces summed `FETCH_SIZE` and GCEA read size;
+- improves exact same-stream whole-call timing;
+- preserves enough launch-local head diversity to avoid the severe contiguous-group regressions;
+- handles arbitrary positive heads, partial groups, both tails, and batch two with checked host arithmetic.
+
+The broad LLC-only policy was directionally positive but failed the structural gate: its robust six-shape geometric mean was `+3.500%`, below `5%`. Schedule sweeps exposed a stronger and repeatable partition rule. Minimum LLC-safe physical-head strides generally won, but strides divisible by eight recreated severe aliasing: H64/N16384 with stride eight regressed `28.90%`, H128/N8192 with stride eight regressed `64.11%`, and H128/N16384 with stride 16 regressed `80.07%`. Incrementing those strides to 9 or 17 changed the same controls to gains of `32.79%`, `29.88%`, and `19.46%` respectively.
+
+The accepted selector therefore activates only for D=64 NHD when all of these hold:
+- the physical head count is divisible by 16;
+- the existing `1.5 * LLC` activation threshold and 32 MiB per-launch cap hold;
+- the cap permits at least four heads per launch and requires at least three launches;
+- the minimum LLC-safe `group_count = ceil(H / group_size)` is incremented by one when divisible by eight.
+
+The accepted mapping is `physical_head = group_index + local_head * group_count`; exact partial-group sizes are computed on the host, and physical tensor strides continue to use the complete head count. It uses a separate strided kernel entry with a 64-byte by-value `Kargs`, while every existing 56-byte HND/NHD D64/D128 production image remains whole-file byte-identical to 11B. The four strided aligned/query/KV/combined-tail variants use `{130,130,151,151}` VGPRs, 16 KiB LDS, zero private memory, and zero spills.
+
+Selected-path aligned/query/KV/combined-tail and batch-two outputs are bitwise identical, including partial plans `[11,11,10]` and `[7,7,7,7,6,6,6,6,6,6]`; the final public contract passes `168/168`. Exact whole-call timing, including every sequential sublaunch, wins all 12 selected-domain controls across H32/H48/H64/H96/H128 by `4.08-39.57%`, for a `+21.280%` geometric mean. At H32/N16384, summed `FETCH_SIZE` falls `15.830 -> 13.554 GiB` (`-14.38%`), summed GCEA reads fall `15.858 -> 13.460 GiB` (`-15.12%`), and request-based `L2CacheHit` rises `2.08% -> 12.93%`. The corrected 36-case matrix reaches `28.879 TFLOPS` at D64/NHD H32/N16384; all non-selected rows retain their established dispatches and performance ranges.
+
+#### Optimization 11D: Replace Scalar Alpha Fan-Out
+
+Status: rejected and restored to production. The current online update extracts row-specific `alpha` through 16 compile-time `v_readlane_b32` operations per key tile, followed by scalar-to-vector moves and selects before output rescaling. Build a D=64 fixture that forms the same row-alpha vectors with fixed lane permutations, DPP, or another vector-only mapping.
+
+Use the existing arithmetic first. The active image must materially reduce readlane and scalar/vector dependency work without adding a barrier, LDS traffic, or persistent VGPR state. Promote to D=128 only if the D=64 fixture wins and the D=128 image remains at or below 192 allocated VGPRs. Expected gain is `0-2%`, unvalidated.
+
+The D=64 fixture used one adjacent-lane DPP swap and one lane-group select, then let the compiler fold eight row-local broadcasts directly into 32 `v_mul_f32_dpp ... row_share:*` output scales. It eliminated all 16 `v_readlane_b32` instructions, reduced aligned HND/NHD static instruction counts by 15/31, and lowered aligned NHD from 130 to 127 VGPRs. All D=64 variants remained spill-free with zero private memory, and every D=128 body stayed byte-identical. Outputs were bitwise identical.
+
+Exact-code-object timing nevertheless rejected the schedule. The first 60-sample bracket regressed HND by `0.313%` geometrically and NHD by `0.825%`, with 0/6 wins. An independent 100-sample bracket confirmed `-0.743%` HND and `-0.602%` NHD, with 1/6 wins and long NHD regressions of `1.04-1.26%`. The cleaner static sequence creates slower row-share output dependencies on gfx1151; restore the scalar readlane fan-out.
+
+#### Optimization 11E: Relaxed Temporary P Arithmetic
+
+Status: completed; all isolated probes rejected and production arithmetic restored. Arithmetic relaxation is useful only when it removes active instructions, shortens a dependency chain, or frees registers for another accepted schedule. Test D=64 first and isolate each change.
+
+Permitted probes include:
+- `v_cvt_pk_rtz_f16_f32` for adjacent P values when the complete beta-scale-plus-conversion sequence is shorter than the current `v_fma_mixlo/hi_f16` pair;
+- converting beta to FP16 and using packed FP16 multiplication only if the active sequence is no longer than the current fused conversion and has a shorter dependency chain;
+- `v_exp_f16` for temporary shifted logits only as a register-lifetime enabler, while row max, row sum, reciprocal, LSE state, and output accumulation remain FP32;
+- alternate Q E5M2 encoding rounding when it removes instructions or enables a better decode/cache schedule.
+
+The static ISA gate comes before full timing. Reject a packed-conversion candidate if separate scaling restores the same or greater instruction count. Reject an FP16 exponential candidate if conversions back to FP32 for the row sum erase the liveness or instruction benefit. Do not combine relaxed conversion, relaxed exponential, or a different Q8 rounding mode in one first experiment. Apply the bounded tolerance escalation only after a candidate passes ISA, resource, and timing gates at the smallest tolerance that works.
+
+The first isolated probe forced D=64 beta scaling followed by adjacent `__builtin_amdgcn_cvt_pkrtz` conversion, while D=128 retained the production path. It failed the static gate. Aligned HND/NHD instruction counts increased `1250 -> 1258` and `1335 -> 1354`, and VALU counts increased `907 -> 912` and `942 -> 960`; the strided NHD body likewise increased `1351 -> 1370` instructions and `945 -> 963` VALU instructions. The candidate replaced 32 fused scale-and-convert mixed-FMA operations with 16 packed conversions plus 26-36 additional FP32 multiplies. Restore it without correctness or timing; no tolerance relaxation is justified.
+
+The second probe attempted an RNE packed-FP16 conversion followed by `v_pk_mul_f16` with beta converted to FP16. LLVM rejects `v_cvt_pk_f16_f32` for gfx1151 as an unsupported instruction. The available packed RTZ conversion is the independently rejected 11E1 path; retaining RNE requires two scalar mixed conversions per pair and then adds one packed multiply, which is strictly longer than the production two fused beta-scale-and-convert mixed-FMAs. Reject this form at compile/static feasibility without combining it with RTZ arithmetic.
+
+The third probe routed only the 32 temporary score exponentials through the OCML FP16 entry, immediately widened each result for the mandatory FP32 row sum, and retained FP32 state exponentials and accumulation. LLVM did not select `v_exp_f16` on gfx1151. The active D=64 bodies retained all 34 `v_exp_f32` instructions and added 64 FP32-to-FP16 conversions. Aligned HND/NHD grew `1250 -> 1355` and `1335 -> 1437` instructions, and VALU grew `907 -> 1009` and `942 -> 1041`; aligned HND also rose to 178 VGPRs. Reject before correctness or timing because the conversion path erases both instruction and liveness benefit.
+
+The fourth probe changed only D=64 Q encoding from tie-even RNE to the previously qualified half-up form `bits + 0x80`, retaining the exact Q8 LDS layout, decoder, and all FP32 accumulation. It passed the static and arithmetic gates: D=64 aligned HND/NHD instruction counts fell `1250 -> 1152` and `1335 -> 1239`, VALU fell equally, all D=128 bodies remained byte-identical, resources stayed within 175 HND and 162 NHD VGPRs with zero private memory or spills, and the public contract passed `168/168` at the original thresholds. Exact-code-object timing did not retain it. The first bracket was neutral at `-0.019%` HND and `+0.011%` NHD; the independent 100-sample bracket was `-0.461%` HND and `+0.109%` NHD, for `-0.176%` overall. The removed encoder work runs once per query tile, not once per key tile, and misses the `0.5%` gate. Restore tie-even RNE without requesting tolerance relaxation.
+
+#### Optimization 11F: Rejected D=64 NHD `Br=256`
+
+Status: rejected at the aligned structural timing gate. Attempt this only if 11C fails or leaves the long D=64 NHD path clearly traffic limited. This is not approval for a generalized block-size policy.
+
+A Q8 `Br=256,Bc=64,D=64` specialization would use 16 KiB persistent Q LDS plus 8 KiB phase-reused K/V LDS, or 24 KiB total. Sixteen wave32 waves would each retain ownership of 16 query rows while sharing one K/V tile, halving schedule-implied K/V reads per query row and raising the modeled no-reuse intensity from about `128` to `256 FLOP/byte`.
+
+The risks are substantial:
+- a 16-wave workgroup can provide only 16 resident waves per WGP where the current 8-wave workgroup can reach the qualified 24-wave point;
+- barrier scope doubles;
+- the current V staging uses an eight-wave ownership map and must be redesigned rather than extended with `wave * 8`;
+- query-tail behavior and launch granularity change;
+- the prior generic Triton `M256N64W16` control was rejected, although its 64 KiB FP16-Q shared-memory footprint is not resource-equivalent to this 24 KiB Q8 proposal.
+
+Compile and test only aligned `H=32/56,N=16384,D=64,NHD` first. Stop before tail implementation unless measured fetch falls by at least `25%`, the target-domain geometric mean improves at least `5%`, and the image remains below 192 allocated VGPRs with zero private memory and spills.
+
+The standalone aligned fixture used a 512-thread, 16-wave workgroup, 16 KiB Q8 LDS plus 8 KiB phase-reused K/V LDS, the accepted 64-byte strided ABI, and only the first eight waves for the rotating V transpose. It compiled to 131 VGPRs, 24 KiB LDS, zero private memory, and zero spills. The active body retained 32 WMMAs and four barriers per key tile and was slightly shorter than the `Br=128` strided body. Outputs were bitwise identical on the focused controls.
+
+Whole-call timing rejected it before traffic profiling or tails. H32/N16384, including four accepted partition-aware launches on both sides, improved only `0.90%`; H56/N16384 regressed `4.60%`. The two-shape geometric mean was `-1.889%` with 1/2 wins, far below the structural `5%` gate. Do not add a production `Br=256` entry.
+
+#### Optimization 11G: Rejected D=64 `Bc=128`
+
+Status: rejected at the compile-time resource gate. A D=64 `Br=128,Bc=128` specialization would use 8 KiB Q LDS plus 16 KiB K/V LDS, or 24 KiB total, while retaining the 8-wave workgroup. It does not reduce K/V controller bytes, but it halves key-loop barrier, reciprocal, logarithm, and state-update counts.
+
+The score fragments double from four to eight, so live score pressure is the primary gate. Test aligned HND first, where controller traffic is already low and fixed on-chip overhead matters most. Do not attempt D=128: its Q plus K/V LDS requirement would be 48 KiB and violate the accepted 32 KiB resource contract. As an additional specialization, 11G must meet the structural `5%` timing gate before tail and dispatch work.
+
+The standalone aligned HND fixture retained the accepted four-fragment decoded-Q cache and instantiated eight FP32 score fragments, eight PV updates, the 8-wave workgroup, and 24 KiB LDS. The extracted gfx1151 image required 242 VGPRs. Although private memory and spills remained zero, this exceeds the hard 192-VGPR gate by 50. Reject without correctness, timing, tails, or dispatch work.
+
+#### Optimization 11H: SageAttention-Style Tile-Local FP16 PV Buffer
+
+Status: rejected and restored to production. SageAttention's `pv_accum_dtype="fp16+fp32"` path is materially different from carrying the attention output in FP16. `compute_fp16_sv_permuted_inst_buf` keeps `RO` as a persistent FP32 fragment, initializes a temporary FP16 instruction buffer for the first `K=16` PV MMA, performs the remaining inner MMAs into that buffer, then widens its eight results and adds them to `RO`. The buffer is flushed once per outer key tile rather than carried across the sequence.
+
+The corresponding FeatherAttn recurrence is:
+
+```text
+O32 = alpha * O32
+T16 = WMMA_F16(P_beta[0], V[0], 0)
+T16 = WMMA_F16(P_beta[1], V[1], T16)
+T16 = WMMA_F16(P_beta[2], V[2], T16)
+T16 = WMMA_F16(P_beta[3], V[3], T16)
+O32 = O32 + widen(T16)
+```
+
+Here each `P_beta` is the existing beta-scaled FP16 probability fragment, the four updates cover only the current `Bc=64` tile, and no FP16 output partial survives the key-loop iteration. Before FP16 conversion, the beta-scaled tile probabilities are nonnegative and have row mass at most one, so the exact tile contribution is a bounded weighted-V partial rather than an unnormalized 64-term sum. Rounding each probability and each FP16 FMA can weaken that bound, including overflow near the FP16 limit, so the candidate must pass the complete arithmetic-candidate policy. SageAttention's use is evidence for the decomposition, not evidence that FeatherAttn meets its error or model-quality gates.
+
+gfx1151 supports `v_wmma_f16_16x16x16_f16` with round-to-nearest-even, but its register economics differ from NVIDIA's. In wave32, both the FP16-output and FP32-output `16x16x16` WMMA C/D fragments occupy eight 32-bit VGPRs per lane. With `op_sel=0`, the eight meaningful FP16 results are the low halves at logical `half16` indices `{0,2,...,14}`; widen only those values into the corresponding eight FP32 C slots. The unused halves are not additional results. This means 11H is not a register-compression optimization on gfx1151.
+
+Use one eight-VGPR FP16 scratch fragment and serialize output-fragment ownership. Convert the four score fragments to packed P in storage whose FP32 score lifetime has ended; do not retain both score and P arrays. The measured D=64 HND baselines for aligned, query-tail, KV-tail, and combined-tail are `{147,147,172,162}` used VGPRs. Adding only the logical scratch gives first-order estimates `{155,155,180,170}`, but compiler scheduling can change other live ranges, so exact metadata for all four variants decides feasibility. The corresponding NHD baselines are no higher than 151 VGPRs. A scratch fragment per D tile would add 32 logical VGPRs and is rejected without a compile. D=128 is excluded because its production image already uses 191 VGPRs.
+
+Apply a static gate before full timing:
+- D=64 QK must retain its 16 `v_wmma_f32_16x16x16_f16` instructions per key tile, while only the 16 PV instructions change to `v_wmma_f16_16x16x16_f16`;
+- the active image must show one tile-local FP16 scratch lifetime, FP32 alpha scaling, and an immediate FP32 widening-add merge, with no new barrier, LDS operation, or global-memory transaction;
+- the merge should require at most one mixed widening-add instruction per output value; reject separate conversion/add expansion unless a focused dependency fixture demonstrates a compensating schedule benefit;
+- inspect all D=64 aligned and tail images and reject retained score/P duplication, more than 192 allocated VGPRs, private memory, scratch, or spills;
+- run focused zero, random, alternating-sign, high-dynamic-range V, long-sequence, both-layout, and tail checks at the production thresholds before considering the bounded relaxation policy.
+
+Public sources do not establish a gfx1151 throughput advantage for FP16-output over FP32-output WMMA, and 11H adds 32 FP32 merges per D=64 key tile. Its only plausible wins are a shorter PV accumulator dependency or a better compiler schedule. Start with HND because that is the dependency-limited regime; leave NHD on the FP32 path unless a separate NHD comparison passes the same gates. Qualify 11H independently from 11A and 11B, retain it only after the normal `0.5%` exact-code-object timing gate, and do not request a tolerance relaxation unless that material timing or resource benefit has already been demonstrated.
+
+The extracted D=64 HND fixture exactly matched the bounded design: 16 FP32 QK WMMAs remained, 16 PV operations changed to FP16-output WMMAs, and 32 `v_fma_mix_f32` widening-add merges immediately folded the tile scratch into persistent FP32 output. Barrier, LDS, and global-memory instruction counts were unchanged. D=64 NHD, the strided entry, and every D=128 body were byte-identical. Aligned/query/combined-tail HND allocated 192 VGPRs and KV-tail allocated 189, all with 16 KiB LDS and zero private memory or spills.
+
+The candidate passed the complete `168/168` contract at production thresholds and a direct adversarial screen covering zero, random, alternating-sign, 256x dynamic-range, near-FP16-limit, long-sequence, tail, both-layout, and batch-two controls. All outputs were finite; worst candidate/production relative-L2 ratio was `1.0002`, so no tolerance relaxation was needed. Performance nevertheless rejected it decisively: exact-code-object HND timing regressed `10.92%`, `7.70%`, and `7.55%` on the focused controls, for `-8.739%` geometrically with 0/3 wins. The FP16 WMMA dependency does not compensate for 32 merges and 192-VGPR pressure on gfx1151. Restore the FP32 PV path.
+
+#### Explicitly Deprioritized Or Excluded In Phase 11
+
+- Pure FP16 WMMA score accumulation or persistent output accumulation is excluded because of known accuracy risk. Optimization 11H is the sole exception: it rounds only one tile-local PV partial before an immediate FP32 merge.
+- Generic VOPD tuning is deprioritized because the compiler already emits extensive `v_dual_*` instructions.
+- Persistent linear `(m,l)`, the D=64 V-load hoist, and contiguous D=64 grouping remain rejected by their Phase 10 timing results.
+- Full K/V double buffering is not a general option; D=128 already consumes the complete 32 KiB LDS budget.
+- D=128 decoded-Q caching remains outside the 191/192-VGPR envelope.
+- CK async/TDM pipelines remain scheduling references rather than drop-in gfx1151 implementations.
+- Native BF8 conversion remains unproven on gfx1151; keep byte-permute E5M2 expansion unless an isolated compiler/ISA probe demonstrates a supported instruction and end-to-end win.
+- Broad block-shape sweeps, a new autotuner, FP8 K/V/P transport, and polynomial transcendental replacements remain outside scope.
+
+#### Phase 11 Execution Order
+
+- Freeze exact Phase 10C production code objects, loaded-image hashes, the 36-case matrix, and focused profiler controls.
+- Run 11A QK progressive LDS consumption, then its PV counterpart, as independent D=64 experiments.
+- Run 11B additional HND Q caching independently against production.
+- Run 11C strided D=64 NHD grouping with traffic attribution.
+- Run 11D alpha fan-out only after the leading dependency and traffic candidates are resolved.
+- Run the isolated 11E arithmetic probes only when their static ISA can beat the current instruction or liveness shape. Escalate tolerance only after the candidate proves a material performance or resource benefit.
+- Run the 11H tile-local mixed-PV fixture only after its active ISA proves the exact four-update FP16 buffer and immediate FP32 merge. Qualify it independently from 11A/11B.
+- Attempt 11F only if long D=64 NHD remains traffic limited after 11C.
+- Attempt 11G only if D=64 HND remains on-chip limited and the aligned resource model fits after earlier accepted work.
+- Combine only independently accepted candidates, then rerun resources, correctness at the accepted uniform tolerance, profiler attribution, exact-code-object paired timing, and the authoritative 36-case matrix.
+
+The sequence is complete. No separate combination patch was required: 11C was developed and qualified on the accepted 11B baseline, so commit `01454e3` already contains the complete accepted Phase 11 source state.
+
+#### Phase 11 Final Qualification
+
+A forced rebuild removed every generated `.cuda.o` before compiling, then extracted the five active `.hip_fatbin` gfx1151 images with the explicit `hipv4-amdgcn-amd-amdhsa--gfx1151` target. Every rebuilt image matches the frozen accepted 11C image byte-for-byte.
+
+The rebuilt extension passes the complete public contract at `168/168` with the unchanged production thresholds. Authoritative metadata covers 20 kernels: the 16 existing aligned/tail HND/NHD D64/D128 entries retain 56-byte `Kargs`, the four isolated strided D64 NHD entries use 64-byte `Kargs`, maximum used VGPRs are 191 and therefore allocate 192, maximum LDS is 32,768 bytes, and private memory and SGPR/VGPR spills are zero.
+
+Because these images are byte-identical to the accepted 11C freeze, the cumulative profiler attribution and exact-code-object timing are the accepted 11B and 11C measurements: HND dynamic VALU fell `3.39%` from 11B, while selected D64 NHD grouping improved 12/12 controls by `21.280%` geometrically and reduced H32/N16384 `FETCH_SIZE` by `14.38%` and GCEA reads by `15.12%`. The final wrapper matrix completes all 36 cases. Relative to AITER, Feather's geometric-mean ratios are `1.101x` for D64 HND, `1.087x` for D128 HND, `1.048x` for D64 NHD, and `1.156x` for D128 NHD; the overall ratio is `1.097x` with 31/36 wins. The selected D64 NHD H32/N16384 row reaches `29.088 TFLOPS`. A separate-run comparison with the corrected 11C matrix is `+0.917%` geometrically and is used only as a stability check, not an acceptance measurement.
+
+Final artifacts are under `~/tmp/feather_attn/phase11_final/` and `~/tmp/feather_attn/phase11_final_images/`. Phase 11 stops at `01454e3`; only this documentation ledger remains as an uncommitted tracked change.
 
 ## Stop Rules
 
@@ -786,15 +1062,16 @@ Stop or redesign before further optimization if any of these remain true:
 - any private segment or scratch remains;
 - the exact Q layout has material bank conflicts;
 - a supported shape can overflow a narrowed device offset, counter, or launch dimension;
-- realistic activation tests fail the FP16 tolerance or model quality check;
+- realistic activation tests fail the accepted uniform Phase 11 tolerance or model-quality check;
 - `S=4096` remains more than 5% slower than AITER after basic scheduling;
 - profiling shows Q LDS traffic or `v_perm_b32` issue consumes the complete occupancy gain.
 
 ## Deferred Work
 
 The accepted fixed kernel does not include:
-- additional `Br`, `Bc`, or wave-count variants;
-- `Br=256`, 16-wave workgroups;
+- production additional `Br`, `Bc`, or wave-count variants; Phase 11F/11G permit only isolated D=64 feasibility probes until their structural gates pass;
+- a production `Br=256` or `Bc=128` dispatch entry;
+- FP16 WMMA score accumulators or persistent FP16 output accumulators; 11H permits only a non-production tile-local mixed-PV probe;
 - FP8 K or V transport and cooperative expansion;
 - FP8 P;
 - causal attention, arbitrary masks, dropout, ALiBi, or softcap;
@@ -841,6 +1118,25 @@ Add one row per isolated experiment. Include links or paths to profile artifacts
 | F10b | Rejected | Persistent linear online `(m,l)`, D=64 | Focused HND/NHD set passes 16/16 | 168 used max; 16 KiB LDS; zero private/spills | Paired focused geometric mean `-0.938%` | One of six paired cases wins; full matrix also negative | Restore Phase 10A recurrence; do not attempt D128 |
 | F10c | Done | Cache one D64 HND decoded-Q fragment across key tiles | 168/168 contract; paired output bit-identical | 172 used max; 16 KiB LDS; zero private/spills | HND paired geometric mean `+1.294%` | All 9 HND rows win `1.07-1.64%`; NHD unchanged | Accept HND only; retain Phase 10A NHD schedule |
 | F10d | Rejected | Hoist D64 V loads before K-to-V LDS barrier | Focused HND/NHD set passes 16/16 | Resources unchanged; 16 KiB LDS; zero private/spills | Paired focused geometric mean `-0.349%` | All six paired cases regress | Restore Phase 10A scheduling |
+| R11a | Done | Findings-only review of final production ISA, profiles, and external schedules | Read-only review; no behavior change | Production resources unchanged | HND remains about `32-35 TFLOPS` | Long D64 NHD remains traffic limited | Open a separate measured Phase 11 campaign |
+| R11b | Done | Freeze Phase 10C code objects and verify current build images | Byte-for-byte image comparison | Production resources and 56-byte Kargs unchanged | N/A | N/A | Use `phase11_baseline_freeze` for all Phase 11 paired controls |
+| D11a | Deferred | Pure FP16 WMMA score or persistent output accumulation | Excluded because of known accuracy risk | N/A | N/A | N/A | Keep FP32 score and cross-key-tile output accumulators |
+| F11a | Rejected | Progressive D=64 QK/PV LDS issue and descending `lgkmcnt` consumption | Focused outputs bitwise identical | All candidates <=177 VGPR; zero private/spills | QK4 `-2.263%`, QK2 `+0.312%`, PV4 `-3.165%` | QK4 `-1.149%`, QK2 `+0.239%`, PV4 `+0.371%` | Restore production QK/PV loops |
+| F11a1 | Rejected | D64 QK issue all four K pairs before four WMMAs | Focused aligned outputs bitwise identical | HND `{145,145,168,168}`; NHD <=149; zero private/spills | HND geometric mean `-2.263%` | NHD geometric mean `-1.149%`; 1/6 wins overall | Reject full batch; try two-pair fallback |
+| F11a2 | Rejected | D64 QK issue two K pairs before two WMMAs | Focused aligned outputs bitwise identical | At most 169 VGPRs; zero private/spills | HND geometric mean `+0.312%` | NHD geometric mean `+0.239%`; long H32/N16384 `-0.85%` | Below 0.5% gate; restore production QK |
+| F11a3 | Rejected | D64 PV issue four V pairs before four WMMAs | Focused aligned outputs bitwise identical | HND `{172,172,177,176}`; NHD 152; zero private/spills | HND geometric mean `-3.165%` | NHD geometric mean `+0.371%`; 1/6 wins overall | Restore production PV loop |
+| F11b | Done | Cache four D64 HND decoded-Q fragments, capped at three for KV-tail | 168/168 contract; paired outputs bitwise identical | HND `{175,175,171,171}` VGPRs; 16 KiB LDS; zero private/spills | Robust HND geometric mean `+0.789%`; 9/9 wins | NHD and D128 bodies byte-identical; dynamic VALU `-3.39%` | Accept as cumulative Phase 11 baseline |
+| F11c | Done | Partition-aware strided, LLC-bounded D64 NHD groups | 168/168; selected tails/batch two bitwise identical | New 64-byte Kargs; `{130,130,151,151}` VGPRs; 16 KiB LDS; zero private/spills | Selected-domain geometric mean `+21.280%`; 12/12 wins | H32/N16384 fetch `-14.38%`, GCEA reads `-15.12%`; existing images byte-identical | Accept guarded selector; avoid strides divisible by eight |
+| F11d | Rejected | D64 DPP row-share alpha fan-out | Focused outputs bitwise identical | HND <=175, NHD <=150 VGPRs; zero private/spills; D128 byte-identical | Robust HND geometric mean `-0.743%` | Robust NHD geometric mean `-0.602%`; 1/6 wins | Restore scalar readlane fan-out |
+| F11e | Rejected | Isolated relaxed temporary P conversion/exp/Q-rounding probes | Half-up probe passed `168/168`; others stopped at static gate | FP32 QK/PV accumulators retained throughout | No probe passed timing | No probe passed timing | Restore production arithmetic; no tolerance relaxation |
+| F11e1 | Rejected | D64 explicit adjacent-P packed RTZ conversion after FP32 beta scaling | Static gate only; no arithmetic relaxation requested | FP32 accumulators retained; D128 source path unchanged | Aligned HND instructions `1250 -> 1258` | Aligned/strided NHD instructions `1335/1351 -> 1354/1370` | Separate scaling erased the packed-conversion benefit; restore without timing |
+| F11e2 | Rejected | D64 RNE P packing plus packed-FP16 beta multiply | Compile/static gate only | `v_cvt_pk_f16_f32` unsupported on gfx1151 | N/A | N/A | Scalar RNE converts plus packed multiply are strictly longer; do not combine with rejected RTZ path |
+| F11e3 | Rejected | D64 FP16 temporary score exponential with immediate FP32 widening | Static gate only; FP32 sum/state retained | Aligned HND rose to 178 VGPRs; zero private/spills | HND instructions/VALU `1250/907 -> 1355/1009` | NHD instructions/VALU `1335/942 -> 1437/1041` | LLVM retained `v_exp_f32` and added 64 conversions; restore without timing |
+| F11e4 | Rejected | D64 half-up Q E5M2 encoding | `168/168` at production thresholds | HND <=175, NHD <=162 VGPRs; zero private/spills; D128 byte-identical | Robust HND geometric mean `-0.461%` | Robust NHD geometric mean `+0.109%`; overall `-0.176%` | Static work is outside the key loop and misses the 0.5% gate; restore RNE |
+| F11f | Rejected | Standalone D64 NHD Q8 `Br=256,Bc=64`, 16 waves | Focused aligned outputs bitwise identical | 131 VGPRs; 24 KiB LDS; zero private/spills | N/A | H32 `+0.90%`, H56 `-4.60%`; geometric mean `-1.889%` | Stop before profiling/tails; no production entry |
+| F11g | Rejected | Standalone D64 HND `Br=128,Bc=128`, 8 waves | Compile-only | 242 VGPRs; 24 KiB LDS; zero private/spills | N/A | N/A | Exceeds 192-VGPR gate by 50; stop before timing/tails |
+| F11h | Rejected | D64 HND SageAttention-style four-WMMA FP16 PV tile buffer with immediate FP32 merge | `168/168`; adversarial screen finite and passes without relaxation | HND `{192,192,189,192}` VGPRs; 16 KiB LDS; zero private/spills; NHD/D128 byte-identical | Focused HND geometric mean `-8.739%` | NHD unchanged | Merge cost and 192-VGPR pressure dominate; restore FP32 PV |
+| F11z | Done | Cumulative 11B+11C final qualification at `01454e3` | `168/168`; final 36-case matrix complete | 20 kernels; 191 used/192 allocated max; 32 KiB LDS max; zero private/spills | D64/D128 HND geometric means `1.101x/1.087x` AITER | D64/D128 NHD geometric means `1.048x/1.156x`; overall `1.097x` | Close Phase 11; accepted source already committed |
 
 ## Verification Commands
 
@@ -911,3 +1207,12 @@ Normalize `GCEA_RDRAM_SIZE_REQ` as 32-byte increments over dispatch duration. Ke
 - `~/tmp/feather_attn/review/counter_matrix_summary.txt`: normalized HND/NHD Feather/AITER counter matrix.
 - `~/tmp/feather_attn/review/model_grouping_and_roofline.txt`: long-NHD byte accounting, roofline, and grouping model.
 - `~/tmp/feather_attn/review/model_optimization_bounds.txt`: grouped working-set and online-state resource bounds.
+- `~/tmp/feather_attn/phase10c_hnd_qcache_full_matrix.csv`: historical Phase 10C wrapper benchmark artifact.
+- `~/tmp/feather_attn/phase11_final/matrix/attn.csv`: authoritative final `01454e3` AITER/FeatherAttn benchmark matrix.
+- `~/tmp/feather_attn/phase10c_hnd_qcache_images/featherattn_aligned.active.s`: qualified production aligned disassembly.
+- `~/tmp/feather_attn/review/triton_exact_hnd_d64/*/attn_fwd.amdgcn`: active AITER LDS issue/consume schedule control.
+- `~/tmp/feather_attn/phase10_group_sweep.log`: contiguous D64/D128 head-group timing controls.
+- `~/sageattention-autotune/csrc/qattn/attn_utils.cuh`: `compute_fp16_sv_permuted_inst_buf` mixed FP16/FP32 PV reference.
+- `~/rocm-libraries/projects/composablekernel/include/ck/utility/amd_wmma.hpp`: gfx11 FP16-output WMMA builtin and `op_sel` reference.
+- `https://gpuopen.com/learn/wmma_on_rdna3/`: gfx11 WMMA C/D register count and FP16 `op_sel` element-selection reference.
+- `~/rdna35-isa-markdown/rdna35_instruction_set_architecture.md`: gfx1151 waitcnt, packed conversion, FP16 transcendental, VOPD, and WMMA ISA reference.

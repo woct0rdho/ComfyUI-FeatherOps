@@ -56,6 +56,8 @@ bool IsInt32HalfAddressable(const torch::stable::Tensor& tensor)
 }
 
 using Launcher = bool (*)(const feather_attn::LaunchParams&);
+using StridedLauncher =
+    bool (*)(const feather_attn::StridedLaunchParams&);
 
 Launcher SelectLauncher(int64_t head_dim, bool nhd, bool pad_q, bool pad_kv)
 {
@@ -102,6 +104,44 @@ int64_t ResolveNhdHeadGroupSize(int64_t heads, int64_t n_kv, int64_t head_dim)
     if(group_size < 4 || group_size >= heads)
         return heads;
     return group_size;
+}
+
+int64_t ResolveNhdD64StridedGroupCount(int64_t heads, int64_t n_kv)
+{
+    if(heads % 16 != 0)
+        return 1;
+
+    constexpr __int128 kLlcBytes = static_cast<__int128>(32) * 1024 * 1024;
+    constexpr int64_t kHeadDim  = 64;
+    const __int128 kv_bytes_per_head =
+        static_cast<__int128>(n_kv) * kHeadDim * 2 * sizeof(half_bits_t);
+    const __int128 total_kv_bytes =
+        static_cast<__int128>(heads) * kv_bytes_per_head;
+    if(total_kv_bytes * 2 < kLlcBytes * 3 || kv_bytes_per_head > kLlcBytes)
+        return 1;
+
+    const int64_t group_size = static_cast<int64_t>(kLlcBytes / kv_bytes_per_head);
+    if(group_size < 4 || group_size >= heads)
+        return 1;
+
+    int64_t group_count = (heads + group_size - 1) / group_size;
+    if(group_count < 3)
+        return 1;
+    // A physical-head stride divisible by eight recreates the NHD partition cliff.
+    if(group_count % 8 == 0)
+        ++group_count;
+    return group_count;
+}
+
+StridedLauncher SelectNhdD64StridedLauncher(bool pad_q, bool pad_kv)
+{
+    if(pad_q && pad_kv)
+        return feather_attn::feather_attn_nhd_d64_strided_query_key_tail;
+    if(pad_q)
+        return feather_attn::feather_attn_nhd_d64_strided_query_tail;
+    if(pad_kv)
+        return feather_attn::feather_attn_nhd_d64_strided_key_tail;
+    return feather_attn::feather_attn_nhd_d64_strided_aligned;
 }
 
 } // namespace
@@ -171,33 +211,76 @@ void AttnFp16Feather(
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
     const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
     const int64_t group_size = nhd ? ResolveNhdHeadGroupSize(heads, n_kv, d) : heads;
+    const int64_t strided_group_count =
+        nhd && d == 64 ? ResolveNhdD64StridedGroupCount(heads, n_kv) : 1;
+    const bool use_strided_d64 = strided_group_count > 1;
     const Launcher launcher =
         SelectLauncher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0);
+    const StridedLauncher strided_launcher =
+        use_strided_d64 ? SelectNhdD64StridedLauncher(n_q % 128 != 0, n_kv % 64 != 0)
+                        : nullptr;
 
     (void)hipGetLastError();
     bool launched = true;
-    for(int64_t head_start = 0; head_start < heads; head_start += group_size)
+    if(use_strided_d64)
     {
-        const int64_t launch_heads =
-            group_size < heads - head_start ? group_size : heads - head_start;
-        const __int128 grouped_grid_size =
-            static_cast<__int128>(batch) * launch_heads * q_tiles;
-        const feather_attn::LaunchParams params{
-            q.const_data_ptr(),
-            k.const_data_ptr(),
-            v.const_data_ptr(),
-            o.mutable_data_ptr(),
-            static_cast<int32_t>(n_q),
-            static_cast<int32_t>(n_kv),
-            static_cast<int32_t>(heads),
-            static_cast<int32_t>(head_start),
-            static_cast<int32_t>(launch_heads),
-            static_cast<uint32_t>(grouped_grid_size),
-            stream};
-        if(!launcher(params))
+        STD_TORCH_CHECK(strided_group_count <= INT32_MAX,
+                        "strided head-group count exceeds signed int32");
+        for(int64_t group_index = 0; group_index < strided_group_count;
+            ++group_index)
         {
-            launched = false;
-            break;
+            const int64_t launch_heads =
+                (heads - 1 - group_index) / strided_group_count + 1;
+            const __int128 grouped_grid_size =
+                static_cast<__int128>(batch) * launch_heads * q_tiles;
+            STD_TORCH_CHECK(launch_heads > 0 && launch_heads <= INT32_MAX &&
+                                grouped_grid_size <= UINT32_MAX,
+                            "strided head-group launch exceeds device limits");
+            const feather_attn::StridedLaunchParams params{
+                q.const_data_ptr(),
+                k.const_data_ptr(),
+                v.const_data_ptr(),
+                o.mutable_data_ptr(),
+                static_cast<int32_t>(n_q),
+                static_cast<int32_t>(n_kv),
+                static_cast<int32_t>(heads),
+                static_cast<int32_t>(group_index),
+                static_cast<int32_t>(launch_heads),
+                static_cast<int32_t>(strided_group_count),
+                static_cast<uint32_t>(grouped_grid_size),
+                stream};
+            if(!strided_launcher(params))
+            {
+                launched = false;
+                break;
+            }
+        }
+    }
+    else
+    {
+        for(int64_t head_start = 0; head_start < heads; head_start += group_size)
+        {
+            const int64_t launch_heads =
+                group_size < heads - head_start ? group_size : heads - head_start;
+            const __int128 grouped_grid_size =
+                static_cast<__int128>(batch) * launch_heads * q_tiles;
+            const feather_attn::LaunchParams params{
+                q.const_data_ptr(),
+                k.const_data_ptr(),
+                v.const_data_ptr(),
+                o.mutable_data_ptr(),
+                static_cast<int32_t>(n_q),
+                static_cast<int32_t>(n_kv),
+                static_cast<int32_t>(heads),
+                static_cast<int32_t>(head_start),
+                static_cast<int32_t>(launch_heads),
+                static_cast<uint32_t>(grouped_grid_size),
+                stream};
+            if(!launcher(params))
+            {
+                launched = false;
+                break;
+            }
         }
     }
     const hipError_t launch_error = hipGetLastError();
