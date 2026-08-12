@@ -133,6 +133,8 @@ struct AttentionKernel
     static constexpr index_t kKChunks    = kHeadDim / kKPack;
     static constexpr index_t kVPack      = 8;
     static constexpr index_t kVChunks    = kBlockN / kVPack;
+    static constexpr index_t kCachedQTiles =
+        kHeadDim == 64 && !kNHD ? (kPadKV && !kPadQ ? 3 : kDTiles) : 0;
 
     struct Kargs
     {
@@ -257,7 +259,7 @@ struct AttentionKernel
         uint32_t store_wave;
         asm volatile("v_readfirstlane_b32 %0, %1" : "=s"(store_wave) : "v"(wave));
         float lane_lse = -__builtin_inff();
-        typename Wmma::AVecType cached_q = {};
+        typename Wmma::AVecType cached_q[kCachedQTiles > 0 ? kCachedQTiles : 1] = {};
 
         #pragma unroll 1
         for(index_t key_start = 0; key_start < kargs.n_kv; key_start += kBlockN)
@@ -292,11 +294,12 @@ struct AttentionKernel
                 const index_t q_lds_offset = q_lds_desc.calculate_offset(
                     ck_tile::make_tuple(wave, d_tile.value, lane_row, index_t{0}));
                 typename Wmma::AVecType q;
-                if constexpr(kHeadDim == 64 && !kNHD && d_tile.value == 0)
+                if constexpr(d_tile.value < kCachedQTiles)
                 {
                     if(key_start == 0)
-                        cached_q = Q8Ops::DecodeE5M2x16(q_lds + q_lds_offset);
-                    q = cached_q;
+                        cached_q[d_tile.value] =
+                            Q8Ops::DecodeE5M2x16(q_lds + q_lds_offset);
+                    q = cached_q[d_tile.value];
                 }
                 else
                 {
