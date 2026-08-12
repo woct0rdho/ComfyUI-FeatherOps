@@ -257,6 +257,7 @@ struct AttentionKernel
         uint32_t store_wave;
         asm volatile("v_readfirstlane_b32 %0, %1" : "=s"(store_wave) : "v"(wave));
         float lane_lse = -__builtin_inff();
+        typename Wmma::AVecType cached_q = {};
 
         #pragma unroll 1
         for(index_t key_start = 0; key_start < kargs.n_kv; key_start += kBlockN)
@@ -290,7 +291,17 @@ struct AttentionKernel
             ck_tile::static_for<0, kDTiles, 1>{}([&](auto d_tile) {
                 const index_t q_lds_offset = q_lds_desc.calculate_offset(
                     ck_tile::make_tuple(wave, d_tile.value, lane_row, index_t{0}));
-                const auto q = Q8Ops::DecodeE5M2x16(q_lds + q_lds_offset);
+                typename Wmma::AVecType q;
+                if constexpr(kHeadDim == 64 && !kNHD && d_tile.value == 0)
+                {
+                    if(key_start == 0)
+                        cached_q = Q8Ops::DecodeE5M2x16(q_lds + q_lds_offset);
+                    q = cached_q;
+                }
+                else
+                {
+                    q = Q8Ops::DecodeE5M2x16(q_lds + q_lds_offset);
+                }
 
                 ck_tile::static_for<0, kNTiles, 1>{}([&](auto n_tile) {
                     const index_t k_row   = n_tile.value * kLaneRows + lane_row;

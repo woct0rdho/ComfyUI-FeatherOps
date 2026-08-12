@@ -23,7 +23,7 @@ The accepted implementation has one block shape and two head-dimension specializ
 
 Do not add another block size, an autotune table, or a generalized FeatherAttn policy matrix without a separate measured justification. Tail support and the D=64/D=128 specializations share this block shape.
 
-The correctness, resource, and two-layout performance qualification through Phase 9 is complete. Phase 10 is the active post-qualification optimization campaign. Its priorities are bounded NHD LLC grouping, linear online-softmax state, and D=64 dependency-chain reduction. These are proposals until their individual acceptance gates pass; the Phase 9 implementation remains the production baseline.
+The correctness, resource, and two-layout performance qualification through Phase 9 is complete. Phase 10 is complete. Bounded D=128 NHD LLC grouping and one-fragment D=64 HND decoded-Q caching passed every gate and form the production baseline. Linear D=64 online-softmax state, D=64 NHD Q caching, and D=64 V-load scheduling were measured independently and rejected by their timing gates.
 
 ## Objective
 
@@ -679,13 +679,13 @@ Isolated profiler passes sum counters across all sublaunches in one API call and
 
 The independent H32/N16384 GCEA pass reports `31.529 GiB` ungrouped and `13.543 GiB` grouped, corroborating the traffic reduction. GCEA and `FETCH_SIZE` came from separate profiler runs and are not expected to match exactly. Per-sublaunch `SIMD_UTILIZATION` cannot be combined into a meaningful whole-call percentage because rocprof can report values above one on later sequential launches; it is excluded from the acceptance claim.
 
-The complete 36-case matrix passes. D=128 NHD is now `0.972x-1.376x` AITER, versus `0.972x-1.084x` in Phase 9, and its geometric-mean throughput improves `1.113x` over the Phase 9 table. HND and D=64 geometric means change by only `+0.7%`, `+0.4%`, and `+0.1%`, respectively. The public contract passes `168/168`, including arbitrary heads, independent tails, and batch two. Fresh metadata for all 16 kernels reports at most 191 used/192 allocated VGPRs, 32 KiB LDS, zero private memory, and zero spills; Kargs is 48 bytes.
+The complete 36-case matrix passes. D=128 NHD is now `0.972x-1.376x` AITER, versus `0.972x-1.084x` in Phase 9, and its geometric-mean throughput improves `1.113x` over the Phase 9 table. HND and D=64 geometric means change by only `+0.7%`, `+0.4%`, and `+0.1%`, respectively. The public contract passes `168/168`, including arbitrary heads, independent tails, and batch two. Fresh metadata for all 16 kernels reports at most 191 used/192 allocated VGPRs, 32 KiB LDS, zero private memory, and zero spills; Kargs is 56 bytes.
 
 Artifacts are under `~/tmp/feather_attn/phase10_group_*`, including the focused sweep, paired qualification, profile summary, contract log, metadata, and complete matrix. Phase 10A becomes the production baseline for subsequent experiments.
 
 #### Optimization 10B: Persistent Linear Online `(m,l)` State
 
-FeatherAttn currently reconstructs a log-domain state on every key tile:
+**Status: rejected for D=64; D=128 not attempted.** FeatherAttn reconstructs a log-domain state on every key tile:
 
 ```text
 old_term  = exp2(old_lse - new_max)
@@ -715,9 +715,15 @@ Implement and qualify D=64 first. It has material register headroom. The state c
 
 Correctness must be rerun because changing the recurrence can alter rounding and all-masked/initial-state behavior. Preserve the public tolerance gates and compare relative L2 and maximum normalized tolerance ratio against the Phase 9 baseline, not only AITER.
 
+The D=64 experiment formed P directly as `exp2(score - new_max)`, retained linear `running_max/running_sum`, and normalized once in the epilogue. Focused HND/NHD aligned, independent-tail, short, long, arbitrary-head, and batch-two checks passed `16/16`. Exact active gfx1151 images for all 16 kernels remained spill-free with at most 168 used VGPRs for D=64, 16 KiB LDS, and zero private memory; D=128 remained at 191 used VGPRs and 32 KiB LDS.
+
+The generated aligned D=64 ISA changed as intended: exponentials fell from 34 to 33, the logarithm disappeared, and normalization moved to the epilogue. However, HND static instructions rose from 1,175 to 1,186 and aligned HND used 155 VGPRs in the active image. A randomized 80-sample same-stream comparison of exact baseline/candidate code objects regressed `0.938%` geometrically on the six representative HND/NHD cases and won only one. The separate complete 18-row D=64 matrix was also negative, though its raw `1.98%` loss includes cross-run clock drift. An in-place epilogue lifetime refinement remained negative on all six focused cases and increased HND static instructions to 1,220.
+
+The recurrence therefore failed the repeatable timing gate before profiler attribution or the complete public contract. D=128 was not attempted because the prerequisite D=64 benefit was absent and D=128 has no register margin. Production source returns to the Phase 10A log-domain recurrence. Artifacts are `~/tmp/feather_attn/phase10b_linear_*` and `phase10b_epilogue_*`.
+
 #### Optimization 10C: D=64 Q Decode And Dependency Reduction
 
-D=64 has 136 allocated VGPRs in aligned NHD and 152 in aligned HND, zero measured LDS bank conflicts, and proportionally more fixed softmax/conversion work than D=128. It is the only dimension where selective Q-fragment caching or a longer-lived decoded fragment is currently reasonable.
+**Status: accepted for D=64 HND only; rejected for NHD.** D=64 has 136 allocated VGPRs in aligned NHD and 152 in aligned HND, zero measured LDS bank conflicts, and proportionally more fixed softmax/conversion work than D=128. It is the only dimension where selective Q-fragment caching or a longer-lived decoded fragment is currently reasonable.
 
 Test one narrowly scoped change at a time:
 - retain one decoded FP16 Q fragment across its four QK WMMAs while consuming and overwriting it promptly;
@@ -729,9 +735,17 @@ The purpose is to reduce dependency stalls and selected loads/permutations, not 
 
 Do not generalize Q caching to D=128. Its 191-VGPR result makes an eight-register decoded fragment incompatible with the current resource contract.
 
+The accepted loop already decodes each Q fragment once and retains it across the four same-fragment QK WMMAs. The bounded experiment additionally caches D64 `d_tile=0` across key-loop iterations. Applying it to both layouts exposed a schedule tradeoff: a randomized same-stream comparison of exact saved code objects improved HND but regressed the traffic-bound NHD H32 long cases. Production therefore enables the cache only when `D=64` and the compile-time layout is HND. NHD and all D=128 generated instruction counts remain unchanged.
+
+The public contract passes `168/168`, and paired aligned outputs are bit-identical for all 18 D64 benchmark shapes. Exact active metadata for all 16 variants remains spill-free. D64 HND aligned/query-tail rise from 146 to 147 used VGPRs, combined-tail uses 162, and KV-tail rises from 168 to 172; all use 16 KiB LDS and zero private memory. NHD resources remain at Phase 10A values, and D=128 remains at 191 used VGPRs and 32 KiB LDS.
+
+The first-iteration decode branch grows the static aligned HND body from 1,175 to 1,208 instructions, while dynamic work falls on later key tiles. At `H=16,N=4096`, isolated final-two-dispatch profiler medians report `VALUInsts 29,979 -> 28,719` (`-4.20%`) and `SQ_INSTS_LDS_sum 20,455,424 -> 20,197,376` (`-1.26%`). Normalized wait-count and LDS-issue exposure fall `26.6%` and `27.8%`; `ALUStalledByLDS` falls `28.0%`. Both variants retain zero LDS bank conflicts, 16 KiB LDS, zero scratch, approximately 152 allocated VGPRs for the aligned kernel, and effectively identical measured traffic.
+
+The decisive 60-sample, randomized, same-stream exact-code-object comparison wins all nine HND rows by `1.07-1.64%`, with a `1.294%` geometric-mean gain. NHD, compiled through the original path, changes by `-0.135%` geometrically in the same control and is treated as unchanged. The complete public 36-case benchmark remains competitive with AITER: D64 HND is `1.037x-1.136x`, D64 NHD `0.978x-1.057x`, D128 HND `0.995x-1.136x`, and D128 NHD `0.973x-1.369x`. Cross-run absolute throughput was clock-shifted, so acceptance uses the paired baseline/candidate control rather than comparing raw values from separate full-matrix runs. Artifacts are under `~/tmp/feather_attn/phase10c_hnd_qcache*` and `phase10c_qcache_profiles/`.
+
 #### Optimization 10D: Barrier And Waitcnt Scheduling
 
-Evaluate this only after 10B and the D=64 portion of 10C, because both can change the dependency graph. Keep the single phase-reused K/V LDS buffer and the four correctness barriers. Do not remove a barrier unless a formal producer/consumer argument covers all eight waves and the next overwrite phase.
+**Status: D64 V-load hoist rejected; no production change.** Evaluate this only after 10B and the D=64 portion of 10C, because both can change the dependency graph. Keep the single phase-reused K/V LDS buffer and the four correctness barriers. Do not remove a barrier unless a formal producer/consumer argument covers all eight waves and the next overwrite phase.
 
 Permitted experiments are instruction scheduling changes:
 - move independent pointer arithmetic before LDS waits;
@@ -740,6 +754,10 @@ Permitted experiments are instruction scheduling changes:
 - replace overly conservative compiler waits only when ISA inspection and repeated correctness tests prove the narrower wait is valid.
 
 CK Tile's async and transpose-load pipelines are scheduling references, not drop-in replacements. A second K/V buffer would exceed the D=128 32 KiB LDS budget and is outside this campaign. Expected gain is `0-3%` with low confidence.
+
+The bounded experiment moved D64 V global loads before the existing K-to-V LDS barrier while leaving V LDS stores after it. D128 source ordering remained unchanged. Exact gfx1151 ISA confirmed that the two `global_load_b128` operations moved from immediately after the barrier into the independent softmax-reduction window; all four barriers, 50 waits, 1,175/1,335 HND/NHD D64 instructions, and the complete resource profile were unchanged. Focused HND/NHD correctness passed `16/16`, including all tail combinations and a D128 control.
+
+A randomized 80-sample same-stream comparison of exact baseline/candidate code objects regressed all six representative cases and fell `0.349%` geometrically. The earlier separate-process focused run was more negative because of cross-run clock drift. The candidate therefore failed before the complete-matrix gate. Production source restores the Phase 10A load/barrier schedule. Artifacts are `~/tmp/feather_attn/phase10d_vload_*` and `phase10_paired_robust.*`.
 
 #### Deprioritized Phase 10 Work
 
@@ -753,13 +771,12 @@ CK Tile's async and transpose-load pipelines are scheduling references, not drop
 #### Phase 10 Execution Order And Gates
 
 1. **Done:** bounded D=128 NHD grouping passed traffic, correctness, resource, and complete-matrix gates. D=64 grouping was measured and rejected.
-2. Implement persistent linear `(m,l)` for D=64. Re-run correctness, resource metadata, ISA counts, focused PC sampling, and the D=64 matrix.
-3. Attempt D=128 `(m,l)` only if the generated D=64 recurrence is clearly beneficial and a compile fixture indicates no resource-tier regression.
-4. Test one D=64 Q-decode/dependency experiment at a time.
-5. Revisit barrier/waitcnt placement after the recurrence and decode schedules settle.
-6. Stop when a candidate fails its resource, correctness, or repeatable timing gate. Do not combine failed ideas to hide their individual attribution.
+2. **Rejected:** persistent linear `(m,l)` for D=64 passed focused correctness/resources and transformed the ISA, but regressed the complete D=64 matrix. D=128 was not attempted.
+3. **Done:** one D=64 decoded-Q fragment cached across key tiles passes for HND. The NHD specialization retains the Phase 10A schedule.
+4. **Rejected:** moving D64 V global loads before the K-to-V LDS barrier preserved correctness/resources and changed ISA scheduling, but regressed the focused timing set.
+5. **Stop:** Phase 10A and the HND-only Phase 10C cache are the accepted production changes. The remaining modeled on-chip candidates failed their independent timing gates.
 
-Phase 10A is the production baseline while later Phase 10 candidates are evaluated independently against it.
+Phase 10A plus the HND-only Phase 10C cache form the completed production baseline. Rejected candidates remain documented with their independent attribution.
 
 ## Stop Rules
 
@@ -821,9 +838,9 @@ Add one row per isolated experiment. Include links or paths to profile artifacts
 | R10b | Done | Long-NHD Feather/AITER traffic and roofline profile at `H=32,N=16384` | Read-only review; no kernel change | Qualified Phase 9 resources | D64 Feather `22.584 TFLOPS`, `174.64 GB/s` | D128 Feather `22.306 TFLOPS`, `171.56 GB/s` | Confirm no-reuse K/V stream and grouping opportunity |
 | R10c | Done | FlashAttention-CK LLC grouping policy model for gfx1151 | Source/model review | No kernel change | Candidate groups bounded by 32 MiB LLC | CK eight-group floor can exceed LLC at `H=56,N=16384,D=128` | Test bounded grouping, not unrestricted head-major order |
 | F10a | Done | D=128-only bounded LLC-aware NHD head groups; D64 grouping rejected | 168/168 contract; grouped output bit-identical to ungrouped | 191 used/192 allocated max; 32 KiB LDS; zero private/spills | D128 NHD `0.972-1.171x` AITER | D128 NHD up to `1.376x` AITER; H32/N16384 traffic `31.435 -> 14.822 GiB` | Accept as production baseline; retain one launch for D64 |
-| F10b | Planned | Persistent linear online `(m,l)` state, D=64 first | Re-run public and baseline-relative numerical gates | D64 must remain within gates; D128 must stay at most 192 VGPRs with zero scratch | Expected `2-6%`, unvalidated | Long and intermediate sequences | Normalize once in epilogue; reject resource-tier regression |
-| F10c | Planned | D=64 decoded-Q/dependency-chain reduction | Re-run D=64 correctness | Aligned HND target at most 168 allocated VGPRs; all tails at most 192 | Expected `1-4%`, unvalidated | D=64 only | Do not apply to D=128 |
-| F10d | Planned | Barrier/waitcnt instruction rescheduling | Full recurrence and phase-order correctness | No second K/V LDS buffer; four correctness barriers retained | Expected `0-3%`, low confidence | Evaluate after F10b/F10c | Keep only with ISA proof and repeatable gain |
+| F10b | Rejected | Persistent linear online `(m,l)`, D=64 | Focused HND/NHD set passes 16/16 | 168 used max; 16 KiB LDS; zero private/spills | Paired focused geometric mean `-0.938%` | One of six paired cases wins; full matrix also negative | Restore Phase 10A recurrence; do not attempt D128 |
+| F10c | Done | Cache one D64 HND decoded-Q fragment across key tiles | 168/168 contract; paired output bit-identical | 172 used max; 16 KiB LDS; zero private/spills | HND paired geometric mean `+1.294%` | All 9 HND rows win `1.07-1.64%`; NHD unchanged | Accept HND only; retain Phase 10A NHD schedule |
+| F10d | Rejected | Hoist D64 V loads before K-to-V LDS barrier | Focused HND/NHD set passes 16/16 | Resources unchanged; 16 KiB LDS; zero private/spills | Paired focused geometric mean `-0.349%` | All six paired cases regress | Restore Phase 10A scheduling |
 
 ## Verification Commands
 
