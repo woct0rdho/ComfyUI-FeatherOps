@@ -144,6 +144,8 @@ struct AttentionKernel
         int32_t n_q;
         int32_t n_kv;
         int32_t num_heads;
+        int32_t head_start;
+        int32_t launch_heads;
     };
 
     CK_TILE_DEVICE static index_t VLdsOffset(index_t d_row, index_t n_chunk)
@@ -195,8 +197,9 @@ struct AttentionKernel
         index_t kv_head_offset;
         if constexpr(kNHD)
         {
-            const index_t head       = block % kargs.num_heads;
-            const index_t tile_batch = block / kargs.num_heads;
+            const index_t local_head = block % kargs.launch_heads;
+            const index_t head       = kargs.head_start + local_head;
+            const index_t tile_batch = block / kargs.launch_heads;
             q_tile                   = tile_batch % q_tiles;
             const index_t batch      = tile_batch / q_tiles;
             q_head_offset =
@@ -477,7 +480,9 @@ bool LaunchVariant(const LaunchParams& params)
         q_scale_log2,
         params.n_q,
         params.n_kv,
-        params.num_heads};
+        params.num_heads,
+        params.head_start,
+        params.launch_heads};
     const auto kernel = ck_tile::make_kernel<8, ck_tile::gfx115_t>(
         Kernel{},
         dim3(params.grid_size),

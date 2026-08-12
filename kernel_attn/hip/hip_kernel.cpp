@@ -86,6 +86,24 @@ Launcher SelectLauncher(int64_t head_dim, bool nhd, bool pad_q, bool pad_kv)
                : feather_attn::feather_attn_hnd_d128_aligned;
 }
 
+int64_t ResolveNhdHeadGroupSize(int64_t heads, int64_t n_kv, int64_t head_dim)
+{
+    if(head_dim != 128)
+        return heads;
+
+    constexpr __int128 kLlcBytes = static_cast<__int128>(32) * 1024 * 1024;
+    const __int128 kv_bytes_per_head =
+        static_cast<__int128>(n_kv) * head_dim * 2 * sizeof(half_bits_t);
+    const __int128 total_kv_bytes = static_cast<__int128>(heads) * kv_bytes_per_head;
+    if(total_kv_bytes * 2 < kLlcBytes * 3 || kv_bytes_per_head > kLlcBytes)
+        return heads;
+
+    const int64_t group_size = static_cast<int64_t>(kLlcBytes / kv_bytes_per_head);
+    if(group_size < 4 || group_size >= heads)
+        return heads;
+    return group_size;
+}
+
 } // namespace
 
 void AttnFp16Feather(
@@ -152,20 +170,36 @@ void AttnFp16Feather(
     void* raw_stream = nullptr;
     TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
     const auto stream = reinterpret_cast<hipStream_t>(raw_stream);
-    const feather_attn::LaunchParams params{
-        q.const_data_ptr(),
-        k.const_data_ptr(),
-        v.const_data_ptr(),
-        o.mutable_data_ptr(),
-        static_cast<int32_t>(n_q),
-        static_cast<int32_t>(n_kv),
-        static_cast<int32_t>(heads),
-        static_cast<uint32_t>(grid_size),
-        stream};
+    const int64_t group_size = nhd ? ResolveNhdHeadGroupSize(heads, n_kv, d) : heads;
+    const Launcher launcher =
+        SelectLauncher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0);
 
     (void)hipGetLastError();
-    const bool launched =
-        SelectLauncher(d, nhd, n_q % 128 != 0, n_kv % 64 != 0)(params);
+    bool launched = true;
+    for(int64_t head_start = 0; head_start < heads; head_start += group_size)
+    {
+        const int64_t launch_heads =
+            group_size < heads - head_start ? group_size : heads - head_start;
+        const __int128 grouped_grid_size =
+            static_cast<__int128>(batch) * launch_heads * q_tiles;
+        const feather_attn::LaunchParams params{
+            q.const_data_ptr(),
+            k.const_data_ptr(),
+            v.const_data_ptr(),
+            o.mutable_data_ptr(),
+            static_cast<int32_t>(n_q),
+            static_cast<int32_t>(n_kv),
+            static_cast<int32_t>(heads),
+            static_cast<int32_t>(head_start),
+            static_cast<int32_t>(launch_heads),
+            static_cast<uint32_t>(grouped_grid_size),
+            stream};
+        if(!launcher(params))
+        {
+            launched = false;
+            break;
+        }
+    }
     const hipError_t launch_error = hipGetLastError();
     STD_TORCH_CHECK(launched && launch_error == hipSuccess,
                     "FeatherAttn launch failed: ",
