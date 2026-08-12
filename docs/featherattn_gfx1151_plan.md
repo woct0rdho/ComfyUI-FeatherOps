@@ -23,6 +23,8 @@ The accepted implementation has one block shape and two head-dimension specializ
 
 Do not add another block size, an autotune table, or a generalized FeatherAttn policy matrix without a separate measured justification. Tail support and the D=64/D=128 specializations share this block shape.
 
+The correctness, resource, and two-layout performance qualification through Phase 9 is complete. Phase 10 is the active post-qualification optimization campaign. Its priorities are bounded NHD LLC grouping, linear online-softmax state, and D=64 dependency-chain reduction. These are proposals until their individual acceptance gates pass; the Phase 9 implementation remains the production baseline.
+
 ## Objective
 
 Refactor the current HIP attention implementation into an AITER-style, row-owned FlashAttention dataflow while using FP8 E5M2 to keep Q compact in LDS. Implement the device pipeline with selected CK Tile compile-time tensor, layout, and WMMA facilities, but retain the existing raw HIP/PyTorch integration boundary and low-level gfx11 escape hatches. The intended gain on gfx1151 is higher occupancy from lower VGPR pressure, not higher low-precision WMMA throughput. gfx1151 has no FP8 WMMA path that is useful for this kernel, so every Q fragment is expanded to FP16 immediately before an FP16 WMMA.
@@ -41,7 +43,7 @@ out = softmax(Q @ K^T / sqrt(head_dim)) @ V
 
 ### Supported Shape And Indexing Contract
 
-The public FP16 operation supports every positive `num_heads`, `head_dim` in `{64,128}`, and every positive sequence length representable by the input tensors and the checked 32-bit address/launch arithmetic. Head count only scales grid X and uniform base offsets; `{16,32,56}` are benchmark targets rather than dispatch restrictions. Sequence length need not divide 64 or 128. The fixed kernel uses guarded query and key tails; block size is an implementation detail rather than an API restriction.
+The public FP16 operation supports every positive `num_heads`, `head_dim` in `{64,128}`, and every positive sequence length representable by the input tensors and the checked 32-bit address/launch arithmetic. It accepts contiguous HND `[B,H,N,D]` and NHD `[B,N,H,D]` tensors through the explicit `layout="HND"` or `layout="NHD"` argument, with HND as the compatibility default. Q, K, V, and output use the same selected layout; no physical transpose is performed. Head count only scales grid X, layout-specific strides, and uniform base offsets; `{16,32,56}` are benchmark targets rather than dispatch restrictions. Sequence length need not divide 64 or 128. The fixed kernel uses guarded query and key tails; block size is an implementation detail rather than an API restriction.
 
 Use 32-bit pointer-offset arithmetic, tile counters, and loop indices inside the optimized device path whenever their complete range is proven safe. The host launcher must perform the proof with wider arithmetic before narrowing. For every Q/K/V/O tensor, compute the maximum reachable offset from its sizes and actual strides, account for element size if an intermediate is a byte offset, and require every product or sum formed in 32-bit device code to fit signed `int32_t`. Also validate ceiling-divided grid dimensions before narrowing. Use overflow-safe ceiling division such as `n / tile + (n % tile != 0)` rather than `(n + tile - 1) / tile` in a narrow type.
 
@@ -252,7 +254,7 @@ P remains FP16. Packing P as E5M2 does not remove long-lived state in this dataf
 
 Maintain eight FP32 output fragments per wave for the full key loop. Before each PV update, multiply all output fragments by `alpha`. Each P fragment is reused across all eight D output tiles while FP16 V fragments are read from the shared KV region.
 
-At the end, divide each output value by its distributed row sum and store FP16 directly in `[B, H, N, D]` layout. Do not round-trip output accumulators through LDS.
+At the end, divide each output value by its distributed row sum and store FP16 directly in the selected HND `[B,H,N,D]` or NHD `[B,N,H,D]` layout. Do not round-trip output accumulators through LDS.
 
 ### Synchronization Budget
 
@@ -317,21 +319,21 @@ For `N_KV < 1024`, the separately qualified gate is `abs(out - ref) <= 0.10 * ab
 
 ### File-Level Changes
 
-`kernel_attn/hip/featherattn_kernel.h` contains the shared D=64/D=128 CK Tile device template, E5M2 Q helpers, K/V LDS layouts, online softmax, tied gfx11 WMMA wrapper, and checked launch helper.
+`kernel_attn/hip/featherattn_kernel.h` contains the shared D=64/D=128 and HND/NHD CK Tile device template, E5M2 Q helpers, K/V LDS layouts, online softmax, tied gfx11 WMMA wrapper, and checked launch helper. Layout is compile-time specialized so global address selection adds no runtime branch to the load/store loops.
 
-`kernel_attn/hip/featherattn_launch.h` defines only the compact launch argument structure and eight specialization declarations. It keeps CK Tile and Torch out of the host/kernel ABI boundary.
+`kernel_attn/hip/featherattn_launch.h` defines only the compact launch argument structure and 16 specialization declarations. It keeps CK Tile and Torch out of the host/kernel ABI boundary.
 
-`kernel_attn/hip/featherattn_{aligned,query_tail,key_tail,query_key_tail}.cu` each instantiate one tail mode for D=64 and D=128. Keeping tail modes in separate translation units permits four concurrent hipcc jobs and limits recompilation after local changes.
+`kernel_attn/hip/featherattn_{aligned,query_tail,key_tail,query_key_tail}.cu` each instantiate one tail mode for D=64/D=128 and HND/NHD. Keeping tail modes in separate translation units permits four concurrent hipcc jobs and limits recompilation after local changes.
 
 `kernel_attn/hip/hip_kernel.cpp` owns stable Torch registration, dtype/device/layout/shape checks, wide host arithmetic, head-dimension and tail dispatch, and explicit launch errors. It is host-only so Torch and CK Tile HIP headers do not collide.
 
 `kernel/hip/utils.py` accepts multiple extension sources plus extension-specific host and HIP flags. Linux retains the normal HIP wrapper; Windows alone uses the validated `-nohipwrapperinc` workaround.
 
-`kernel_attn/hip/hip_kernel.py` builds the direct-only extension against `FEATHEROPS_CK_TILE_ROOT` or the default CK checkout and exposes only `attn_hip -> feather_attn_internal::attn_fp16`. CK Tile is an unconditional compile-time dependency: unavailable headers fail the extension build instead of producing an empty extension with a runtime error path.
+`kernel_attn/hip/hip_kernel.py` builds the direct-only extension against `FEATHEROPS_CK_TILE_ROOT` or the default CK checkout and exposes `feather_attn(q,k,v,layout="HND")`. CK Tile is an unconditional compile-time dependency: unavailable headers fail the extension build instead of producing an empty extension with a runtime error path.
 
-`test_attn_hip.py` covers both dimensions, benchmark and arbitrary head counts, short/aligned/tail lengths, independent Q/KV lengths, batch greater than one, int32 boundaries, and expected rejection cases.
+`test_attn_hip.py` compares against AITER in both physical layouts and covers both dimensions, benchmark and arbitrary head counts, short/aligned/tail lengths, independent Q/KV lengths, and batch greater than one. HND is exposed to AITER as a zero-copy NHD logical view; no reference transpose copy is included.
 
-`benchmark_attn_hip.py` compares AITER and FeatherAttn across head dimensions, heads `{16,32,56}`, and lengths `{4096,8192,16384}`. The `FEATHER_ATTN_BENCH_HEAD_DIMS` environment variable filters the head-dimension axis.
+`benchmark_attn_hip.py` compares AITER and FeatherAttn across layouts, head dimensions, heads `{16,32,56}`, and lengths `{4096,8192,16384}`. `FEATHER_ATTN_BENCH_LAYOUTS` and `FEATHER_ATTN_BENCH_HEAD_DIMS` filter the corresponding axes.
 
 ### Phase 0: Freeze Controls (Complete)
 
@@ -476,22 +478,7 @@ Acceptance gates:
 
 The expected opportunity is approximately 3-10%, not the nominal 33% increase from six to eight resident waves. Added Q LDS traffic and permutation issue can consume part of the occupancy gain. If the qualified kernel remains slower than AITER after scheduling work, stop rather than adding FP8 K/P/V complexity.
 
-A preliminary `triton.testing.do_bench` matrix reports FeatherAttn wins on all six aligned shapes: `7.1%` and `8.8%` at `H=16`, `37.5%` and `47.8%` at `H=32`, and `24.8%` and `20.9%` at `H=56` for `S=4096` and `8192`, respectively. These are directional results, not final qualification: Triton's `rep=30` argument is a millisecond budget, so the long-shape p20/p80 values collapsed to a single timed sample. Repeat the matrix with 30 explicit HIP-event measurements per provider before accepting these numbers. The preliminary artifact is `~/tmp/feather_attn/phase5/aligned_matrix.json`.
-
-The explicit event-based matrix used five warmups and 30 independently timed launches per provider and passes every aligned timing gate:
-
-| H | S | AITER median ms (p20-p80) | FeatherAttn median ms (p20-p80) | FeatherAttn speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 16 | 4096 | 4.347 (4.308-4.385) | 4.141 (4.101-4.213) | 5.0% |
-| 16 | 8192 | 17.947 (17.758-18.058) | 16.582 (16.433-16.686) | 8.2% |
-| 32 | 4096 | 10.400 (10.273-10.668) | 8.071 (8.027-8.153) | 28.9% |
-| 32 | 8192 | 50.164 (49.385-50.895) | 32.435 (32.176-32.827) | 54.7% |
-| 56 | 4096 | 17.645 (17.583-17.707) | 14.074 (14.021-14.162) | 25.4% |
-| 56 | 8192 | 68.707 (68.636-68.991) | 56.153 (55.783-56.387) | 22.4% |
-
-These timings include fused Q conversion. The final direct shell removed the legacy temporary FP8 allocations. Raw samples and extrema are in `~/tmp/feather_attn/phase5/aligned_matrix_events.json`.
-
-After the `4096/8192` matrix passed, the standard benchmark surface was extended to `S=16384`. With the same five-warmup/30-event protocol, FeatherAttn measures `65.221 ms` versus AITER `91.135 ms` at `H=16` (`39.7%` faster), `131.495 ms` versus `203.903 ms` at `H=32` (`55.1%` faster), and `229.407 ms` versus `273.443 ms` at `H=56` (`19.2%` faster). The corresponding p20-p80 intervals are `64.657-65.424`, `130.737-132.147`, and `228.598-230.557 ms` for FeatherAttn. `benchmark_attn_hip.py` now covers all nine `{16,32,56} x {4096,8192,16384}` shapes; raw `16384` samples are in `~/tmp/feather_attn/phase6/benchmark_16384_events.json`.
+Historical Phase 5/6 event matrices qualified the transposed-score HND core and justified extending the benchmark surface to `S=16384`. Their raw samples remain under `~/tmp/feather_attn/phase5/` and `phase6/`, but their full tables are superseded by the final two-layout matrix in Phase 9.
 
 PyTorch `scaled_dot_product_attention` cannot serve as the production-shape oracle in the current PyTorch/ROCm environment: it returns `hipErrorInvalidValue` before FeatherAttn launches for all six aligned shapes. Preserve that failed-oracle artifact at `~/tmp/feather_attn/phase5/aligned_public_correctness.json`; do not classify it as a FeatherAttn correctness failure. Use chunked FP32 `QK -> softmax -> PV` reference computation for the final elementwise gate so the full attention matrix is never materialized.
 
@@ -518,7 +505,7 @@ Representative direct D=128 tail-kernel checks for `(N_Q,N_KV)` in `{(1,1),(16,1
 
 Long-tail public validation also passes with zero failed elements for `(H,N_Q,N_KV)` equal to `(16,4095,4095)`, `(16,4097,4097)`, `(16,4096,1025)`, `(32,1500,1024)`, `(32,8800,8800)`, and `(56,5302,5302)`. This covers combined tails, an independent KV tail, an independent query tail, and real LTX/H3 shapes. Relative L2 stays between `0.05344` and `0.05365`; maximum absolute error is at most `0.04676`, and the worst tolerance ratio is `0.729`. Full metrics are in `~/tmp/feather_attn/phase6/long_tail_correctness.json`.
 
-The final repository public-contract test passes `84/84` cases across D=64 and D=128. It covers benchmark heads at `257`, `4096`, and `8192`; general head counts `{1,2,3,4,7,24,30,40,48}`; short lengths from `1` upward; the `1023/1024/1025` accuracy-gate boundary; independent query/KV tails; query and KV tile boundaries; and `B=2`. It also verifies explicit rejection of unsupported head dimensions, dtypes, and non-contiguous layouts.
+The final repository public-contract test passes `168/168` AITER-backed cases across HND/NHD and D=64/D=128. It covers benchmark heads at `257`, `4096`, and `8192`; general head counts `{1,2,3,4,7,24,30,40,48}`; short lengths from `1` upward; the `1023/1024/1025` accuracy-gate boundary; independent query/KV tails; query and KV tile boundaries; and `B=2`.
 
 Representative tail timing uses five warmups and 30 event samples per provider. FeatherAttn measures `4.538 ms` versus AITER `5.240 ms` at `H=16,N=4097` (`15.5%` faster), `39.544 ms` versus `58.358 ms` at LTX `H=32,N=8800` (`47.6%` faster), and `25.692 ms` versus `32.453 ms` at H3 `H=56,N=5302` (`26.3%` faster). Tail performance is qualified; raw samples are in `~/tmp/feather_attn/phase6/tail_event_benchmarks.json`.
 
@@ -528,7 +515,7 @@ The production host path now proves every reachable FP16 byte offset with `__int
 
 D=64 reuses the accepted `128x64x8` ownership and online-softmax template. It halves Q8 LDS to 8 KiB and phase-reused K/V LDS to 8 KiB, for 16 KiB total. K staging issues two vector loads per thread rather than four. V staging uses the same rotating-shared swizzle but maps the two unused D=128 lane-row groups onto additional N rows and stores two FP16 rows per lane. The D=64 query scale is the exact `log2(e)/sqrt(64)` constant.
 
-The implementation lives in `featherattn_kernel.h`. Four small translation units instantiate aligned, query-tail, KV-tail, and combined-tail pairs for D=64 and D=128; Ninja compiles those units in parallel. The Torch binding is a host-only C++ translation unit and does not parse CK Tile. A clean build and import completed in approximately `7.0 s` with `MAX_JOBS=32`.
+The implementation lives in `featherattn_kernel.h`. Four small translation units instantiate aligned, query-tail, KV-tail, and combined-tail kernels for both dimensions and layouts; Ninja compiles those units in parallel. The Torch binding is a host-only C++ translation unit and does not parse CK Tile. A clean build and import with 16 device specializations completed in approximately `8.4 s` with `MAX_JOBS=32`.
 
 D=64 resource metadata passes every gate:
 
@@ -541,23 +528,239 @@ D=64 resource metadata passes every gate:
 
 The aligned D=64 static body contains 32 FP16 WMMAs, 68 `ds_load_b128`, four `ds_store_b128`, eight `ds_store_b32`, 80 `v_perm_b32`, zero `v_permlane16_b32`, 18 `v_permlanex16_b32`, 34 exponentials, one logarithm, four barriers, and zero `ds_bpermute_b32`. Eight `N_KV=4096` profile dispatches each report 152 allocated VGPRs, 16,384 bytes LDS, zero scratch, `VALUInsts=29979.0`, and `LDSBankConflict=0.0`. Metadata, ISA, and profiler artifacts are under `~/tmp/feather_attn/`.
 
-The combined D=64/D=128 public contract suite passes `84/84` cases. On D=64, aligned production cases have relative L2 `0.0531-0.0547`; the largest long-case absolute error is `0.0419`, and the worst long tolerance ratio is `0.740`. The largest short-case absolute error is `0.144`, with worst tolerance ratio `0.879` under the documented `0.10/0.10` gate.
+The combined HND/NHD and D=64/D=128 public contract suite passes `168/168` cases. Historical D=64-only timing and profiling artifacts remain under `~/tmp/feather_attn/d64_benchmark/`; the current cross-layout performance results are reported once in Phase 9.
 
-The final D=64 event matrix uses five warmups and 30 independently timed launches per provider and beats AITER on all nine target shapes:
+### Phase 9: Native HND/NHD Layouts (Complete)
 
-| H | S | AITER median ms (p20-p80) | FeatherAttn median ms (p20-p80) | FeatherAttn speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 16 | 4096 | 2.172 (2.149-2.182) | 2.091 (2.080-2.146) | 3.9% |
-| 16 | 8192 | 8.493 (8.477-8.529) | 8.347 (8.317-8.385) | 1.7% |
-| 16 | 16384 | 34.102 (34.046-34.209) | 33.332 (33.253-33.421) | 2.3% |
-| 32 | 4096 | 4.544 (4.518-4.552) | 4.198 (4.192-4.216) | 8.2% |
-| 32 | 8192 | 19.088 (18.507-19.652) | 16.660 (16.595-16.762) | 14.6% |
-| 32 | 16384 | 95.529 (94.939-96.124) | 66.798 (66.673-66.905) | 43.0% |
-| 56 | 4096 | 8.259 (8.193-8.372) | 7.340 (7.287-7.359) | 12.5% |
-| 56 | 8192 | 34.151 (34.047-34.315) | 29.175 (29.145-29.254) | 17.1% |
-| 56 | 16384 | 137.747 (136.396-137.998) | 119.429 (118.672-119.559) | 15.3% |
+The public wrapper accepts explicit `HND` and `NHD` layouts. Both keep D innermost and contiguous, so Q/K/V vector loads and output stores retain their existing vector widths. Layout is a compile-time template parameter. HND preserves the original flattened `(batch,head)` ownership and contiguous row stride; NHD decomposes batch/head and uses `num_heads * D` as the sequence-row stride. The four instantiation units now produce 16 kernels across layout, dimension, and tail mode.
 
-The standard benchmark now treats D as an axis and defaults to both `64` and `128`. Set `FEATHER_ATTN_BENCH_HEAD_DIMS=64` or `128` to measure one specialization. Raw D=64 samples are in `~/tmp/feather_attn/d64_benchmark/events.json`; the preliminary budget-based matrix remains beside it for comparison.
+The first correct NHD implementation assigned consecutive grid blocks to query tiles of one head. On power-of-two `H*D` row strides this caused severe memory-partition aliasing; the worst measured point, `D=64,H=32,N=16384`, reached only `4.793 TFLOPS`. The accepted NHD mapping makes head the fastest grid axis, interleaving adjacent head offsets across active workgroups. The same point rises to `22.553 TFLOPS`, and the full NHD matrix becomes competitive with AITER. HND block ordering is unchanged.
+
+All 16 final kernels remain within the resource gates. HND metadata is unchanged. NHD D=64 uses 130 VGPRs for aligned/query-tail and 151 for KV/combined tails; NHD D=128 uses 191 VGPRs for every tail mode. NHD uses 16,384 bytes LDS for D=64 and 32,768 bytes for D=128, with zero private memory and zero SGPR/VGPR spills in every variant.
+
+The final benchmark uses `triton.testing.do_bench` with 25 ms warmup and a 100 ms measurement budget per provider. Inputs are physically contiguous in the row's selected layout. For HND, AITER receives zero-copy transposed views because its interface interprets tensors as NHD; FeatherAttn receives HND directly. Throughput is `4 * B * H * N^2 * D / time`, and the ratio is FeatherAttn throughput divided by AITER throughput. Raw output is under `~/tmp/feather_attn/layout_benchmark/final/`.
+
+#### HND
+
+| D | H | N | AITER TFLOPS | FeatherAttn TFLOPS | Feather / AITER |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 16 | 4096 | 33.779 | 34.762 | 1.029x |
+| 64 | 16 | 8192 | 32.154 | 33.132 | 1.030x |
+| 64 | 16 | 16384 | 31.706 | 32.684 | 1.031x |
+| 64 | 32 | 4096 | 32.752 | 33.829 | 1.033x |
+| 64 | 32 | 8192 | 31.054 | 32.753 | 1.055x |
+| 64 | 32 | 16384 | 29.330 | 32.877 | 1.121x |
+| 64 | 56 | 4096 | 29.752 | 33.083 | 1.112x |
+| 64 | 56 | 8192 | 28.669 | 32.654 | 1.139x |
+| 64 | 56 | 16384 | 29.092 | 33.013 | 1.135x |
+| 128 | 16 | 4096 | 35.019 | 34.032 | 0.972x |
+| 128 | 16 | 8192 | 32.479 | 33.154 | 1.021x |
+| 128 | 16 | 16384 | 31.884 | 33.639 | 1.055x |
+| 128 | 32 | 4096 | 31.553 | 34.570 | 1.096x |
+| 128 | 32 | 8192 | 30.660 | 33.315 | 1.087x |
+| 128 | 32 | 16384 | 30.756 | 34.443 | 1.120x |
+| 128 | 56 | 4096 | 28.917 | 33.700 | 1.165x |
+| 128 | 56 | 8192 | 29.855 | 33.180 | 1.111x |
+| 128 | 56 | 16384 | 30.574 | 34.399 | 1.125x |
+
+#### NHD
+
+| D | H | N | AITER TFLOPS | FeatherAttn TFLOPS | Feather / AITER |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 16 | 4096 | 32.804 | 32.601 | 0.994x |
+| 64 | 16 | 8192 | 32.044 | 31.360 | 0.979x |
+| 64 | 16 | 16384 | 32.026 | 31.204 | 0.974x |
+| 64 | 32 | 4096 | 31.057 | 31.048 | 1.000x |
+| 64 | 32 | 8192 | 28.517 | 29.866 | 1.047x |
+| 64 | 32 | 16384 | 22.933 | 22.553 | 0.983x |
+| 64 | 56 | 4096 | 29.143 | 30.747 | 1.055x |
+| 64 | 56 | 8192 | 27.870 | 29.572 | 1.061x |
+| 64 | 56 | 16384 | 28.193 | 29.860 | 1.059x |
+| 128 | 16 | 4096 | 31.736 | 30.862 | 0.972x |
+| 128 | 16 | 8192 | 30.291 | 30.885 | 1.020x |
+| 128 | 16 | 16384 | 23.565 | 25.010 | 1.061x |
+| 128 | 32 | 4096 | 26.290 | 28.430 | 1.081x |
+| 128 | 32 | 8192 | 22.097 | 23.943 | 1.084x |
+| 128 | 32 | 16384 | 21.521 | 22.293 | 1.036x |
+| 128 | 56 | 4096 | 26.945 | 27.243 | 1.011x |
+| 128 | 56 | 8192 | 27.565 | 27.068 | 0.982x |
+| 128 | 56 | 16384 | 28.409 | 27.657 | 0.974x |
+
+### Phase 10: Post-Qualification Performance Review And Optimization Plan
+
+The post-qualification review compared FeatherAttn with the active AITER Triton path, CK Tile FMHA pipelines, FlashAttention-CK head grouping, and the SageAttention optimization history. No production implementation files were changed during the review. The main artifacts are under `~/tmp/feather_attn/review/`.
+
+#### Roofline And Long-NHD Findings
+
+Use three separate traffic quantities in all future reports:
+- useful unique tensor bytes: one read of Q/K/V and one write of O;
+- schedule-implied bytes: Q once, K/V once per 128-row query CTA, and O once;
+- measured memory-controller traffic from `FETCH_SIZE` or the equivalent GCEA read-size counter.
+
+Do not infer byte traffic from `L2CacheHit`. It is a request-based percentage. `FETCH_SIZE` is measured controller traffic and includes cache and transaction effects.
+
+For a `128x64` CTA, the dominant dense-attention work and K/V stream are:
+
+```text
+FLOPs per CTA = 4 * 128 * N_KV * D
+K/V bytes     = 4 * N_KV * D
+intensity     = 128 FLOP/byte
+```
+
+The no-cross-CTA-reuse memory roof is therefore approximately `32.8 TFLOPS` at the theoretical `256 GB/s` memory ceiling. This is distinct from the `59.4 TFLOPS` FP16 WMMA ceiling.
+
+The isolated long-NHD profile used `B=1,H=32,N=16384`, two warmups, and final-two-dispatch medians. Its traffic pass is self-consistent: timing and traffic come from the same dispatches.
+
+| Provider | D | Time | Measured fetch | Achieved bandwidth | Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FeatherAttn | 64 | 97.372 ms | 15.837 GiB | 174.64 GB/s | 22.584 TFLOPS |
+| AITER | 64 | 95.807 ms | 15.675 GiB | 175.68 GB/s | 22.953 TFLOPS |
+| FeatherAttn | 128 | 197.169 ms | 31.504 GiB | 171.56 GB/s | 22.306 TFLOPS |
+| AITER | 128 | 203.680 ms | 31.840 GiB | 167.85 GB/s | 21.593 TFLOPS |
+
+For FeatherAttn, useful Q/K/V/O bytes are only `0.250 GiB` for D=64 and `0.500 GiB` for D=128. The schedule-implied Q plus repeated K/V reads are `16.062 GiB` and `32.125 GiB`. Measured fetch is close to that schedule, so the long NHD mapping obtains effectively no cross-CTA K/V reuse. Request-based L2 hit rates are only about `2.0-2.3%` for D=64 and `2.7-2.9%` for D=128.
+
+The GCEA `RDRAM_SIZE_REQ` pass independently reports approximately `174.5 GB/s` for FeatherAttn D=64, using ROCm's documented `32 * GCEA_RDRAM_SIZE_REQ / duration` formula. This corroborates `FETCH_SIZE`. The per-instance GCEA bank and system-arbiter event descriptions are blank, so they must not be used to claim a specific partition-aliasing mechanism without a controlled schedule A/B test.
+
+Long-grid occupancy counters are duration-averaged, not static residency limits. The long FeatherAttn grid has 4,096 workgroups and reports approximately `99.6%` SIMD utilization while measured occupancy falls to about `25%` for D=64 and `12%` for D=128. Static resources still permit the already-qualified residency point; the lower duration average does not justify an occupancy redesign by itself.
+
+#### On-Chip Attribution
+
+Static aligned ISA shows a substantial D-independent loop cost:
+
+| Variant | Instructions | WMMA | Exp | Log | Rcp | LDS loads | Permutations | Barriers | Waits |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HND D=64 | 1,175 | 32 | 34 | 1 | 2 | 68 | 80 | 4 | 50 |
+| HND D=128 | 1,949 | 64 | 34 | 1 | 2 | 136 | 128 | 4 | 94 |
+| NHD D=64 | 1,334 | 32 | 34 | 1 | 3 | 68 | 80 | 4 | 50 |
+| NHD D=128 | 2,060 | 64 | 34 | 1 | 3 | 136 | 128 | 4 | 94 |
+
+NHD adds no branch to the core key loop. Its extra static work is principally block decomposition, address construction, scalar work, and scheduling delays.
+
+At `H=16,N=4096`, FeatherAttn executes `1.264x/1.537x` AITER's VALU instructions for HND D=64/D=128 and `1.296x/1.557x` for NHD. AITER uses the same active `128x64`, eight-wave geometry on gfx1151, so it is a useful instruction-schedule control even though its HND memory traffic is not cache-equivalent.
+
+PC sampling for FeatherAttn HND shows:
+- D=64: `36.03%` other VALU, `25.35%` LDS reads, `14.03%` synchronization, `9.94%` WMMA, `7.11%` conversion, and `5.76%` transcendental samples;
+- D=128: `31.87%` LDS reads and `14.63%` WMMA, with `38.41%` ALU-dependency and `14.93%` waitcnt stalls.
+
+`ALUStalledByLDS` is only `0.024-0.043%`, and LDS issue waits stay below `0.08%` of wave cycles. The sampled LDS stalls are predominantly dependent-address or dependent-data waits, not an LDS queue-full condition. Optimize dependency chains and load/use distance before adding deeper prefetch.
+
+Barrier waits are approximately `12.1%/4.8%` of wave cycles for HND D=64/D=128 and `12.1%/5.4%` for NHD. Wait-count stalls are approximately `10.1%/21.3%` for HND and `11.4%/30.7%` for NHD. D=128 therefore has more waitcnt exposure but almost no register headroom for buffering.
+
+#### Optimization 10A: Bounded LLC-Aware NHD Grouping
+
+This is the highest-priority memory optimization. Keep the accepted head-fast NHD mapping as the baseline. Test a bounded head/query-tile grouping policy that restores same-head K/V reuse without concentrating all concurrently active CTAs on one head.
+
+Use FlashAttention-CK's RDNA policy as the starting model:
+
+```text
+per_head_KV_bytes = N_KV * (D_K * sizeof(K) + D_V * sizeof(V))
+                  = 4 * N_KV * D for FP16 MHA
+nominal_group     = floor(LLC_bytes / per_head_KV_bytes)
+```
+
+On gfx1151, use a 32 MiB LLC budget. Representative H=32 groups are:
+
+| N | D | Per-head K/V | Candidate heads/group | Groups | Group K/V set |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | 128 | 2 MiB | 16 | 2 | 32 MiB |
+| 8192 | 64 | 2 MiB | 16 | 2 | 32 MiB |
+| 8192 | 128 | 4 MiB | 8 | 4 | 32 MiB |
+| 16384 | 64 | 4 MiB | 8 | 4 | 32 MiB |
+| 16384 | 128 | 8 MiB | 4 | 8 | 32 MiB |
+
+Do not copy CK's maximum-eight-groups floor unconditionally. For `H=56,N=16384,D=128`, that floor produces seven heads per group and a 56 MiB K/V working set, which exceeds this GPU's LLC. Prefer an LLC-resident smaller group even when it creates more than eight groups, or disable grouping if launch overhead outweighs locality.
+
+The device kernel and tile remain unchanged. The host or grid decomposition may add a group descriptor or a bounded swizzle, but it must retain signed-int32 proofs and independent tail/layout specialization. Candidate mappings must maintain several head offsets among concurrently scheduled CTAs; an unrestricted head-major swizzle is rejected because the original query-tile-fast NHD schedule already demonstrated severe partition aliasing.
+
+Measure candidate group sizes `{4,8,16}` only where the complete group K/V set fits the LLC budget. For each candidate record:
+- benchmark median and p20/p80 interval;
+- `FETCH_SIZE` and GCEA read bandwidth from isolated passes;
+- request-based `L2CacheHit` without converting it to bytes;
+- GCEA per-instance bank/arbiter counters only as comparative diagnostics;
+- SIMD utilization and resource metadata;
+- all 36 authoritative benchmark rows after a candidate passes its focused cases.
+
+Expected, unvalidated range: `0-5%` for cases already near HND performance and `5-15%` for the worst long/intermediate NHD regimes. HND throughput is an empirical upper reference, not a guaranteed grouped-NHD result. Reject a mapping that improves one power-of-two head/stride case but regresses another supported head count by more than the Phase 6 policy.
+
+#### Optimization 10B: Persistent Linear Online `(m,l)` State
+
+FeatherAttn currently reconstructs a log-domain state on every key tile:
+
+```text
+old_term  = exp2(old_lse - new_max)
+tile_term = exp2(tile_max - new_max)
+combined  = old_term + tile_term * tile_sum
+alpha     = old_term / combined
+beta      = tile_term / combined
+lane_lse  = new_max + log2(combined)
+```
+
+Replace this with the AITER/FlashAttention linear online state:
+
+```text
+new_max = max(running_max, tile_max)
+alpha   = exp2(running_max - new_max)
+beta    = exp2(tile_max - new_max)
+running_sum = alpha * running_sum + beta * tile_sum
+output      = alpha * output + beta * P @ V
+running_max = new_max
+```
+
+Normalize output once in the epilogue with `rcp(running_sum)`. If probabilities remain `exp2(score - tile_max)`, multiplying P by `beta` still requires two state exponentials per tile. To reach AITER's 33-exponential structure, form P directly as `exp2(score - new_max)` and keep only `alpha = exp2(running_max - new_max)`. The exact generated dataflow, not source-level algebra, determines whether the second state exponential is actually removed.
+
+The primary target is to remove the per-key-tile logarithm and reciprocal and shorten the serial softmax/update chain. A secondary target is reducing 34 exponentials to 33 without increasing reduction or broadcast cost. The 32 probability exponentials remain. Treat the standalone expected gain as `2-6%`, not as removal of the whole softmax cost.
+
+Implement and qualify D=64 first. It has material register headroom. The state changes from one persistent `lane_lse` scalar to at least `running_max` plus `running_sum`, approximately one additional persistent scalar before compiler scheduling. D=128 is already at 191 used/192 allocated VGPRs. Do not retain the D=128 variant if it exceeds 192 allocated VGPRs, creates any private/scratch memory, spills, or requires less favorable LDS/wave residency.
+
+Correctness must be rerun because changing the recurrence can alter rounding and all-masked/initial-state behavior. Preserve the public tolerance gates and compare relative L2 and maximum normalized tolerance ratio against the Phase 9 baseline, not only AITER.
+
+#### Optimization 10C: D=64 Q Decode And Dependency Reduction
+
+D=64 has 136 allocated VGPRs in aligned NHD and 152 in aligned HND, zero measured LDS bank conflicts, and proportionally more fixed softmax/conversion work than D=128. It is the only dimension where selective Q-fragment caching or a longer-lived decoded fragment is currently reasonable.
+
+Test one narrowly scoped change at a time:
+- retain one decoded FP16 Q fragment across its four QK WMMAs while consuming and overwriting it promptly;
+- increase independent work between each Q LDS load and first use;
+- simplify/rematerialize Q and K LDS addresses to reduce dependent `ds_load_b128` issue;
+- interleave Q decode permutations with independent K loads and WMMAs without adding another K/V buffer.
+
+The purpose is to reduce dependency stalls and selected loads/permutations, not merely to increase nominal prefetch depth. Expected, unvalidated gain is `1-4%` for D=64. Reject the experiment if aligned HND exceeds 168 allocated VGPRs, any tail exceeds 192, bank conflicts appear, or the complete D=64 matrix regresses.
+
+Do not generalize Q caching to D=128. Its 191-VGPR result makes an eight-register decoded fragment incompatible with the current resource contract.
+
+#### Optimization 10D: Barrier And Waitcnt Scheduling
+
+Evaluate this only after 10B and the D=64 portion of 10C, because both can change the dependency graph. Keep the single phase-reused K/V LDS buffer and the four correctness barriers. Do not remove a barrier unless a formal producer/consumer argument covers all eight waves and the next overwrite phase.
+
+Permitted experiments are instruction scheduling changes:
+- move independent pointer arithmetic before LDS waits;
+- start address construction for the next phase while current WMMA work is independent;
+- increase legal LDS load/use distance;
+- replace overly conservative compiler waits only when ISA inspection and repeated correctness tests prove the narrower wait is valid.
+
+CK Tile's async and transpose-load pipelines are scheduling references, not drop-in replacements. A second K/V buffer would exceed the D=128 32 KiB LDS budget and is outside this campaign. Expected gain is `0-3%` with low confidence.
+
+#### Deprioritized Phase 10 Work
+
+- Deep K/V prefetch is secondary because SIMD utilization is already high and LDS queue-full pressure is negligible.
+- Split-K/split-sequence remains conditional on low-grid, long-K workloads. The profiled long grid already has 4,096 CTAs and is traffic-bound.
+- Additional block shapes and a broad autotuner remain outside scope.
+- FP8 K, V, or P remain unjustified because they add conversion work without removing the persistent state that motivated Q8.
+- D=128 Q caching is outside the resource envelope.
+- Targeted AITER/NHD PC sampling is optional and should be run only if a candidate changes attribution that existing traffic, SQ, and occupancy counters cannot explain.
+
+#### Phase 10 Execution Order And Gates
+
+1. Prototype bounded NHD grouping without changing the device key loop. Start with `H=32,N in {8192,16384},D in {64,128}` and include `H=56,N=16384,D=128` as the over-capacity policy case.
+2. Retain grouping only if measured controller traffic falls and focused timing improves without a supported-head regression. Then run the 36-case matrix and layout bit-equivalence tests.
+3. Implement persistent linear `(m,l)` for D=64. Re-run correctness, resource metadata, ISA counts, focused PC sampling, and the D=64 matrix.
+4. Attempt D=128 `(m,l)` only if the generated D=64 recurrence is clearly beneficial and a compile fixture indicates no resource-tier regression.
+5. Test one D=64 Q-decode/dependency experiment at a time.
+6. Revisit barrier/waitcnt placement after the recurrence and decode schedules settle.
+7. Stop when a candidate fails its resource, correctness, or repeatable timing gate. Do not combine failed ideas to hide their individual attribution.
+
+The production baseline remains the Phase 9 implementation until a Phase 10 candidate passes correctness, resource qualification, focused profiler attribution, and the complete benchmark surface.
 
 ## Stop Rules
 
@@ -611,8 +814,17 @@ Add one row per isolated experiment. Include links or paths to profile artifacts
 | F7d | Done | Wide host arithmetic and checked int32 narrowing | Boundary arithmetic passes | No kernel change | N/A | N/A | Keep mandatory pre-launch checks |
 | F7e | Done | D=128 direct-only public contract suite | 35/35 cases pass; zero failed elements | All D=128 variants | Production and tail cases pass | Production cases pass | D=128 correctness gate complete |
 | F8a | Done | Shared D=64 specialization and four parallel instantiation units | Focused quantized/public checks pass | 146 aligned; 168 max tail / 16,384 / 0 | N/A | N/A | Keep shared template and parallel build |
-| F8b | Done | Combined D=64/D=128 contract suite | 84/84 cases pass; explicit rejection checks pass | All eight variants pass gates | Production and independent tails pass | Production cases pass | Correctness complete |
+| F8b | Done | Combined D=64/D=128 HND contract suite | 84/84 cases pass | All eight HND variants pass gates | Production and independent tails pass | Production cases pass | Superseded by the two-layout F9b suite |
 | F8c | Done | D=64 nine-shape event matrix, 30 samples/provider | Timing only | Aligned: 146 used (152 allocated) / 16,384 / 0; conflicts 0 | Wins `3.9-12.5%` | Wins `1.7-17.1%`; S=16384 wins `2.3-43.0%` | D=64 performance qualified |
+| F9a | Rejected | NHD with query tile as fastest grid axis | Layout equivalence passes | All NHD variants pass resource gates | Mixed | `D64/H32/N16384`: `4.793 TFLOPS` | Reject memory-partition aliasing |
+| F9b | Done | Compile-time HND/NHD with head-interleaved NHD grid | 168/168 AITER-backed cases pass | All 16 variants pass; 191 VGPR max, 32 KiB LDS max, zero private/spills | `0.972-1.165x` vs AITER | `0.979-1.139x`; N=16384 `0.974-1.135x` | Accept both layouts |
+| R10a | Done | Post-qualification static ISA, PC sampling, and 40-pass counter review | Read-only review; no kernel change | Qualified Phase 9 resources | Feather executes `1.264-1.557x` AITER VALU work | Dependency, barrier, waitcnt, and traffic regimes identified | Use findings to order Phase 10 |
+| R10b | Done | Long-NHD Feather/AITER traffic and roofline profile at `H=32,N=16384` | Read-only review; no kernel change | Qualified Phase 9 resources | D64 Feather `22.584 TFLOPS`, `174.64 GB/s` | D128 Feather `22.306 TFLOPS`, `171.56 GB/s` | Confirm no-reuse K/V stream and grouping opportunity |
+| R10c | Done | FlashAttention-CK LLC grouping policy model for gfx1151 | Source/model review | No kernel change | Candidate groups bounded by 32 MiB LLC | CK eight-group floor can exceed LLC at `H=56,N=16384,D=128` | Test bounded grouping, not unrestricted head-major order |
+| F10a | Planned | Bounded LLC-aware NHD head/query grouping | Must preserve layout/correctness contract | Device resources unchanged; checked host/grid arithmetic required | Focus `H=32,N=8192/16384` | Complete matrix after focused pass | Accept only with lower measured traffic and repeatable timing gain |
+| F10b | Planned | Persistent linear online `(m,l)` state, D=64 first | Re-run public and baseline-relative numerical gates | D64 must remain within gates; D128 must stay at most 192 VGPRs with zero scratch | Expected `2-6%`, unvalidated | Long and intermediate sequences | Normalize once in epilogue; reject resource-tier regression |
+| F10c | Planned | D=64 decoded-Q/dependency-chain reduction | Re-run D=64 correctness | Aligned HND target at most 168 allocated VGPRs; all tails at most 192 | Expected `1-4%`, unvalidated | D=64 only | Do not apply to D=128 |
+| F10d | Planned | Barrier/waitcnt instruction rescheduling | Full recurrence and phase-order correctness | No second K/V LDS buffer; four correctness barriers retained | Expected `0-3%`, low confidence | Evaluate after F10b/F10c | Keep only with ISA proof and repeatable gain |
 
 ## Verification Commands
 
@@ -623,7 +835,7 @@ python test_attn_hip.py
 python benchmark_attn_hip.py
 ```
 
-The default benchmark output must contain separate rows for both head dimensions and all 18 `{16,32,56} x {4096,8192,16384}` shapes. The correctness output identifies batch, head count, query length, KV length, and head dimension for every case so tail failures cannot be hidden by an aggregate result.
+The default benchmark output must contain separate rows for both layouts and head dimensions: all 36 `HND/NHD x D{64,128} x {16,32,56} x {4096,8192,16384}` cases. The correctness output identifies layout, batch, head count, query length, KV length, and head dimension for every case so tail failures cannot be hidden by an aggregate result.
 
 Resource and ISA checks must report, for the exact new kernel symbol:
 - used and allocated VGPRs;
@@ -643,6 +855,22 @@ rocprofv3 --kernel-trace --stats \
 
 Use a separate PMC run for occupancy-related counters when required. Single-run profiler durations are metadata aids, not benchmark results.
 
+For traffic-bound investigations, also use isolated passes because rocprofv3 rejects some counter combinations:
+
+```bash
+rocprofv3 --pmc FETCH_SIZE \
+  --kernel-include-regex '<new-kernel-symbol>' \
+  -d <fetch-dir> -o counters --output-format csv -- \
+  python <single-kernel-profile-script>.py
+
+rocprofv3 --pmc GCEA_RDRAM_SIZE_REQ \
+  --kernel-include-regex '<new-kernel-symbol>' \
+  -d <gcea-dir> -o counters --output-format csv -- \
+  python <single-kernel-profile-script>.py
+```
+
+Normalize `GCEA_RDRAM_SIZE_REQ` as 32-byte increments over dispatch duration. Keep `FETCH_SIZE`, GCEA bandwidth, and request-based L2 hit rate as separate reported measurements. Use final dispatches after two warmups and do not combine incompatible counters into one pass.
+
 ## References
 
 - `kernel_attn/hip/featherattn_kernel.h`: shared D=64/D=128 CK Tile implementation and E5M2 helpers.
@@ -660,3 +888,10 @@ Use a separate PMC run for occupancy-related counters when required. Single-run 
 - `~/rocm-libraries/projects/composablekernel/include/ck_tile/ops/gemm/warp/warp_wmma_gemm_gfx11_utils.hpp`: gfx11 WMMA C-to-A permutation reference.
 - `~/rocm-libraries/projects/composablekernel/include/ck_tile/core/arch/mma/wmma/wmma_gfx11.hpp`: gfx11 FP16 WMMA backend.
 - `~/rocm-libraries/projects/composablekernel/include/ck_tile/core/numeric/float8.hpp`: evidence that generic gfx11 BF8 conversion is not the hot-loop decoder.
+- `~/flash-attention/csrc/flash_attn_ck/mha_fwd_head_grouping_utils.hpp`: FlashAttention-CK grouped-forward dispatch integration.
+- `~/flash-attention/csrc/composable_kernel/example/ck_tile/01_fmha/fmha_fwd_head_grouping.hpp`: RDNA LLC sizing, activation threshold, and head-group policy reference.
+- `~/rocm-libraries/projects/composablekernel/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs_async_trload.hpp`: async/load scheduling reference only.
+- `~/sageattention-autotune/docs/qattn_cutlass_fwd_plan.md`: comparison evidence for online denominator state, Q caching, and prefetch tradeoffs.
+- `~/tmp/feather_attn/review/counter_matrix_summary.txt`: normalized HND/NHD Feather/AITER counter matrix.
+- `~/tmp/feather_attn/review/model_grouping_and_roofline.txt`: long-NHD byte accounting, roofline, and grouping model.
+- `~/tmp/feather_attn/review/model_optimization_bounds.txt`: grouped working-set and online-state resource bounds.

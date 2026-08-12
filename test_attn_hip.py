@@ -9,6 +9,7 @@ BATCH = 1
 BENCHMARK_HEAD_COUNTS = (16, 32, 56)
 GENERAL_HEAD_COUNTS = (1, 2, 3, 4, 7, 24, 30, 40, 48)
 HEAD_DIMS = (64, 128)
+LAYOUTS = ("HND", "NHD")
 BENCHMARK_SEQ_LENS = (257, 4096, 8192)
 GENERAL_SEQ_LENS = (
     1,
@@ -54,7 +55,16 @@ def _contract_cases() -> list[tuple[int, int, int, int, int]]:
     return cases
 
 
-def aiter_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def aiter_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout: str,
+) -> torch.Tensor:
+    if layout == "HND":
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
     out, _, _, _ = flash_attn_2.fwd(
         q,
         k,
@@ -69,25 +79,29 @@ def aiter_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tenso
         softcap=0.0,
         return_softmax=False,
     )
-    return out
+    return out.transpose(1, 2) if layout == "HND" else out
 
 
-def test_case(batch: int, heads: int, n_q: int, n_kv: int, head_dim: int, device: str) -> tuple[bool, str]:
+def test_case(
+    batch: int,
+    heads: int,
+    n_q: int,
+    n_kv: int,
+    head_dim: int,
+    layout: str,
+    device: str,
+) -> tuple[bool, str]:
     torch.manual_seed(0)
     q = torch.randn((batch, heads, n_q, head_dim), dtype=torch.float16, device=device)
     k = torch.randn((batch, heads, n_kv, head_dim), dtype=torch.float16, device=device)
     v = torch.randn((batch, heads, n_kv, head_dim), dtype=torch.float16, device=device)
+    if layout == "NHD":
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
 
-    out_ref = (
-        aiter_attn(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-        )
-        .transpose(1, 2)
-        .contiguous()
-    )
-    out_hip = feather_attn(q, k, v)
+    out_ref = aiter_attn(q, k, v, layout)
+    out_hip = feather_attn(q, k, v, layout)
 
     out_ref_f = out_ref.float()
     diff = out_hip.float() - out_ref_f
@@ -107,25 +121,27 @@ def main() -> None:
     cases = _contract_cases()
 
     print("Testing attention HIP public FP16 contract")
-    print(f"benchmark_heads={BENCHMARK_HEAD_COUNTS} general_heads={GENERAL_HEAD_COUNTS} head_dims={HEAD_DIMS} cases={len(cases)}")
-    print("=" * 96)
+    total_cases = len(cases) * len(LAYOUTS)
+    print(f"benchmark_heads={BENCHMARK_HEAD_COUNTS} general_heads={GENERAL_HEAD_COUNTS} head_dims={HEAD_DIMS} layouts={LAYOUTS} cases={total_cases}")
+    print("=" * 112)
 
     failures = []
-    for batch, heads, n_q, n_kv, head_dim in cases:
-        try:
-            passed, msg = test_case(batch, heads, n_q, n_kv, head_dim, device)
-        except (RuntimeError, ValueError) as exc:
-            # Report every unsupported tail instead of stopping at the first one.
-            passed = False
-            msg = f"{type(exc).__name__}: {exc}"
+    for layout in LAYOUTS:
+        for batch, heads, n_q, n_kv, head_dim in cases:
+            try:
+                passed, msg = test_case(batch, heads, n_q, n_kv, head_dim, layout, device)
+            except (AssertionError, RuntimeError, ValueError) as exc:
+                # Report every unsupported tail instead of stopping at the first one.
+                passed = False
+                msg = f"{type(exc).__name__}: {exc}"
 
-        status = "PASS" if passed else "FAIL"
-        print(f"[{status}] B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}: {msg}")
-        if not passed:
-            failures.append((batch, heads, n_q, n_kv, head_dim, msg))
+            status = "PASS" if passed else "FAIL"
+            print(f"[{status}] layout={layout} B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}: {msg}")
+            if not passed:
+                failures.append((layout, batch, heads, n_q, n_kv, head_dim, msg))
 
-    print("=" * 96)
-    print(f"Summary: {len(cases) - len(failures)}/{len(cases)} contract cases passed")
+    print("=" * 112)
+    print(f"Summary: {total_cases - len(failures)}/{total_cases} contract cases passed")
     if failures:
         raise SystemExit(1)
 

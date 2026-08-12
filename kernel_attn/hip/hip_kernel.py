@@ -32,16 +32,28 @@ load_hip_stable_extension(
 
 
 @torch.library.custom_op("feather_attn_internal::attn_fp16", mutates_args=())
-def _feather_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _feather_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: int) -> torch.Tensor:
     out = torch.empty_like(q)
-    torch.ops.feather_attn_fp16.attn_fp16_feather.default(q, k, v, out)
+    torch.ops.feather_attn_fp16.attn_fp16_feather.default(q, k, v, out, layout)
     return out
 
 
 @_feather_attn.register_fake
-def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: int) -> torch.Tensor:
     return torch.empty_like(q)
 
 
-def feather_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    return _feather_attn(q, k, v)
+def feather_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout: str = "HND",
+) -> torch.Tensor:
+    normalized_layout = layout.upper()
+    if normalized_layout == "HND":
+        layout_id = 0
+    elif normalized_layout == "NHD":
+        layout_id = 1
+    else:
+        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
+    return _feather_attn(q, k, v, layout_id)
