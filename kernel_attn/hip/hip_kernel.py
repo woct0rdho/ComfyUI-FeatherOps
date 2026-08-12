@@ -1,147 +1,47 @@
 import os
+from pathlib import Path
 
 import torch
-from torch._inductor.kernel.custom_op import register_custom_op_autotuning
 
 from kernel.hip.utils import load_hip_stable_extension
 
-from .utils import generate_autotune_configs, get_compatible_config, old_autotune
-
-_CONFIGS = [
-    (64, 32, 8),
-    (128, 32, 8),
-]
-
 cur_dir = os.path.dirname(os.path.abspath(__file__))
-load_hip_stable_extension("attn_hip_ext", cur_dir, "hip_kernel.cu")
+_ck_tile_root = os.environ.get("FEATHEROPS_CK_TILE_ROOT", "~/rocm-libraries/projects/composablekernel")
+_ck_tile_root = Path(_ck_tile_root).expanduser()
+_extension_sources = [
+    "hip_kernel.cpp",
+    "featherattn_aligned.cu",
+    "featherattn_query_tail.cu",
+    "featherattn_key_tail.cu",
+    "featherattn_query_key_tail.cu",
+]
+_extension_cuda_flags = [
+    f"-I{_ck_tile_root / 'include'}",
+    "-DCK_USE_WMMA=1",
+    "-DCK_TILE_USE_WMMA=1",
+    "-Wno-unknown-warning-option",
+    "-Wno-lifetime-safety-intra-tu-suggestions",
+    "-Wno-lifetime-safety-lifetimebound-violation",
+]
+load_hip_stable_extension(
+    "attn_hip_ext",
+    cur_dir,
+    _extension_sources,
+    extra_cuda_cflags=_extension_cuda_flags,
+)
 
 
-@torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_configured", mutates_args=())
-def _configured_op(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    br: int,
-    bc: int,
-    n_waves: int,
-) -> torch.Tensor:
-    k_fp8 = torch.empty(k.shape, device=k.device, dtype=torch.float8_e5m2)
-    v_fp8 = torch.empty(v.shape, device=v.device, dtype=torch.float8_e5m2)
+@torch.library.custom_op("feather_attn_internal::attn_fp16", mutates_args=())
+def _feather_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(q)
-    torch.ops.feather_attn_fp16.attn_fp16_fp8kv.default(q, k, v, k_fp8, v_fp8, out, br, bc, n_waves)
+    torch.ops.feather_attn_fp16.attn_fp16_feather.default(q, k, v, out)
     return out
 
 
-@_configured_op.register_fake
-def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    br: int,
-    bc: int,
-    n_waves: int,
-) -> torch.Tensor:
+@_feather_attn.register_fake
+def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(q)
 
 
-attn_hip_configured = _configured_op
-
-
-def quantize_kv_e5m2_out(k: torch.Tensor, v: torch.Tensor, k_fp8: torch.Tensor, v_fp8: torch.Tensor) -> None:
-    torch.ops.feather_attn_fp16.quantize_kv_e5m2.default(k, v, k_fp8, v_fp8)
-
-
-def quantize_kv_e5m2(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    k_fp8 = torch.empty(k.shape, device=k.device, dtype=torch.float8_e5m2)
-    v_fp8 = torch.empty(v.shape, device=v.device, dtype=torch.float8_e5m2)
-    quantize_kv_e5m2_out(k, v, k_fp8, v_fp8)
-    return k_fp8, v_fp8
-
-
-def wmma_fragment_probe() -> torch.Tensor:
-    out = torch.empty((4, 16, 16), device="cuda", dtype=torch.float16)
-    torch.ops.feather_attn_fp16.wmma_fragment_probe.default(out)
-    return out
-
-
-@torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_prepacked_configured", mutates_args=())
-def _prepacked_configured_op(
-    q: torch.Tensor,
-    k_fp8: torch.Tensor,
-    v_fp8: torch.Tensor,
-    br: int,
-    bc: int,
-    n_waves: int,
-) -> torch.Tensor:
-    out = torch.empty_like(q)
-    torch.ops.feather_attn_fp16.attn_fp16_fp8kv_prepacked.default(q, k_fp8, v_fp8, out, br, bc, n_waves)
-    return out
-
-
-@_prepacked_configured_op.register_fake
-def _(
-    q: torch.Tensor,
-    k_fp8: torch.Tensor,
-    v_fp8: torch.Tensor,
-    br: int,
-    bc: int,
-    n_waves: int,
-) -> torch.Tensor:
-    return torch.empty_like(q)
-
-
-attn_hip_prepacked_configured = _prepacked_configured_op
-
-
-@torch.library.custom_op("feather_attn_internal::attn_fp16_fp8kv_autotuned", mutates_args=())
-def _autotuned_op(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    br: int = 0,
-    bc: int = 0,
-    n_waves: int = 0,
-) -> torch.Tensor:
-    if min(br, bc, n_waves) <= 0:
-        br, bc, n_waves = get_compatible_config(q, k, _CONFIGS)
-    return _configured_op(q, k, v, br, bc, n_waves)
-
-
-@_autotuned_op.register_fake
-def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    br: int = 0,
-    bc: int = 0,
-    n_waves: int = 0,
-) -> torch.Tensor:
-    return torch.empty_like(q)
-
-
-register_custom_op_autotuning(_autotuned_op, config_generator=lambda fake_tensors: generate_autotune_configs(fake_tensors, _CONFIGS))
-
-
-def attn_hip(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    if torch.compiler.is_compiling():
-        return _autotuned_op(q, k, v)
-
-    b, h, n, d = q.shape
-    n_kv = k.shape[2]
-
-    def run_fn(cfg):
-        return _configured_op(q, k, v, *cfg)
-
-    best_cfg = old_autotune(b, h, n, n_kv, d, _CONFIGS, run_fn, "attn_fp16_fp8kv")
-    return _configured_op(q, k, v, *best_cfg)
-
-
-def attn_hip_prepacked(q: torch.Tensor, k_fp8: torch.Tensor, v_fp8: torch.Tensor) -> torch.Tensor:
-    b, h, n, d = q.shape
-    n_kv = k_fp8.shape[2]
-
-    def run_fn(cfg):
-        return _prepacked_configured_op(q, k_fp8, v_fp8, *cfg)
-
-    best_cfg = old_autotune(b, h, n, n_kv, d, _CONFIGS, run_fn, "attn_fp16_fp8kv_prepacked")
-    return _prepacked_configured_op(q, k_fp8, v_fp8, *best_cfg)
+def feather_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return _feather_attn(q, k, v)
