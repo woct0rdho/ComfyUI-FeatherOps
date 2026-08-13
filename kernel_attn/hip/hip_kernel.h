@@ -1,5 +1,7 @@
 #pragma once
 
+#include <hip/hip_runtime_api.h>
+
 #include <cstdint>
 
 namespace feather_attn {
@@ -35,6 +37,28 @@ struct StridedLaunchParams
     hipStream_t stream;
 };
 
+struct BackwardLaunchParams
+{
+    const void* q_ptr;
+    const void* k_ptr;
+    const void* v_ptr;
+    const void* out_ptr;
+    const void* lse_ptr;
+    const void* dout_ptr;
+    void* dq_ptr;
+    void* dk_ptr;
+    void* dv_ptr;
+    void* delta_ptr;
+    void* dq_acc_ptr;
+    void* dk_acc_ptr;
+    void* dv_acc_ptr;
+    int32_t head_count;
+    int32_t n_q;
+    int32_t n_kv;
+    float scale;
+    hipStream_t stream;
+};
+
 extern "C" bool feather_attn_hnd_d64_aligned(const LaunchParams& params);
 extern "C" bool feather_attn_hnd_d128_aligned(const LaunchParams& params);
 extern "C" bool feather_attn_nhd_d64_aligned(const LaunchParams& params);
@@ -59,5 +83,9 @@ extern "C" bool feather_attn_nhd_d64_strided_key_tail(
     const StridedLaunchParams& params);
 extern "C" bool feather_attn_nhd_d64_strided_query_key_tail(
     const StridedLaunchParams& params);
+extern "C" bool feather_attn_bwd_d128_reference(
+    const BackwardLaunchParams& params);
+extern "C" bool feather_attn_bwd_d64_fused(
+    const BackwardLaunchParams& params);
 
 } // namespace feather_attn

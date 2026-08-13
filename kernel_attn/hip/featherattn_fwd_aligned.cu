@@ -1,4 +1,4 @@
-#include "featherattn_kernel.h"
+#include "featherattn_fwd_kernel.h"
 
 namespace feather_attn {
 

@@ -3,7 +3,7 @@
 #include <__clang_cuda_math_forward_declares.h>
 #include <hip/hip_runtime.h>
 
-#include "featherattn_launch.h"
+#include "hip_kernel.h"
 
 #if defined(_WIN32)
 #include <__clang_hip_math.h>
