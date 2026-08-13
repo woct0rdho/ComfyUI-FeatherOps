@@ -1,7 +1,7 @@
 #define FEATHER_ATTN_STRIDED_NHD 1
 #define AttentionKernel StridedNhdAttentionKernel
 #define LaunchVariant LaunchStridedNhdVariant
-#include "featherattn_kernel.h"
+#include "featherattn_fwd_kernel.h"
 #undef LaunchVariant
 #undef AttentionKernel
 #undef FEATHER_ATTN_STRIDED_NHD

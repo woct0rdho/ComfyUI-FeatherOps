@@ -10,11 +10,13 @@ _ck_tile_root = os.environ.get("FEATHEROPS_CK_TILE_ROOT", "~/rocm-libraries/proj
 _ck_tile_root = Path(_ck_tile_root).expanduser()
 _extension_sources = [
     "hip_kernel.cpp",
-    "featherattn_aligned.cu",
-    "featherattn_query_tail.cu",
-    "featherattn_key_tail.cu",
-    "featherattn_query_key_tail.cu",
-    "featherattn_strided.cu",
+    "featherattn_bwd_reference_d128.cu",
+    "featherattn_bwd_fused_d64.cu",
+    "featherattn_fwd_aligned.cu",
+    "featherattn_fwd_query_tail.cu",
+    "featherattn_fwd_key_tail.cu",
+    "featherattn_fwd_query_key_tail.cu",
+    "featherattn_fwd_strided.cu",
 ]
 _extension_cuda_flags = [
     f"-I{_ck_tile_root / 'include'}",
@@ -58,3 +60,69 @@ def feather_attn(
     else:
         raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
     return _feather_attn(q, k, v, layout_id)
+
+
+def feather_attn_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    dout: torch.Tensor,
+    sm_scale: float | None = None,
+    dq: torch.Tensor | None = None,
+    dk: torch.Tensor | None = None,
+    dv: torch.Tensor | None = None,
+    delta: torch.Tensor | None = None,
+    dq_acc: torch.Tensor | None = None,
+    dk_acc: torch.Tensor | None = None,
+    dv_acc: torch.Tensor | None = None,
+    *,
+    implementation: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if sm_scale is None:
+        sm_scale = q.shape[-1] ** -0.5
+    implementation_ids = {
+        "reference": 0,
+        "fused": 1,
+    }
+    normalized_implementation = implementation.lower()
+    if normalized_implementation not in implementation_ids:
+        raise ValueError("implementation must be 'reference' or 'fused'")
+    head_dim = q.shape[-1]
+    if normalized_implementation == "reference" and head_dim != 128:
+        raise ValueError("reference backward supports D128 only")
+    if normalized_implementation == "fused" and head_dim != 64:
+        raise ValueError("fused backward supports D64 only")
+    dq = torch.empty_like(q) if dq is None else dq
+    dk = torch.empty_like(k) if dk is None else dk
+    dv = torch.empty_like(v) if dv is None else dv
+    delta = torch.empty(lse.shape, dtype=torch.float32, device=lse.device) if delta is None else delta
+    needs_workspace = normalized_implementation == "fused"
+    dq_acc = torch.empty(q.shape, dtype=torch.float32, device=q.device) if dq_acc is None and needs_workspace else dq_acc
+    dk_acc = torch.empty(k.shape, dtype=torch.float32, device=k.device) if dk_acc is None and needs_workspace else dk_acc
+    dv_acc = torch.empty(v.shape, dtype=torch.float32, device=v.device) if dv_acc is None and needs_workspace else dv_acc
+    if dq_acc is None:
+        dq_acc = torch.empty((0,), dtype=torch.float32, device=q.device)
+    if dk_acc is None:
+        dk_acc = torch.empty((0,), dtype=torch.float32, device=k.device)
+    if dv_acc is None:
+        dv_acc = torch.empty((0,), dtype=torch.float32, device=v.device)
+    torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dout,
+        dq,
+        dk,
+        dv,
+        delta,
+        dq_acc,
+        dk_acc,
+        dv_acc,
+        float(sm_scale),
+        implementation_ids[normalized_implementation],
+    )
+    return dq, dk, dv, delta

@@ -1,6 +1,6 @@
 #include <hip/hip_runtime.h>
 
-#include "featherattn_launch.h"
+#include "hip_kernel.h"
 
 #ifndef NO_PYTORCH
 #if defined(__clang__)
@@ -18,6 +18,7 @@
 #endif
 
 #include <climits>
+#include <cmath>
 #include <cstdint>
 
 #ifndef NO_PYTORCH
@@ -304,5 +305,270 @@ STABLE_TORCH_LIBRARY(feather_attn_fp16, m)
 STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
 {
     m.impl("attn_fp16_feather", TORCH_BOX(&AttnFp16Feather));
+}
+
+namespace feather_attn {
+namespace {
+
+bool IsContiguous3D(const torch::stable::Tensor& tensor)
+{
+    __int128 expected_stride = 1;
+    for(int64_t dim = 2; dim >= 0; --dim)
+    {
+        if(expected_stride > INT64_MAX)
+            return false;
+        if(tensor.size(dim) != 1 &&
+           tensor.stride(dim) != static_cast<int64_t>(expected_stride))
+            return false;
+        expected_stride *= tensor.size(dim);
+    }
+    return true;
+}
+
+bool IsInt32Addressable(
+    const torch::stable::Tensor& tensor,
+    int64_t element_size)
+{
+    __int128 max_element_offset = 0;
+    for(int64_t dim = 0; dim < tensor.dim(); ++dim)
+    {
+        const int64_t stride = tensor.stride(dim);
+        if(stride < 0 || stride > INT32_MAX)
+            return false;
+        max_element_offset +=
+            static_cast<__int128>(tensor.size(dim) - 1) * stride;
+    }
+    return max_element_offset * element_size <= INT32_MAX;
+}
+
+using BackwardLauncher = bool (*)(const BackwardLaunchParams&);
+
+BackwardLauncher SelectBackwardLauncher(int64_t implementation)
+{
+    return implementation == 0 ? feather_attn_bwd_d128_reference
+                               : feather_attn_bwd_d64_fused;
+}
+
+} // namespace
+
+void AttnBwdFp16Feather(
+    const torch::stable::Tensor& q,
+    const torch::stable::Tensor& k,
+    const torch::stable::Tensor& v,
+    const torch::stable::Tensor& out,
+    const torch::stable::Tensor& lse,
+    const torch::stable::Tensor& dout,
+    torch::stable::Tensor& dq,
+    torch::stable::Tensor& dk,
+    torch::stable::Tensor& dv,
+    torch::stable::Tensor& delta,
+    torch::stable::Tensor& dq_acc,
+    torch::stable::Tensor& dk_acc,
+    torch::stable::Tensor& dv_acc,
+    double sm_scale,
+    int64_t implementation)
+{
+    STD_TORCH_CHECK(implementation == 0 || implementation == 1,
+                    "backward implementation must be reference or fused");
+    STD_TORCH_CHECK(q.is_cuda(), "all backward tensors must be CUDA tensors");
+    const auto device_index = q.get_device_index();
+    auto CheckDevice = [&](const torch::stable::Tensor& tensor) {
+        STD_TORCH_CHECK(tensor.is_cuda(), "all backward tensors must be CUDA tensors");
+        STD_TORCH_CHECK(tensor.get_device_index() == device_index,
+                        "all backward tensors must be on the same device");
+    };
+    CheckDevice(k);
+    CheckDevice(v);
+    CheckDevice(out);
+    CheckDevice(lse);
+    CheckDevice(dout);
+    CheckDevice(dq);
+    CheckDevice(dk);
+    CheckDevice(dv);
+    CheckDevice(delta);
+    CheckDevice(dq_acc);
+    CheckDevice(dk_acc);
+    CheckDevice(dv_acc);
+    STD_TORCH_CHECK(q.scalar_type() == torch::stable::ScalarType::Half &&
+                        k.scalar_type() == torch::stable::ScalarType::Half &&
+                        v.scalar_type() == torch::stable::ScalarType::Half &&
+                        out.scalar_type() == torch::stable::ScalarType::Half &&
+                        dout.scalar_type() == torch::stable::ScalarType::Half &&
+                        dq.scalar_type() == torch::stable::ScalarType::Half &&
+                        dk.scalar_type() == torch::stable::ScalarType::Half &&
+                        dv.scalar_type() == torch::stable::ScalarType::Half,
+                    "q, k, v, out, dout, dq, dk, and dv must be float16");
+    STD_TORCH_CHECK(lse.scalar_type() == torch::stable::ScalarType::Float &&
+                        delta.scalar_type() == torch::stable::ScalarType::Float &&
+                        dq_acc.scalar_type() == torch::stable::ScalarType::Float &&
+                        dk_acc.scalar_type() == torch::stable::ScalarType::Float &&
+                        dv_acc.scalar_type() == torch::stable::ScalarType::Float,
+                    "lse, delta, dq_acc, dk_acc, and dv_acc must be float32");
+    auto CheckAttentionDim = [&](const torch::stable::Tensor& tensor) {
+        STD_TORCH_CHECK(tensor.dim() == 4, "attention tensors must be 4D");
+    };
+    CheckAttentionDim(q);
+    CheckAttentionDim(k);
+    CheckAttentionDim(v);
+    CheckAttentionDim(out);
+    CheckAttentionDim(dout);
+    CheckAttentionDim(dq);
+    CheckAttentionDim(dk);
+    CheckAttentionDim(dv);
+
+    const int64_t batch = q.size(0);
+    const int64_t heads = q.size(1);
+    const int64_t n_q = q.size(2);
+    const int64_t head_dim = q.size(3);
+    const int64_t n_kv = k.size(2);
+    STD_TORCH_CHECK(batch > 0 && heads > 0 && n_q > 0 && n_kv > 0,
+                    "attention dimensions must be positive");
+    STD_TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                    "head dimension must be 64 or 128");
+    STD_TORCH_CHECK(implementation != 0 || head_dim == 128,
+                    "reference backward supports D128 only");
+    STD_TORCH_CHECK(implementation != 1 || head_dim == 64,
+                    "fused backward supports D64 only");
+    const bool needs_workspace = implementation == 1;
+    if(needs_workspace)
+    {
+        CheckAttentionDim(dq_acc);
+        CheckAttentionDim(dk_acc);
+        CheckAttentionDim(dv_acc);
+    }
+    STD_TORCH_CHECK(lse.dim() == 3 && delta.dim() == 3,
+                    "lse and delta must be [B, H, N]");
+    STD_TORCH_CHECK(k.size(0) == batch && v.size(0) == batch &&
+                        out.size(0) == batch && dout.size(0) == batch &&
+                        dq.size(0) == batch && dk.size(0) == batch &&
+                        dv.size(0) == batch,
+                    "batch dimensions must match");
+    STD_TORCH_CHECK(k.size(1) == heads && v.size(1) == heads &&
+                        out.size(1) == heads && dout.size(1) == heads &&
+                        dq.size(1) == heads && dk.size(1) == heads &&
+                        dv.size(1) == heads,
+                    "head dimensions must match");
+    STD_TORCH_CHECK(k.size(2) == n_kv && v.size(2) == n_kv &&
+                        dk.size(2) == n_kv && dv.size(2) == n_kv,
+                    "key/value sequence dimensions must match");
+    STD_TORCH_CHECK(out.size(2) == n_q && dout.size(2) == n_q &&
+                        dq.size(2) == n_q,
+                    "query/output sequence dimensions must match");
+    STD_TORCH_CHECK(k.size(3) == head_dim && v.size(3) == head_dim &&
+                        out.size(3) == head_dim && dout.size(3) == head_dim &&
+                        dq.size(3) == head_dim && dk.size(3) == head_dim &&
+                        dv.size(3) == head_dim,
+                    "head dimensions must match");
+    if(needs_workspace)
+    {
+        STD_TORCH_CHECK(
+            dq_acc.size(0) == batch && dq_acc.size(1) == heads &&
+                dq_acc.size(2) == n_q && dq_acc.size(3) == head_dim,
+            "dq_acc must have the query shape");
+        STD_TORCH_CHECK(
+            dk_acc.size(0) == batch && dv_acc.size(0) == batch &&
+                dk_acc.size(1) == heads && dv_acc.size(1) == heads &&
+                dk_acc.size(2) == n_kv && dv_acc.size(2) == n_kv &&
+                dk_acc.size(3) == head_dim && dv_acc.size(3) == head_dim,
+            "dK/dV workspaces must have the key/value shapes");
+    }
+    STD_TORCH_CHECK(lse.size(0) == batch && lse.size(1) == heads &&
+                        lse.size(2) == n_q && delta.size(0) == batch &&
+                        delta.size(1) == heads && delta.size(2) == n_q,
+                    "lse and delta shapes must be [B, H, NQ]");
+    auto CheckAttentionLayout = [&](const torch::stable::Tensor& tensor) {
+        STD_TORCH_CHECK(tensor.is_contiguous(),
+                        "HND backward tensors must be contiguous");
+        STD_TORCH_CHECK(IsInt32Addressable(tensor, sizeof(uint16_t)),
+                        "an attention tensor exceeds signed-int32 addressing");
+    };
+    CheckAttentionLayout(q);
+    CheckAttentionLayout(k);
+    CheckAttentionLayout(v);
+    CheckAttentionLayout(out);
+    CheckAttentionLayout(dout);
+    CheckAttentionLayout(dq);
+    CheckAttentionLayout(dk);
+    CheckAttentionLayout(dv);
+    if(needs_workspace)
+    {
+        STD_TORCH_CHECK(dq_acc.is_contiguous() && dk_acc.is_contiguous() &&
+                            dv_acc.is_contiguous(),
+                        "gradient workspaces must be contiguous");
+        STD_TORCH_CHECK(IsInt32Addressable(dq_acc, sizeof(float)) &&
+                            IsInt32Addressable(dk_acc, sizeof(float)) &&
+                            IsInt32Addressable(dv_acc, sizeof(float)),
+                        "a gradient workspace exceeds signed-int32 addressing");
+    }
+    STD_TORCH_CHECK(IsContiguous3D(lse) && IsContiguous3D(delta),
+                    "lse and delta must be contiguous");
+    STD_TORCH_CHECK(IsInt32Addressable(lse, sizeof(float)) &&
+                        IsInt32Addressable(delta, sizeof(float)),
+                    "lse or delta exceeds signed-int32 addressing");
+    STD_TORCH_CHECK(batch <= INT32_MAX && heads <= INT32_MAX &&
+                        n_q <= INT32_MAX && n_kv <= INT32_MAX,
+                    "attention dimensions exceed signed int32");
+    STD_TORCH_CHECK(std::isfinite(sm_scale) && sm_scale > 0.0,
+                    "sm_scale must be finite and positive");
+
+    const __int128 head_count = static_cast<__int128>(batch) * heads;
+    const __int128 q_rows = head_count * n_q;
+    const __int128 kv_rows = head_count * n_kv;
+    const __int128 q_elements = q_rows * head_dim;
+    const __int128 kv_elements = kv_rows * head_dim;
+    STD_TORCH_CHECK(head_count <= INT32_MAX && q_rows <= INT32_MAX &&
+                        kv_rows <= INT32_MAX && q_elements <= INT32_MAX &&
+                        kv_elements <= INT32_MAX,
+                    "backward tensor size exceeds signed int32");
+
+    torch::stable::accelerator::DeviceGuard device_guard(device_index);
+    void* raw_stream = nullptr;
+    TORCH_ERROR_CODE_CHECK(
+        aoti_torch_get_current_cuda_stream(device_index, &raw_stream));
+    const BackwardLaunchParams params{
+        q.const_data_ptr(),
+        k.const_data_ptr(),
+        v.const_data_ptr(),
+        out.const_data_ptr(),
+        lse.const_data_ptr(),
+        dout.const_data_ptr(),
+        dq.mutable_data_ptr(),
+        dk.mutable_data_ptr(),
+        dv.mutable_data_ptr(),
+        delta.mutable_data_ptr(),
+        dq_acc.mutable_data_ptr(),
+        dk_acc.mutable_data_ptr(),
+        dv_acc.mutable_data_ptr(),
+        static_cast<int32_t>(head_count),
+        static_cast<int32_t>(n_q),
+        static_cast<int32_t>(n_kv),
+        static_cast<float>(sm_scale),
+        reinterpret_cast<hipStream_t>(raw_stream)};
+    const BackwardLauncher launcher = SelectBackwardLauncher(implementation);
+
+    (void)hipGetLastError();
+    const bool launched = launcher(params);
+    const hipError_t launch_error = hipGetLastError();
+    STD_TORCH_CHECK(launched && launch_error == hipSuccess,
+                    "FeatherAttn backward launch failed: ",
+                    hipGetErrorString(launch_error));
+}
+
+} // namespace feather_attn
+
+STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn_fp16, m)
+{
+    m.def(
+        "attn_bwd_fp16_feather("
+        "Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor dout, "
+        "Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) delta, "
+        "Tensor(e!) dq_acc, Tensor(f!) dk_acc, Tensor(g!) dv_acc, "
+        "float sm_scale, int implementation"
+        ") -> ()");
+}
+
+STABLE_TORCH_LIBRARY_IMPL(feather_attn_fp16, CUDA, m)
+{
+    m.impl("attn_bwd_fp16_feather", TORCH_BOX(&feather_attn::AttnBwdFp16Feather));
 }
 #endif
