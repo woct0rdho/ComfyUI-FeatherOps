@@ -2,279 +2,173 @@
 
 ## Status
 
-The public backward surface is intentionally small:
+The current production backward surface contains one explicit implementation:
 
-| Head dimension | Explicit implementation | Role |
+| Head dimension | Explicit implementation | Current status |
 | ---: | --- | --- |
-| 64 | `implementation="fused"` | Retained custom D64 kernel with caller-owned FP32 workspaces |
-| 128 | `implementation="reference"` | Correctness kernel with no full-gradient workspace |
+| 64 | `implementation="fused"` | Seven-GEMM direct-output kernel, linked and contract-tested |
 
-There is no default, `auto`, D64 reference, `owned`, or `paired` implementation in the linked production extension. Low-level IDs are `0=reference` and `1=fused`; the Python argument is required and keyword-only. The saved-state API remains contiguous HND `[B,H,N,D]`, FP16 `(Q,K,V,O,dO)`, FP32 natural-log LSE, FP32 Delta, current-device validation, and current-stream execution.
-
-The qualified performance provider is the FlashAttention AITER Triton backward kernel. The retained Feather kernels are correctness and development surfaces. The main private result is an exact D64 seven-GEMM schedule that is close to the target but is not production-promoted.
+The saved-state contract is contiguous HND `[B,H,N,D]`, FP16 `(Q,K,V,O,dO)`, FP32 natural-log LSE, dense non-causal attention, equal query/KV heads, current-device validation, and current-stream execution. The current operator returns FP16 `dQ`, `dK`, `dV`, and FP32 `Delta`.
 
 ## Public Contract and Source Layout
 
-The backward wrapper accepts:
+The public wrapper is:
 
 ```text
 feather_attn_backward(Q, K, V, O, LSE, dO, *, implementation, sm_scale=None, ...)
 ```
 
-Constraints:
-- FP16 Q/K/V/O/dO and FP32 natural-log LSE and Delta.
-- Dense, non-causal attention with equal query/KV heads.
-- Contiguous HND tensors only.
-- D64 selects `fused`; D128 selects `reference`.
-- D64 fused requires `dq_acc`, `dk_acc`, and `dv_acc` FP32 workspaces. The wrapper allocates them when omitted, or accepts caller-owned tensors.
-- D128 reference does not require full FP32 gradient workspaces.
-- All tensors must be on the current device and meet the checked signed-int32 address and dimension limits.
+The backward arguments are fixed HND tensors. There is no backward `layout` selector and no full-gradient workspace argument. The seven-GEMM kernel owns each output element and writes the final FP16 gradients directly; this removes the old FP32 accumulation buffers, atomic updates, clear kernel, and conversion kernels.
 
 | File | Role |
 | --- | --- |
-| `kernel_attn/hip/hip_kernel.py` | Explicit Python selector, output/workspace setup, extension source list |
-| `kernel_attn/hip/hip_kernel.cpp` | Shared validation, implementation dispatch, current-stream lookup, Torch registration |
+| `kernel_attn/hip/hip_kernel.py` | Explicit fused-only Python selector and extension source list |
+| `kernel_attn/hip/hip_kernel.cpp` | Shared validation, fused dispatch, current-stream lookup, and Torch registration |
 | `kernel_attn/hip/hip_kernel.h` | Raw forward/backward launch ABI |
-| `kernel_attn/hip/featherattn_bwd_kernel.h` | Reference and fused device templates |
-| `kernel_attn/hip/featherattn_bwd_reference_d128.cu` | D128 reference instantiation |
-| `kernel_attn/hip/featherattn_bwd_fused_d64.cu` | D64 fused instantiation |
-
-The two backward images compile independently. The linked extension exposes exactly `feather_attn_bwd_d128_reference` and `feather_attn_bwd_d64_fused`.
+| `kernel_attn/hip/featherattn_bwd_fused_d64.cu` | D64 Delta helper and seven-GEMM device launcher |
 
 ## Current Production Design
 
-### D64 Fused Kernel
+The D64 kernel uses one 128-thread workgroup per head and ownership tile. The grid has one owner-tile axis sized to the larger of the Q and KV tile counts, so irregular query/KV lengths share one launch without a second selector.
 
-The retained D64 kernel uses a 64-thread workgroup, D64 query tiles of 16 rows, and KV tiles of 32 rows. Its main kernel stages Q/K/V and P/dS state in 17,152 bytes of LDS, computes FP32 gradients, and accumulates dQ, dK, and dV into caller-owned FP32 workspaces. The complete launch sequence is:
-- Delta and dQ workspace clear.
-- Main fused backward kernel.
-- FP32 dQ conversion to FP16.
-- FP32 dK/dV conversion to FP16.
+| Parameter | Value |
+| --- | ---: |
+| Head dimension | 64 |
+| Workgroup | 128 threads, four wave32 waves |
+| Ownership tile | 64 rows |
+| Inner WMMA tile | 16 rows/elements |
+| KV storage | FP16, XOR-swizzled LDS rows |
+| K/Q/dO transpose stride | 20 FP16 elements |
+| Main LDS | 13,312 bytes with lifetime-local aliasing |
+| Gradient ownership | Unique output ownership, no atomics |
+| Output | Direct FP16 `dQ`, `dK`, `dV` stores |
+| Saved state | Natural-log FP32 LSE plus stream-local FP32 Delta |
 
-The loaded production image uses 174 logical VGPRs, 192 allocated VGPRs, 54 SGPRs, 17,152 bytes LDS, zero private memory, zero spills, and 16 compiler-generated FP32 atomic CAS sites for the workspace accumulation. This implementation is numerically qualified but much slower than AITER.
+The KV-owned portion stages V in LDS, caches K rows, cooperatively stages each Q and dO tile into the stride-20 transpose layout, and computes four GEMM-equivalent operations: QK score, dO/V dP, dS/Q dK, and P/dO dV. The Q-owned portion stages K and V in two 16-row tiles, caches Q and dO rows, and computes three operations: QK score, dO/V dP, and dS/K dQ. The C-to-A WMMA handoff converts each FP32 C fragment to the FP16 A-fragment layout with lane permutes.
 
-### D128 Reference Kernel
+The complete launch is a Delta helper followed by the seven-GEMM main kernel. Both launches use the caller's current stream. No initialization, workspace clear, FP32-to-FP16 gradient conversion, or reduction helper remains in the current path.
 
-The D128 reference path launches separate Delta, dQ, dK, and dV kernels. Each gradient kernel reconstructs the saved-state probability path in FP32 and stores the final FP16 gradient. It is deliberately scalar and independent from the D64 fused schedule so it remains a correctness oracle. It is not a throughput candidate and has no current performance/profile qualification.
+## D128 Scope
 
-### Numerical Dataflow
+D128 is intentionally absent from the current backward implementation. The former scalar D128 reference kernel and its four-launch reconstruction path were removed because the production objective is a new seven-GEMM D128 design, not preservation of a slow duplicate. No D128 backward benchmark or resource claim is made here.
 
-All retained production paths consume the caller's natural-log LSE rather than recomputing it. The reference reconstruction is:
+## Throughput Convention
 
-```text
-P  = exp(Q @ K^T * sm_scale - LSE)
-Delta = rowsum(O * dO)
-dP = dO @ V^T
-dS = P * (dP - Delta)
-dQ = dS @ K * sm_scale
-dK = dS^T @ Q * sm_scale
-dV = P^T @ dO
-```
-
-Intermediate scores, probabilities, Delta, dP, dS, and accumulation are FP32. Caller-visible dQ/dK/dV are FP16.
-
-## Private D64 Seven-GEMM Design
-
-The active research control is separate from the linked production extension. It uses one 128-thread workgroup per head/tile and unique output ownership with no gradient atomics or partition-reduction workspace.
-
-The seven attention-sized GEMM equivalents are:
-
-| Owner | GEMM equivalents | Work |
-| --- | ---: | --- |
-| KV-owned portion | 4 | QK score, dO/V dP, dS/Q dK, P/dO dV |
-| Q-owned portion | 3 | QK score, dO/V dP, dS/K dQ |
-| Total | 7 | Exact FP16 arithmetic and FP32 accumulation |
-
-The KV portion uses KV64 ownership. The Q portion uses KV32 grouping. The implementation stages operands cooperatively, converts WMMA C fragments directly to WMMA A fragments for P and dS, and uses a stride-20 K/Q/dO transpose layout. Lifetime-local LDS reservations are aliased so the current leader uses 13,312 bytes rather than the earlier 24,576-byte image. Persistent K, Q, and dO caches remove the scalar transposed global-load network that dominated the initial seven-GEMM source.
-
-The private leader is not part of the public API, is not linked into the production extension, and is not allowed to change the saved-state ABI without a separate promotion decision.
-
-## Backward Throughput Convention
-
-All backward throughput values in this document use the same normalized seven-GEMM work estimate:
+All backward throughput uses the seven-GEMM convention:
 
 ```text
 F7 = 7 * 2 * B * H * NQ * NKV * D FLOPs
 TFLOPS = F7 / elapsed_seconds / 1e12
-```
-
-For equal sequence lengths this is `14 * B * H * N^2 * D` FLOPs. The same denominator is applied to AITER and Feather so the ratio is a timing ratio expressed as throughput:
-
-```text
 Feather / AITER = AITER elapsed time / Feather elapsed time
 ```
 
-This convention matches the private D64 schedule. It is a normalized comparison for the public fused path, whose ownership and workspace topology differs. No throughput claim is made for the D128 scalar reference because it has not been performance-qualified.
+A ratio above `1.000x` means the Feather elapsed time is lower. Complete timing includes the Delta launch, main launch, initialization outside the measured call only when shared by both providers, synchronization, and all helper work inside the provider call. Outputs and Delta were preallocated before the current matrix timing.
 
 ## Current Benchmarks
 
-### Public D64 Fused Surface
+The current matrix uses B1, contiguous HND inputs, equal Q/KV lengths, H `{16,32}`, N `{2048,4096,8192}`, eight warmups, and 30 timed samples per provider. AITER is the FlashAttention Triton backward control. The values below are recomputed with `F7`, not the older five-GEMM field.
 
-The last qualified six-row saved-state matrix uses identical HND inputs at B1, H `{16,32}`, N `{2048,4096,8192}`, D64, preallocated outputs/workspaces, and complete backward timing. The table below recalculates TFLOPS with the seven-GEMM convention rather than using the older five-GEMM field in the raw JSON.
+Every H/N row in the current D64 matrix is shown. The current direct-output Feather kernel does not allocate gradient workspaces.
 
-| Provider | Geomean TFLOPS, seven GEMMs | Feather / AITER | Wins |
-| --- | ---: | ---: | ---: |
-| Feather D64 fused | 5.436 | 0.204x | 0/6 |
+| Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HND | 16 | 2048 | 25.986 | 27.620 | 1.063x |
+| HND | 16 | 4096 | 26.704 | 28.167 | 1.055x |
+| HND | 16 | 8192 | 26.493 | 29.226 | 1.103x |
+| HND | 32 | 2048 | 25.726 | 27.748 | 1.079x |
+| HND | 32 | 4096 | 25.395 | 29.050 | 1.144x |
+| HND | 32 | 8192 | 25.342 | 29.242 | 1.154x |
 
-Representative rows:
+The public D64 contract screen additionally covers `(NQ,NKV) = (33,35), (65,67), (65,129)` and batch two. The private candidate screen covers `(65,64), (129,65), (256,256), (257,257), (512,513)`, plus batch two and a cancellation pattern.
 
-| H | N | AITER TFLOPS | Feather fused TFLOPS | Feather / AITER |
-| ---: | ---: | ---: | ---: | ---: |
-| 16 | 2048 | 27.082 | 5.328 | 0.197x |
-| 16 | 4096 | 27.289 | 5.424 | 0.199x |
-| 16 | 8192 | 27.107 | 5.532 | 0.204x |
-| 32 | 4096 | 26.063 | 5.450 | 0.209x |
-| 32 | 8192 | 25.984 | 5.552 | 0.214x |
+## Resource and Profile Results
 
-Raw matrix: `~/tmp/feather_attn/bwd_d64_final_four_provider_matrix.json`. The old owned and paired columns remain useful as campaign evidence but are not current production results.
+The symbol-matched private leader that was promoted into the repository has the following gfx1151 profile:
 
-### Private Seven-GEMM Leader
+| Symbol/workgroup | Logical VGPRs | Allocated VGPRs | SGPRs | LDS | Private/spills |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| D64 seven-GEMM main, 128 threads | 178 | 192 | 46 | 13,312 B | 0 / 0 |
+| Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 |
 
-The current leader was timed at B1/H16/N4096/D64 with eight warmups and 50 interleaved samples. The AITER row is from the same timing run.
+The private six-case correctness screen reports maximum relative L2 `0.00030204`, minimum cosine `0.99999988`, and maximum absolute error `0.00121403`. The full-image counter pass reports occupancy `46.62%`, `426.889 M` VALU instructions, `77.611 M` LDS instructions, `12.457 B` wave cycles, `2.440 B` wait-any cycles, `1.076 B` barrier waits, LDS latency `106.73` cycles, LDS conflict metric `24.32`, and ALU stalled by LDS `2.10%`.
 
-At this shape:
-
-```text
-F7 = 240.518 GFLOPs
-```
-
-| Candidate | Median ms | Seven-GEMM TFLOPS | Feather / AITER |
-| --- | ---: | ---: | ---: |
-| Stride-20 full image | 9.526261 | 25.248 | 0.962x |
-| 21,504 B LDS plus KV prefetch | 8.852319 | 27.170 | 1.035x |
-| 13,312 B current leader | 8.495935 | 28.310 | 1.078x |
-| Promotion gate | 8.417913 | 28.572 | 1.088x |
-
-The leader's repeat result is `0.927%` slower than the promotion gate. One separate interleaved observation reached `8.385254 ms`, or `28.683 TFLOPS`, but the crossing is too small and not repeatable enough for promotion. The private leader has not been run across the frozen six-row matrix.
-
-### Work Distribution
-
-The 13,312-byte leader's component timing was measured with separate empty, KV, Q, and full launches. Empty-launch overhead is `0.108981 ms`; subtracting it gives the net workload below.
+The private H16/N4096/D64 complete result is `8.495935 ms` (`28.310 TFLOPS` under F7). The component result is:
 
 | Portion | GEMM equivalents | Net ms | Normalized TFLOPS |
 | --- | ---: | ---: | ---: |
 | KV-owned | 4 | 4.980566 | 27.595 |
 | Q-owned | 3 | 3.399451 | 30.322 |
-| Full leader | 7 | 8.495935 | 28.310 |
+| Full seven-GEMM image | 7 | 8.495935 | 28.310 |
 
-The KV portion carries 57.1% of the nominal GEMM work but about 58.6% of net kernel time. Its per-GEMM throughput is approximately 9.0% below the Q portion, so the next useful experiment must change the KV/Q resource balance rather than only reorder another local instruction.
+The KV portion is the slower side per nominal GEMM. It remains the first target for any FP8 experiment, but the experiment must reduce complete time rather than only LDS bytes.
 
-## Current Profile Results
+- The current D64 leader is direct-output, 13,312-byte LDS, 178 logical/192 allocated VGPRs, and no private memory or spills. Its P and dS values currently remain in FP32 C fragments and go through the exact FP32-to-FP16 C-to-A handoff.
+- The forward Q path already stores E5M2 bytes through a `uint8x16` lane-vector pattern in `featherattn_fwd_kernel.h`. That path uses RNE and log2 prescaling for forward Q, so its accuracy policy cannot be copied blindly to backward P or dS.
+- `kernel/hip/hip_kernel.cu` contains the compact `fp8e5m2x4_to_half2x2` decode: one packed `uint32_t` input produces two packed half2 outputs through two `v_perm_b32` operations. This is a useful decode primitive and an instruction-count reference, not proof that a backward hot-loop decode will be profitable.
+- The archived seven-GEMM packed screen measured exact `167` logical VGPRs, `168` allocated VGPRs, `20,480` bytes LDS, and 8 permutes for the unquantized control. P-only used `165/168` VGPRs and 19,456 bytes LDS but 40 permutes; dS-only used `169/192` and 44 permutes; P+dS used `164/168`, 18,432 bytes LDS, and 76 permutes. None changed the useful allocation class in the tested schedule.
+- The same screen found truncating P or dS numerically admissible under the broad public tolerance but not preferred: P maximum relative L2 was about `0.10045`, dS about `0.10021`, and P+dS about `0.17681`. Exact FP16 had maximum relative L2 about `0.0002318` in that screen. This is a strong reason to test truncation as an optimization candidate, not silently use it.
+- Prior fixed-scale, power-of-two-scale, and linear-scale attempts consumed conversion/register margin and were rejected. gfx1151 has no useful native FP8 WMMA or native E5M2 conversion instruction, so the byte savings compete directly with VALU and `v_perm_b32` work.
 
-### Private Leader Resources
+## Historical D64 Campaign Evidence
 
-The symbol-matched gfx1151 metadata for the private leader reports:
+These results are retained as provenance for the selector and topology decisions. They are not current production timings because those kernels used the removed accumulation/workspace ABI or private source images.
 
-| Workgroup | Logical VGPRs | Allocated VGPRs | SGPRs | LDS | Private/scratch | Spills |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 threads, seven-GEMM main | 178 | 192 | 46 | 13,312 B | 0 / 0 | 0 / 0 |
-| Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 | 0 / 0 |
+| Comparison or candidate | Result | Resource/evidence summary | Decision |
+| --- | --- | --- | --- |
+| Triton / CK external | `0.2333805x` geometric ratio; `0/6` frozen-row Feather wins | CK backward receipt omits `--targets gfx1151` in the default build | Retained as blocked external evidence |
+| Triton / owned | `0.5459785x` geometric ratio; `0/6` frozen-row wins | Qualified at 126 logical / 144 physical VGPRs, 46 SGPRs, 17,152 B LDS | Removed from production |
+| Triton / fused workspace kernel | `0.2039779x` geometric ratio; `0/6` frozen-row wins | 174 logical / 192 allocated VGPRs, 54 SGPRs, 17,152 B LDS, FP32 caller workspace and atomic updates | Removed and replaced by direct output |
+| Paired ownership | `1.41%` improvement over owned | 191 logical / 192 physical VGPRs and 29,696 B LDS | Rejected as insufficient |
+| Native atomics | Site-local owned result about `12.0452 ms` | Lost every frozen row to Triton despite qualified atomics | Retained only as evidence |
+| Step 11 cooperative staging/caching | `10.9995437 ms` | 178 logical VGPRs, 47 SGPRs, 24,576 B LDS, zero spills | Superseded by the seven-GEMM leader |
+| Five-GEMM, partition workspace, M16, atomic-reduction variants | No promotion gate cleared | Extra workspace, launches, or reduction cost dominated the complete path | Deferred or rejected |
 
-The main image is wave32, has no atomics, and remains within the campaign gates. Its correctness screen covers six exact cases, including odd heads, query/KV tails, cancellation, and batch two. Maximum relative L2 is `0.00030204`; minimum global cosine is `0.99999988`; maximum absolute error is `0.00121403`.
+The historical owned variants `owned-order`, `owned-lifetime`, `owned-exp2`, `owned-half-pds`, `owned-qreuse`, and `owned-q32` were individually rejected. Their measurements remain in the campaign artifacts, while the current source contains none of their selectors or workspace paths.
 
-### Full-Leader Counters
+## Accepted, Rejected, and Deferred Work
 
-The following are serialized legal counter results for the current 13,312-byte full image. They are attribution data, not replacements for complete timing.
-
-| Counter | Full leader |
-| --- | ---: |
-| Occupancy | 46.62% |
-| `SQ_INSTS_VALU_sum` | 426.889 M |
-| `SQ_INSTS_LDS_sum` | 77.611 M |
-| `SQ_WAVE_CYCLES_sum` | 12.457 B |
-| `SQ_WAIT_CNT_ANY` | 2.440 B |
-| `SQ_WAIT_INST_LDS_sum` | 453.345 M |
-| `SQ_WAIT_BARRIER` | 1.076 B |
-| LDS latency | 106.73 cycles |
-| LDS conflict metric | 24.32 |
-| ALU stalled by LDS | 2.10% |
-
-The leader has low global traffic and lower LDS instruction count than the AITER control, but it still exposes long LDS dependency and barrier wait chains. Higher residency is real, but it does not by itself produce a promotion because complete event timing includes every launch, synchronization, conversion, and workspace cost.
-
-## Accepted and Retained Work
-
-| Work | Decision and current role |
+| Work | Decision |
 | --- | --- |
-| Saved-state HND API with natural-log LSE | Accepted public contract |
-| Explicit implementation selection | Accepted; no automatic or dimension-inferred selector |
-| D128 scalar reference | Accepted correctness oracle |
-| D64 shared-tile fused kernel | Retained public diagnostic kernel; not performance-promoted |
-| AITER Triton backward | Accepted performance provider |
-| Seven-GEMM unique-ownership topology | Accepted private research control; no atomics or N-squared workspace |
-| Cooperative K/V and Q staging | Accepted private mechanism; removed the original global-load bottleneck |
-| WMMA C-to-A handoff | Accepted private exact transformation |
-| Stride-20 transpose layout | Accepted private exact layout |
-| Persistent K/Q/dO caching | Accepted private resource-valid improvements |
-| 13,312-byte lifetime-aliased LDS | Accepted private leader mechanism |
-| Source split into host, template, and two instantiation units | Accepted production organization |
+| Direct-output seven-GEMM D64 schedule | Accepted and linked as the current production kernel |
+| Unique output ownership, C-to-A handoff, stride-20 transpose, lifetime-local LDS | Accepted mechanisms |
+| Old atomic FP32 D64 kernel | Removed; no source, selector, workspace, or linked image remains |
+| `owned`, `paired`, automatic selection, and duplicate D64 reference paths | Removed from production |
+| FP8 P/dS truncation | Deferred to the gated plan above; not in current production |
+| Six-GEMM N-squared workspace design | Deferred; it requires approximately 256 MiB intermediate storage and 512 MiB extra traffic at the reference shape |
+| Stock AITER CK backward | Blocked on gfx1151 receipt generation; retained only as external evidence |
 
-## Rejected Work
+## Next Work
 
-| Candidate or idea | Evidence | Decision |
-| --- | --- | --- |
-| Public D64 fused promotion | `0.204x` AITER geomean and 0/6 wins | Retain for correctness/diagnostics only |
-| Direct dK/dV `owned` | `0.546x` AITER geomean and 0/6 wins | Retired from production source |
-| Paired KV64 reduction | Only `1.41%` faster than owned with material LDS regressions | Retired |
-| Site-local native FP32 atomics | `12.0452 ms` focused latency; still lost every frozen Triton row and changes accumulation semantics | Not integrated |
-| Five-GEMM ownership inversion | Lower nominal work but worse complete timing and substantial synchronization/reduction cost | Rejected |
-| Q-owned partition reduction | Complete path reached `92.6505 ms` at H16/N4096/D64 | Rejected |
-| Four-wave KV-owned M16 exact FP16 | `14.019381 ms` versus AITER `9.192410 ms`; `1.525x` slower | Rejected |
-| M16 unscaled E5M2 | `13.591690 ms`; `1.479x` slower with no lower VGPR allocation class | Rejected |
-| Fixed, power-of-two, or linear E5M2 scaling | Conversion and scaling cost consumed the register/LDS margin | Rejected before full integration |
-| Initial exact seven-GEMM schedule | `20.858525 ms`, `11.531 TFLOPS`, `0.430x` AITER | Rejected as a schedule, retained as control |
-| Transient truncating E5M2 | No lower allocation class; dS-only reached 192 VGPRs and failed numerical preference | Rejected |
-| First cooperative staged winner | `10.999544 ms`, `1.204x` AITER latency, above the continuation gate | Retained only as profiling evidence |
-| Padded LDS rows | `21.0009 ms` and approximately 542-cycle LDS latency | Rejected |
-| Q32 synchronization grouping | `10.193416 ms`, `21.29%` slower than the 13,312-byte Q16 control | Rejected |
-| Forced 64-bit LDS reads | `+17.11%` latency and higher conflicts/waits | Rejected |
-| DPP/register wave transpose | Exhaustively exact, but optimistic complete bound only `4.35%`, below the required `5%` | Closed before integration |
-| Six-GEMM N-squared workspace | Requires approximately 256 MiB intermediate storage and 512 MiB extra traffic at the reference shape | Deferred pending explicit workspace approval |
-| Stock AITER CK backward | gfx1151 receipt generation omits `--targets gfx1151` | External CK module retained only as evidence |
+- Keep the `168/168` forward contract and the current six-row D64 backward matrix as regression gates.
+- Design D128 as a separate seven-GEMM effort; do not restore the deleted reference kernel.
+- Evaluate FP8 E5M2 only through the isolated truncation, vectorized pack/decode, resource, correctness, and complete-timing gates above.
+- Preserve HND, natural-log LSE, current-device validation, and current-stream execution while changing the internal schedule.
 
-## Remaining Work
+### Proposed Sequence
 
-The next private experiment splits the seven-GEMM main image into compile-time KV and Q kernels launched sequentially on the same stream. The extra launch is included in complete timing. Same-layout fission alone is only a control; the candidate must pair fission with a compact Q-stage layout:
-- one K16 row-major tile: 2,048 B;
-- one V16 row-major tile: 2,048 B;
-- one stride-20 K-transpose tile: 2,560 B;
-- practical Q-stage LDS target: exactly 6,656 B.
+- Freeze the current baseline. Record symbol-matched metadata, disassembly counts, six-case exact correctness, full H/N timings, and complete H16/N4096 timing. Keep the admission target below `8.417913 ms` and retain the seven-GEMM F7 convention.
+- Build an isolated truncation fixture. For an FP16 input, bit-cast to `uint16_t` and take the high byte as E5M2: `e5m2 = half_bits >> 8`. Test all 65,536 FP16 encodings, including signed zero, subnormals, infinities, NaNs, and negative values. Define the treatment of exponent-zero and non-finite values before integrating.
+- Vectorize the pack path. Start with eight half values per lane and pack two `uint32_t` words containing eight E5M2 bytes. Compare a shift/pack sequence against `__builtin_amdgcn_perm` byte assembly. Use the `fp8e5m2x4_to_half2x2` layout as the decode oracle. Measure VALU, permute, LDS byte traffic, and register counts in a standalone fixture before inserting the code into attention.
+- Try P-only first. P has the lower historical allocation result and is consumed by dV in the KV-owned portion and by dQ in the Q-owned portion. Replace only the current C-to-A P handoff with truncating FP8 pack plus vectorized decode. Keep dS exact. Do not add per-tile scales in the first candidate.
+- Test only real reuse. A transient pack followed immediately by a decode is a win only if it reduces live VGPRs or replaces an existing expensive conversion. If it only adds pack and permute instructions, close the candidate. The next version may store packed P in the existing lifetime-local LDS reservation, but only if the stored bytes eliminate a global/LDS round trip or cross a resource class.
+- Try dS-only second. Use the same path for dS, preserving exact P. The old screen suggests dS is more likely to hit the 192-VGPR class, so this candidate must show a resource crossing rather than just a smaller LDS number.
+- Try P+dS only after both single-state tests. Keep the two state layouts disjoint in lifetime and alias them where possible. Do not carry two decoders or two packed representations simultaneously unless metadata proves the added code still fits the current resource gates.
+- Run correctness before timing. Require finite outputs, maximum relative L2 at most `0.01`, minimum per-head cosine at least `0.9995`, norm-ratio error at most `0.01`, and the existing public allclose gate across the six exact cases and the cancellation case. The broad `0.10` allclose threshold is not sufficient for promotion because the current exact leader is much more accurate.
+- Check symbol-scoped resources and ISA. Require at most `192` allocated VGPRs, at most `13,312` bytes LDS unless the smaller LDS crosses a measured occupancy class, zero private memory, zero spills, and no materially higher permute/VALU count without a corresponding timing reduction. A candidate that remains in the same allocation class and adds more than the measured conversion work is closed.
+- Use complete timing as the gate. First require at least a repeatable `5%` complete improvement over the current D64 leader and a result below `8.417913 ms` at H16/N4096. Then run every D64 H/N row in the table. No isolated kernel-phase result, lower LDS byte count, or single `8.385254 ms` observation is sufficient for promotion.
 
-The Q-only image must allocate at most 144 VGPRs so the 6,656-byte image can cross to a useful residency class. Both images must remain at or below 192 allocated VGPRs, 32,768 B LDS, zero private/scratch memory, and zero spills.
+### Expected Outcomes and Stop Conditions
 
-Qualification gates:
-- Inspect loaded metadata and symbol-scoped ISA before timing.
-- Pass the six-case exact correctness screen.
-- Improve split-Q32 timing by at least `12.5%` for the compact Q phase.
-- Improve complete timing by at least `5%` against the unchanged 13,312-byte leader after charging the extra launch.
-- Repeat below `8.417913 ms` with useful margin before running the frozen six-row matrix.
+The highest-probability outcome is that direct P/dS FP8 compression fails to pay: the current leader does not store these states in LDS, and gfx1151's permute-based decode can consume the saved bytes. If the vectorized truncation fixture shows no allocation-class crossing, stop before a full attention integration. If P-only reaches a lower class with preferred numerics, continue to dS-only; otherwise keep the exact current kernel.
 
-If the Q symbol remains above 144 allocated VGPRs, the compact LDS layout does not change residency and the experiment stops before timing. If the KV transpose handoff or the complete timing gate fails, close the experiment rather than expanding the source surface with more caches, approximations, ownership changes, or a production ABI change.
+Do not add dynamic scaling, approximate exponentials, FP8 WMMA assumptions, or an ABI selector for experimental quantization. Any successful candidate must remain an internal compile-time variant until it passes symbol metadata, exact correctness, complete timing, and the full D64 matrix.
 
-### Other Deferred Work
+## Artifacts
 
-- A custom D128 performance schedule, only after it is spill-free and below the current 191/192 VGPR boundary.
-- Any FP8 storage follow-up, unless a materially different exact topology first reaches an occupancy or spill cliff that compression can remove.
-- The six-GEMM workspace design, pending a separate memory-budget decision.
-- An upstream AITER CK gfx1151 recipe fix.
-- The broken optional AITER `fused_atomic` wrapper, which currently raises missing-argument `TypeError` and is not a baseline.
-
-There is no active production D64 schedule search outside the compile-time fission experiment. A candidate that fails its gates is closed and the current public source remains unchanged.
-
-## Verification and Artifacts
-
-Repository verification:
-- `test_attn_hip_backward.py`: `4/4` explicit D64/D128 saved-state cases.
-- `test_attn_hip.py`: `168/168` forward cases after the shared ABI cleanup.
-- Clean extension build with separate backward translation units and exactly two linked backward symbols.
-- Python bytecode checks, `git diff --check`, and configured Python hooks pass.
-
-Authoritative artifacts:
-- Public D64 matrix: `~/tmp/feather_attn/bwd_d64_final_four_provider_matrix.json`.
-- Private leader timing and component timing: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/timing_clean.json` and `timing_phases_clean.json`.
-- Private leader correctness: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/correctness.json`.
-- Private leader metadata and disassembly: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/build/attn_stride20_all_lds13312_hip_ext/`.
-- Private leader counters: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/profile/h16_n4096/summary.json`.
-- Private optimization ladder: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/final_best/step11_qualification_summary.json`.
-- Historical accepted/rejected experiments: `~/tmp/feather_attn/candidates/seven_gemm_packed/` and the neighboring campaign directories.
-
-The historical source and timing logs remain available for decision provenance. These two documents describe the current design, current measurements, accepted/rejected decisions, and the remaining work rather than reproducing the old phase-by-phase campaign.
+- Forward matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
+- Current D64 timing run: `/tmp/feather_current_bwd_matrix.json`.
+- Private D64 leader timing: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/timing_phases_clean.json`.
+- Private D64 leader correctness: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/correctness.json`.
+- Private D64 metadata/disassembly: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/build/attn_stride20_all_lds13312_hip_ext/`.
+- Historical packed FP8 screen: `~/tmp/feather_attn/candidates/seven_gemm_packed/qualification_summary.json`.
+- FP16/FP8 conversion reference: `kernel/hip/hip_kernel.cu`.
