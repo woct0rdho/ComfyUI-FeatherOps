@@ -142,11 +142,16 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
         2 * kTransposeStride * kHeadDim * sizeof(_Float16);
     constexpr int q_kv_tile_bytes =
         2 * kInnerBlock * kHeadDim * sizeof(_Float16);
-    constexpr int lds_bytes = kv_bytes + transpose_bytes;
+    constexpr int do_row_stride = 72;
+    constexpr int do_row_bytes =
+        kInnerBlock * do_row_stride * sizeof(_Float16);
+    constexpr int lds_bytes =
+        kv_bytes + transpose_bytes + (kPhase == 1 ? do_row_bytes : 0);
     static_assert(kv_bytes == 8192);
     static_assert(q_kv_tile_bytes == 4096);
+    static_assert(do_row_bytes == 2304);
     static_assert(transpose_bytes == 5120);
-    static_assert(lds_bytes == 13312);
+    static_assert(lds_bytes == (kPhase == 1 ? 15616 : 13312));
 
     alignas(16) __shared__ uint8_t lds[lds_bytes];
     auto* kv_v_lds = reinterpret_cast<_Float16*>(lds);
@@ -156,7 +161,11 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     auto* k_transpose_lds = reinterpret_cast<_Float16*>(transpose_lds);
     auto* q_transpose_lds = reinterpret_cast<_Float16*>(transpose_lds);
     auto* do_transpose_lds = q_transpose_lds + kTransposeStride * kHeadDim;
-    static_assert(transpose_bytes <= lds_bytes - kv_bytes);
+    auto* do_row_lds =
+        reinterpret_cast<_Float16*>(transpose_lds + transpose_bytes);
+    static_assert(
+        transpose_bytes + (kPhase == 1 ? do_row_bytes : 0) <=
+        lds_bytes - kv_bytes);
 
     const int tid = threadIdx.x;
     const int wave = tid / kWaveSize;
@@ -236,6 +245,12 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
                 do_transpose_lds[d * kTransposeStride + stage_row] =
                     do_stage[i];
             }
+            if constexpr(kPhase == 1)
+            {
+                *reinterpret_cast<Half8*>(
+                    do_row_lds + stage_row * do_row_stride +
+                    stage_chunk * kPacked) = do_stage;
+            }
             __syncthreads();
 
             Float8 score = {};
@@ -297,7 +312,13 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
             for(int d_tile = 0; d_tile < kHeadDim / kInnerBlock; ++d_tile)
             {
                 Half16 do_row = {};
-                if(q_start + lane_row < n_q)
+                if constexpr(kPhase == 1)
+                {
+                    do_row = *reinterpret_cast<const Half16*>(
+                        do_row_lds + lane_row * do_row_stride +
+                        d_tile * kInnerBlock);
+                }
+                else if(q_start + lane_row < n_q)
                 {
                     const int offset =
                         q_offset + (q_start + lane_row) * kHeadDim +
