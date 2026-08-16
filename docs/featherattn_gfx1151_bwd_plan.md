@@ -29,7 +29,7 @@ The backward arguments are fixed HND tensors. There is no backward `layout` sele
 
 ## Current Production Design
 
-The D64 kernel uses one 128-thread workgroup per head and ownership tile. The grid has one owner-tile axis sized to the larger of the Q and KV tile counts, so irregular query/KV lengths share one launch without a second selector.
+The D64 kernel uses one 128-thread workgroup per head and ownership tile. Short and irregular inputs use one fused kernel with an owner-tile axis sized to the larger of the Q and KV tile counts. When both query and KV lengths are at least 4096, the launcher uses separate compile-time KV-only and Q-only kernels on the current stream so each phase gets its own register allocation.
 
 | Parameter | Value |
 | --- | ---: |
@@ -46,7 +46,7 @@ The D64 kernel uses one 128-thread workgroup per head and ownership tile. The gr
 
 The KV-owned portion stages V in LDS, caches K rows, cooperatively stages each Q and dO tile into the stride-20 transpose layout, and computes four GEMM-equivalent operations: QK score, dO/V dP, dS/Q dK, and P/dO dV. The Q-owned portion stages K and V in two 16-row tiles, caches Q and dO rows, and computes three operations: QK score, dO/V dP, and dS/K dQ. The C-to-A WMMA handoff converts each FP32 C fragment to the FP16 A-fragment layout with lane permutes.
 
-The complete launch is a Delta helper followed by the seven-GEMM main kernel. Both launches use the caller's current stream. No initialization, workspace clear, FP32-to-FP16 gradient conversion, or reduction helper remains in the current path.
+The complete launch is a Delta helper followed by either the fused seven-GEMM kernel or ordered KV-only and Q-only phase kernels. All launches use the caller's current stream. No initialization, workspace clear, FP32-to-FP16 gradient conversion, or reduction helper remains in the current path.
 
 ## D128 Scope
 
@@ -64,6 +64,19 @@ Feather / AITER = AITER elapsed time / Feather elapsed time
 
 A ratio above `1.000x` means the Feather elapsed time is lower. Complete timing includes the Delta launch, main launch, initialization outside the measured call only when shared by both providers, synchronization, and all helper work inside the provider call. Outputs and Delta were preallocated before the current matrix timing.
 
+## Backward Accuracy Tiers
+
+Backward quantization is judged primarily by gradient direction, not by Rel-L2 alone. The SageBwd validation in `~/sageattention-autotune/tests/test_sagebwd_triton.py` uses `1 - cosine < 0.003` as its direction gate, with Rel-L2 targets of `0.07` for dQ/dK and `0.06` for dV. Feather experiments use the following tiers:
+
+| Tier | Required evidence |
+| --- | --- |
+| Directional candidate | All finite and minimum flattened gradient cosine at least `0.997` (`1 - cosine < 0.003`) for dQ, dK, and dV |
+| Preferred numerical candidate | Directional tier plus maximum Rel-L2 at most `0.10` for each gradient and reported norm-ratio error |
+| Exploratory numerical candidate | Directional tier plus maximum Rel-L2 below `0.20`; this can be retained for a measured speed win, but remains explicitly approximate |
+| Production exact baseline | Existing public elementwise contract and the exact leader's approximately `0.0003` Rel-L2 behavior |
+
+The relaxed exploratory tier is for internal candidate comparison and does not silently change the public API contract. A candidate that passes the directional tier but exceeds `0.10` Rel-L2 is not rejected solely for that reason; complete timing and resource evidence decide whether it is worth retaining.
+
 ## Current Benchmarks
 
 The current matrix uses B1, contiguous HND inputs, equal Q/KV lengths, H `{16,32}`, N `{2048,4096,8192}`, eight warmups, and 30 timed samples per provider. AITER is the FlashAttention Triton backward control. The values below are recomputed with `F7`, not the older five-GEMM field.
@@ -72,27 +85,29 @@ Every H/N row in the current D64 matrix is shown. The current direct-output Feat
 
 | Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 16 | 2048 | 25.986 | 27.620 | 1.063x |
-| HND | 16 | 4096 | 26.704 | 28.167 | 1.055x |
-| HND | 16 | 8192 | 26.493 | 29.226 | 1.103x |
-| HND | 32 | 2048 | 25.726 | 27.748 | 1.079x |
-| HND | 32 | 4096 | 25.395 | 29.050 | 1.144x |
-| HND | 32 | 8192 | 25.342 | 29.242 | 1.154x |
+| HND | 16 | 2048 | 26.215 | 27.635 | 1.054x |
+| HND | 16 | 4096 | 26.467 | 28.340 | 1.071x |
+| HND | 16 | 8192 | 26.447 | 29.696 | 1.123x |
+| HND | 32 | 2048 | 25.585 | 27.836 | 1.088x |
+| HND | 32 | 4096 | 25.403 | 29.221 | 1.150x |
+| HND | 32 | 8192 | 25.106 | 29.784 | 1.186x |
 
 The public D64 contract screen additionally covers `(NQ,NKV) = (33,35), (65,67), (65,129)` and batch two. The private candidate screen covers `(65,64), (129,65), (256,256), (257,257), (512,513)`, plus batch two and a cancellation pattern.
 
 ## Resource and Profile Results
 
-The symbol-matched private leader that was promoted into the repository has the following gfx1151 profile:
+The symbol-matched linked production image has the following gfx1151 profile:
 
 | Symbol/workgroup | Logical VGPRs | Allocated VGPRs | SGPRs | LDS | Private/spills |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| D64 seven-GEMM main, 128 threads | 178 | 192 | 46 | 13,312 B | 0 / 0 |
+| D64 fused main, 128 threads | 178 | 192 | 45 | 13,312 B | 0 / 0 |
+| D64 KV-only long phase, 128 threads | 175 | 192 | 33 | 13,312 B | 0 / 0 |
+| D64 Q-only long phase, 128 threads | 162 | 168 | 34 | 13,312 B | 0 / 0 |
 | Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 |
 
-The private six-case correctness screen reports maximum relative L2 `0.00030204`, minimum cosine `0.99999988`, and maximum absolute error `0.00121403`. The full-image counter pass reports occupancy `46.62%`, `426.889 M` VALU instructions, `77.611 M` LDS instructions, `12.457 B` wave cycles, `2.440 B` wait-any cycles, `1.076 B` barrier waits, LDS latency `106.73` cycles, LDS conflict metric `24.32`, and ALU stalled by LDS `2.10%`.
+The linked fused symbol contains 2,748 static instructions: 40 WMMA, 1,540 VALU, 941 SALU, 32 `v_perm_b32`, 16 cross-half permutes, 72 LDS loads, 40 LDS stores, 54 global loads, and 96 global stores. The linked KV-only and Q-only symbols contain 1,529 and 1,242 static instructions respectively, with 16 WMMA each for KV and 24 WMMA for Q. The six-case production correctness snapshot reports maximum relative L2 `0.00030144`, minimum per-head cosine `0.99999988`, and maximum absolute error `0.00119209`. The earlier full-image counter pass reports occupancy `46.62%`, `426.889 M` VALU instructions, `77.611 M` LDS instructions, `12.457 B` wave cycles, `2.440 B` wait-any cycles, `1.076 B` barrier waits, LDS latency `106.73` cycles, LDS conflict metric `24.32`, and ALU stalled by LDS `2.10%` for the fused baseline.
 
-The private H16/N4096/D64 complete result is `8.495935 ms` (`28.310 TFLOPS` under F7). The component result is:
+The post-integration H16/N4096/D64 production result is `8.486947 ms` (`28.340 TFLOPS` under F7). The private exact leader result was `8.495935 ms` (`28.310 TFLOPS`), and the former campaign target was `8.417913 ms`; none is a fixed promotion gate. A candidate may be retained at any margin when repeated paired measurements provide credible evidence that it is faster. The component result remains the phase attribution for the exact leader:
 
 | Portion | GEMM equivalents | Net ms | Normalized TFLOPS |
 | --- | ---: | ---: | ---: |
@@ -100,7 +115,28 @@ The private H16/N4096/D64 complete result is `8.495935 ms` (`28.310 TFLOPS` unde
 | Q-owned | 3 | 3.399451 | 30.322 |
 | Full seven-GEMM image | 7 | 8.495935 | 28.310 |
 
-The KV portion is the slower side per nominal GEMM. It remains the first target for any FP8 experiment, but the experiment must reduce complete time rather than only LDS bytes.
+The KV portion is the slower side per nominal GEMM. It remains the first target for phase-specific work, but an experiment must reduce complete time rather than only static resources.
+
+The compile-time phase-fission fixture built from the linked exact source produces three symbol-matched kernels:
+
+| Exact symbol | Logical / allocated VGPRs | SGPRs | LDS | Private/spills | Static instructions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Fused KV+Q | 178 / 192 | 45 | 13,312 B | 0 / 0 | 2,748 |
+| KV-only | 175 / 192 | 33 | 13,312 B | 0 / 0 | 1,529 |
+| Q-only | 162 / 168 | 34 | 13,312 B | 0 / 0 | 1,242 |
+
+Fission is bit-identical to the fused fixture across all six research correctness cases. Fifty-sample complete timing, including Delta and both fission launches, gives:
+
+| H | N | Fission ms | Fission / matched fused | Fission / production |
+| ---: | ---: | ---: | ---: | ---: |
+| 16 | 2048 | 2.168165 | 0.9994x | 0.9918x |
+| 16 | 4096 | 8.390506 | 1.0122x | 1.0106x |
+| 16 | 8192 | 32.261520 | 1.0161x | 1.0184x |
+| 32 | 2048 | 4.371885 | 1.0052x | 0.9994x |
+| 32 | 4096 | 16.644175 | 1.0105x | 1.0105x |
+| 32 | 8192 | 65.940956 | 1.0136x | 1.0139x |
+
+The six-row geometric mean is `1.00950x` versus the matched fused image and `1.00739x` versus current production. A subsequent 120-pair confirmation gives a `1.01264x` geometric speedup across the four N4096/N8192 rows. Every long row wins all 12 ten-sample timing blocks, and paired bootstrap 95% intervals range from `[1.00867, 1.01304]` at H16/N4096 to `[1.01375, 1.01496]` at H32/N8192. N2048 remains inconsistent between runs, so the retained selector requires both Q and KV lengths to be at least 4096.
 
 - The current D64 leader is direct-output, 13,312-byte LDS, 178 logical/192 allocated VGPRs, and no private memory or spills. Its P and dS values currently remain in FP32 C fragments and go through the exact FP32-to-FP16 C-to-A handoff.
 - The forward Q path already stores E5M2 bytes through a `uint8x16` lane-vector pattern in `featherattn_fwd_kernel.h`. That path uses RNE and log2 prescaling for forward Q, so its accuracy policy cannot be copied blindly to backward P or dS.
@@ -131,9 +167,17 @@ The historical owned variants `owned-order`, `owned-lifetime`, `owned-exp2`, `ow
 | --- | --- |
 | Direct-output seven-GEMM D64 schedule | Accepted and linked as the current production kernel |
 | Unique output ownership, C-to-A handoff, stride-20 transpose, lifetime-local LDS | Accepted mechanisms |
+| FP8 campaign baseline freeze | Completed: linked metadata/disassembly, six-case correctness, six-row timing matrix, and H16/N4096 component timing recorded |
+| Raw high-byte E5M2 truncation | Accepted as an experimental finite-only primitive: all 65,536 GPU encodings match `half_bits >> 8`; signed zero, infinity, sign, and non-increasing finite magnitude are verified |
+| Explicit two-permute E5M2 pack | Accepted for candidate integration: bit-exact, 42.1% faster than scalar shift/OR pack and 29.9% faster for pack/decode round-trip in the isolated fixture; 15 versus 16 logical VGPRs |
+| Vectorized P-only truncation | Rejected after six-row complete timing: directionally valid, but `0.979607x` geometric mean versus the matched exact image and slower on every row; it adds 68 static instructions, 70 VALU operations, and 10 `v_perm_b32` while remaining in the 192-VGPR class |
+| Vectorized dS-only truncation | Rejected after six-row complete timing: directionally valid, but `0.996503x` geometric mean versus the matched exact image and no row wins; it adds 21 static instructions and 18 `v_perm_b32` while remaining in the 192-VGPR class |
+| Vectorized P+dS truncation | Rejected before timing: maximum Rel-L2 `0.189359` is exploratory-eligible, but minimum flattened cosine `0.996022` and minimum per-head cosine `0.994891` fail the primary direction gate; 172 logical VGPRs still allocate 192 and SGPRs rise to 49 |
+| Transient P/dS pack followed by immediate decode | Rejected for the current topology: no LDS/global traffic is removed, no allocation class is crossed, and software pack/decode work increases complete time |
+| Compile-time KV/Q phase fission | Accepted and integrated for NQ/NKV at least 4096: bit-identical outputs, Q-only falls from 192 to 168 allocated VGPRs, the 120-pair long-row confirmation is `1.01264x` geometric with 48/48 timing-block wins, and short rows remain fused |
 | Old atomic FP32 D64 kernel | Removed; no source, selector, workspace, or linked image remains |
 | `owned`, `paired`, automatic selection, and duplicate D64 reference paths | Removed from production |
-| FP8 P/dS truncation | Deferred to the gated plan above; not in current production |
+| FP8 P/dS truncation | Rejected for the current direct-fragment topology; revisit only if a future schedule creates persistent P/dS storage whose byte reduction can repay software conversion |
 | Six-GEMM N-squared workspace design | Deferred; it requires approximately 256 MiB intermediate storage and 512 MiB extra traffic at the reference shape |
 | Stock AITER CK backward | Blocked on gfx1151 receipt generation; retained only as external evidence |
 
@@ -141,27 +185,20 @@ The historical owned variants `owned-order`, `owned-lifetime`, `owned-exp2`, `ow
 
 - Keep the `168/168` forward contract and the current six-row D64 backward matrix as regression gates.
 - Design D128 as a separate seven-GEMM effort; do not restore the deleted reference kernel.
-- Evaluate FP8 E5M2 only through the isolated truncation, vectorized pack/decode, resource, correctness, and complete-timing gates above.
+- Continue phase-specific KV-only work. Its measured `175/192` VGPR profile leaves a possible allocation-class reduction as the next high-upside exact optimization.
 - Preserve HND, natural-log LSE, current-device validation, and current-stream execution while changing the internal schedule.
 
 ### Proposed Sequence
 
-- Freeze the current baseline. Record symbol-matched metadata, disassembly counts, six-case exact correctness, full H/N timings, and complete H16/N4096 timing. Keep the admission target below `8.417913 ms` and retain the seven-GEMM F7 convention.
-- Build an isolated truncation fixture. For an FP16 input, bit-cast to `uint16_t` and take the high byte as E5M2: `e5m2 = half_bits >> 8`. Test all 65,536 FP16 encodings, including signed zero, subnormals, infinities, NaNs, and negative values. Define the treatment of exponent-zero and non-finite values before integrating.
-- Vectorize the pack path. Start with eight half values per lane and pack two `uint32_t` words containing eight E5M2 bytes. Compare a shift/pack sequence against `__builtin_amdgcn_perm` byte assembly. Use the `fp8e5m2x4_to_half2x2` layout as the decode oracle. Measure VALU, permute, LDS byte traffic, and register counts in a standalone fixture before inserting the code into attention.
-- Try P-only first. P has the lower historical allocation result and is consumed by dV in the KV-owned portion and by dQ in the Q-owned portion. Replace only the current C-to-A P handoff with truncating FP8 pack plus vectorized decode. Keep dS exact. Do not add per-tile scales in the first candidate.
-- Test only real reuse. A transient pack followed immediately by a decode is a win only if it reduces live VGPRs or replaces an existing expensive conversion. If it only adds pack and permute instructions, close the candidate. The next version may store packed P in the existing lifetime-local LDS reservation, but only if the stored bytes eliminate a global/LDS round trip or cross a resource class.
-- Try dS-only second. Use the same path for dS, preserving exact P. The old screen suggests dS is more likely to hit the 192-VGPR class, so this candidate must show a resource crossing rather than just a smaller LDS number.
-- Try P+dS only after both single-state tests. Keep the two state layouts disjoint in lifetime and alias them where possible. Do not carry two decoders or two packed representations simultaneously unless metadata proves the added code still fits the current resource gates.
-- Run correctness before timing. Require finite outputs, maximum relative L2 at most `0.01`, minimum per-head cosine at least `0.9995`, norm-ratio error at most `0.01`, and the existing public allclose gate across the six exact cases and the cancellation case. The broad `0.10` allclose threshold is not sufficient for promotion because the current exact leader is much more accurate.
-- Check symbol-scoped resources and ISA. Require at most `192` allocated VGPRs, at most `13,312` bytes LDS unless the smaller LDS crosses a measured occupancy class, zero private memory, zero spills, and no materially higher permute/VALU count without a corresponding timing reduction. A candidate that remains in the same allocation class and adds more than the measured conversion work is closed.
-- Use complete timing as the gate. First require at least a repeatable `5%` complete improvement over the current D64 leader and a result below `8.417913 ms` at H16/N4096. Then run every D64 H/N row in the table. No isolated kernel-phase result, lower LDS byte count, or single `8.385254 ms` observation is sufficient for promotion.
+- Isolate the KV-only symbol and target a reduction to at most 168 logical VGPRs or a measured LDS/traffic reduction without changing exact numerics.
+- Rebuild and run the full resource, correctness, public-contract, forward-regression, and six-row complete-timing gates for any KV-only change; retain it only with repeated paired evidence.
+- Use complete timing as the gate. Smaller improvements may be retained when repeated paired samples show credible positive evidence and the six-row matrix has no material regression. No isolated phase result, lower LDS byte count, or one fast observation is sufficient for promotion.
 
 ### Expected Outcomes and Stop Conditions
 
-The highest-probability outcome is that direct P/dS FP8 compression fails to pay: the current leader does not store these states in LDS, and gfx1151's permute-based decode can consume the saved bytes. If the vectorized truncation fixture shows no allocation-class crossing, stop before a full attention integration. If P-only reaches a lower class with preferred numerics, continue to dS-only; otherwise keep the exact current kernel.
+The direct P/dS FP8 campaign is closed for the current topology: the exact numerical path remains production, and phase fission is the retained exact optimization. Future work should reduce the KV-only resource class or traffic; do not reopen approximate state unless a future schedule creates persistent P/dS storage whose byte reduction can repay conversion.
 
-Do not add dynamic scaling, approximate exponentials, FP8 WMMA assumptions, or an ABI selector for experimental quantization. Any successful candidate must remain an internal compile-time variant until it passes symbol metadata, exact correctness, complete timing, and the full D64 matrix.
+Do not add dynamic scaling, approximate exponentials, FP8 WMMA assumptions, or an ABI selector for experimental quantization. Raw truncation is finite-only: 510 of 2,046 FP16 subnormals become signed zero and 510 low-payload NaNs become infinity. Attention integration therefore requires finite P/dS inputs and the explicit finite-output gate. Any successful candidate must remain an internal compile-time variant until it passes symbol metadata, the directional accuracy tier, complete timing, and the full D64 matrix.
 
 ## Artifacts
 
@@ -172,3 +209,5 @@ Do not add dynamic scaling, approximate exponentials, FP8 WMMA assumptions, or a
 - Private D64 metadata/disassembly: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/build/attn_stride20_all_lds13312_hip_ext/`.
 - Historical packed FP8 screen: `~/tmp/feather_attn/candidates/seven_gemm_packed/qualification_summary.json`.
 - FP16/FP8 conversion reference: `kernel/hip/hip_kernel.cu`.
+- Active FP8 campaign: `~/tmp/feather_attn/e5m2_truncation_campaign/`.
+- Phase-fission fixture and paired evidence: `~/tmp/feather_attn/phase_fission_campaign/`.
