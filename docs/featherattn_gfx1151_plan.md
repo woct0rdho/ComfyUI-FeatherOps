@@ -6,8 +6,7 @@ The gfx1151 forward kernel is production-qualified for dense non-causal FP16 att
 
 The current result is:
 - `168/168` public-contract cases pass.
-- The authoritative 36-row performance matrix has `31/36` FeatherAttn wins over the FlashAttention AITER Triton kernel.
-- Geometric-mean throughput is `32.258 TFLOPS` for FeatherAttn and `29.397 TFLOPS` for AITER, a `1.097x` Feather/AITER ratio.
+- The complete 36-row performance matrix is shown below, with no aggregate or representative-row summary replacing individual shapes.
 - All 20 linked forward images stay at or below 191 used VGPRs, 32,768 bytes LDS, zero private memory, and zero SGPR/VGPR spills.
 - No forward optimization experiment is currently open. New work must be justified by a measured bottleneck and an explicit promotion gate.
 
@@ -150,31 +149,53 @@ TFLOPS = FLOPs / elapsed_seconds / 1e12
 
 Raw matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
 
-### Aggregate Results
+### D64 Results
 
-| Layout | D | AITER geomean TFLOPS | Feather geomean TFLOPS | Feather / AITER | Feather wins |
+Every layout, head count, and sequence length in the authoritative matrix is listed here. `Feather / AITER` is the throughput ratio; values above `1.000x` favor FeatherAttn.
+
+| Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 64 | 30.941 | 34.071 | 1.101x | 9/9 |
-| HND | 128 | 31.354 | 34.078 | 1.087x | 8/9 |
-| NHD | 64 | 29.248 | 30.643 | 1.048x | 6/9 |
-| NHD | 128 | 26.322 | 30.434 | 1.156x | 8/9 |
-| All | 64/128 | 29.397 | 32.258 | 1.097x | 31/36 |
+| HND | 16 | 4096 | 33.981 | 35.898 | 1.056x |
+| HND | 16 | 8192 | 32.144 | 33.999 | 1.058x |
+| HND | 16 | 16384 | 31.747 | 33.580 | 1.058x |
+| HND | 32 | 4096 | 32.698 | 34.870 | 1.066x |
+| HND | 32 | 8192 | 31.047 | 33.793 | 1.088x |
+| HND | 32 | 16384 | 29.395 | 33.654 | 1.145x |
+| HND | 56 | 4096 | 29.749 | 33.776 | 1.135x |
+| HND | 56 | 8192 | 28.972 | 33.386 | 1.152x |
+| HND | 56 | 16384 | 29.140 | 33.761 | 1.159x |
+| NHD | 16 | 4096 | 32.908 | 32.522 | 0.988x |
+| NHD | 16 | 8192 | 32.007 | 31.376 | 0.980x |
+| NHD | 16 | 16384 | 31.943 | 31.197 | 0.977x |
+| NHD | 32 | 4096 | 31.037 | 31.258 | 1.007x |
+| NHD | 32 | 8192 | 28.596 | 29.960 | 1.048x |
+| NHD | 32 | 16384 | 22.754 | 29.088 | 1.278x |
+| NHD | 56 | 4096 | 29.068 | 30.820 | 1.060x |
+| NHD | 56 | 8192 | 28.092 | 29.749 | 1.059x |
+| NHD | 56 | 16384 | 28.228 | 29.959 | 1.061x |
 
-### Representative Rows
+### D128 Results
 
-These rows show the fast paths, the small regressions that remain, and the long-NHD grouping gains without reproducing the complete 36-row matrix.
-
-| Layout | D | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HND | 64 | 16 | 4096 | 33.981 | 35.898 | 1.056x |
-| HND | 64 | 56 | 16384 | 29.140 | 33.761 | 1.159x |
-| HND | 128 | 16 | 4096 | 35.015 | 34.262 | 0.978x |
-| HND | 128 | 56 | 4096 | 28.927 | 34.007 | 1.176x |
-| NHD | 64 | 16 | 16384 | 31.943 | 31.197 | 0.977x |
-| NHD | 64 | 32 | 16384 | 22.754 | 29.088 | 1.278x |
-| NHD | 128 | 16 | 4096 | 31.842 | 31.202 | 0.980x |
-| NHD | 128 | 32 | 8192 | 21.718 | 30.168 | 1.389x |
-| NHD | 128 | 32 | 16384 | 21.566 | 27.393 | 1.270x |
+| Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HND | 16 | 4096 | 35.015 | 34.262 | 0.978x |
+| HND | 16 | 8192 | 32.737 | 33.444 | 1.022x |
+| HND | 16 | 16384 | 31.653 | 34.120 | 1.078x |
+| HND | 32 | 4096 | 31.800 | 34.731 | 1.092x |
+| HND | 32 | 8192 | 30.872 | 33.641 | 1.090x |
+| HND | 32 | 16384 | 30.822 | 34.419 | 1.117x |
+| HND | 56 | 4096 | 28.927 | 34.007 | 1.176x |
+| HND | 56 | 8192 | 30.109 | 33.727 | 1.120x |
+| HND | 56 | 16384 | 30.628 | 34.372 | 1.122x |
+| NHD | 16 | 4096 | 31.842 | 31.202 | 0.980x |
+| NHD | 16 | 8192 | 30.660 | 30.811 | 1.005x |
+| NHD | 16 | 16384 | 24.062 | 30.240 | 1.257x |
+| NHD | 32 | 4096 | 26.009 | 30.367 | 1.168x |
+| NHD | 32 | 8192 | 21.718 | 30.168 | 1.389x |
+| NHD | 32 | 16384 | 21.566 | 27.393 | 1.270x |
+| NHD | 56 | 4096 | 26.901 | 30.890 | 1.148x |
+| NHD | 56 | 8192 | 27.655 | 31.598 | 1.143x |
+| NHD | 56 | 16384 | 28.485 | 31.454 | 1.104x |
 
 Short, independent-tail, arbitrary-head, and batch-two cases are correctness requirements rather than part of this throughput matrix. The `168/168` public test covers lengths from 1 through 16,384, the `1023/1024/1025` tolerance boundary, independent query/KV tails, odd head counts, and batch two.
 

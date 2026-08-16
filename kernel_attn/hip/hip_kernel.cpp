@@ -341,14 +341,6 @@ bool IsInt32Addressable(
     return max_element_offset * element_size <= INT32_MAX;
 }
 
-using BackwardLauncher = bool (*)(const BackwardLaunchParams&);
-
-BackwardLauncher SelectBackwardLauncher(int64_t implementation)
-{
-    return implementation == 0 ? feather_attn_bwd_d128_reference
-                               : feather_attn_bwd_d64_fused;
-}
-
 } // namespace
 
 void AttnBwdFp16Feather(
@@ -362,14 +354,11 @@ void AttnBwdFp16Feather(
     torch::stable::Tensor& dk,
     torch::stable::Tensor& dv,
     torch::stable::Tensor& delta,
-    torch::stable::Tensor& dq_acc,
-    torch::stable::Tensor& dk_acc,
-    torch::stable::Tensor& dv_acc,
     double sm_scale,
     int64_t implementation)
 {
-    STD_TORCH_CHECK(implementation == 0 || implementation == 1,
-                    "backward implementation must be reference or fused");
+    STD_TORCH_CHECK(implementation == 1,
+                    "only fused D64 backward is currently supported");
     STD_TORCH_CHECK(q.is_cuda(), "all backward tensors must be CUDA tensors");
     const auto device_index = q.get_device_index();
     auto CheckDevice = [&](const torch::stable::Tensor& tensor) {
@@ -386,9 +375,6 @@ void AttnBwdFp16Feather(
     CheckDevice(dk);
     CheckDevice(dv);
     CheckDevice(delta);
-    CheckDevice(dq_acc);
-    CheckDevice(dk_acc);
-    CheckDevice(dv_acc);
     STD_TORCH_CHECK(q.scalar_type() == torch::stable::ScalarType::Half &&
                         k.scalar_type() == torch::stable::ScalarType::Half &&
                         v.scalar_type() == torch::stable::ScalarType::Half &&
@@ -399,11 +385,8 @@ void AttnBwdFp16Feather(
                         dv.scalar_type() == torch::stable::ScalarType::Half,
                     "q, k, v, out, dout, dq, dk, and dv must be float16");
     STD_TORCH_CHECK(lse.scalar_type() == torch::stable::ScalarType::Float &&
-                        delta.scalar_type() == torch::stable::ScalarType::Float &&
-                        dq_acc.scalar_type() == torch::stable::ScalarType::Float &&
-                        dk_acc.scalar_type() == torch::stable::ScalarType::Float &&
-                        dv_acc.scalar_type() == torch::stable::ScalarType::Float,
-                    "lse, delta, dq_acc, dk_acc, and dv_acc must be float32");
+                        delta.scalar_type() == torch::stable::ScalarType::Float,
+                    "lse and delta must be float32");
     auto CheckAttentionDim = [&](const torch::stable::Tensor& tensor) {
         STD_TORCH_CHECK(tensor.dim() == 4, "attention tensors must be 4D");
     };
@@ -423,19 +406,8 @@ void AttnBwdFp16Feather(
     const int64_t n_kv = k.size(2);
     STD_TORCH_CHECK(batch > 0 && heads > 0 && n_q > 0 && n_kv > 0,
                     "attention dimensions must be positive");
-    STD_TORCH_CHECK(head_dim == 64 || head_dim == 128,
-                    "head dimension must be 64 or 128");
-    STD_TORCH_CHECK(implementation != 0 || head_dim == 128,
-                    "reference backward supports D128 only");
-    STD_TORCH_CHECK(implementation != 1 || head_dim == 64,
-                    "fused backward supports D64 only");
-    const bool needs_workspace = implementation == 1;
-    if(needs_workspace)
-    {
-        CheckAttentionDim(dq_acc);
-        CheckAttentionDim(dk_acc);
-        CheckAttentionDim(dv_acc);
-    }
+    STD_TORCH_CHECK(head_dim == 64,
+                    "only D64 fused backward is currently supported");
     STD_TORCH_CHECK(lse.dim() == 3 && delta.dim() == 3,
                     "lse and delta must be [B, H, N]");
     STD_TORCH_CHECK(k.size(0) == batch && v.size(0) == batch &&
@@ -459,19 +431,6 @@ void AttnBwdFp16Feather(
                         dq.size(3) == head_dim && dk.size(3) == head_dim &&
                         dv.size(3) == head_dim,
                     "head dimensions must match");
-    if(needs_workspace)
-    {
-        STD_TORCH_CHECK(
-            dq_acc.size(0) == batch && dq_acc.size(1) == heads &&
-                dq_acc.size(2) == n_q && dq_acc.size(3) == head_dim,
-            "dq_acc must have the query shape");
-        STD_TORCH_CHECK(
-            dk_acc.size(0) == batch && dv_acc.size(0) == batch &&
-                dk_acc.size(1) == heads && dv_acc.size(1) == heads &&
-                dk_acc.size(2) == n_kv && dv_acc.size(2) == n_kv &&
-                dk_acc.size(3) == head_dim && dv_acc.size(3) == head_dim,
-            "dK/dV workspaces must have the key/value shapes");
-    }
     STD_TORCH_CHECK(lse.size(0) == batch && lse.size(1) == heads &&
                         lse.size(2) == n_q && delta.size(0) == batch &&
                         delta.size(1) == heads && delta.size(2) == n_q,
@@ -490,16 +449,6 @@ void AttnBwdFp16Feather(
     CheckAttentionLayout(dq);
     CheckAttentionLayout(dk);
     CheckAttentionLayout(dv);
-    if(needs_workspace)
-    {
-        STD_TORCH_CHECK(dq_acc.is_contiguous() && dk_acc.is_contiguous() &&
-                            dv_acc.is_contiguous(),
-                        "gradient workspaces must be contiguous");
-        STD_TORCH_CHECK(IsInt32Addressable(dq_acc, sizeof(float)) &&
-                            IsInt32Addressable(dk_acc, sizeof(float)) &&
-                            IsInt32Addressable(dv_acc, sizeof(float)),
-                        "a gradient workspace exceeds signed-int32 addressing");
-    }
     STD_TORCH_CHECK(IsContiguous3D(lse) && IsContiguous3D(delta),
                     "lse and delta must be contiguous");
     STD_TORCH_CHECK(IsInt32Addressable(lse, sizeof(float)) &&
@@ -536,18 +485,13 @@ void AttnBwdFp16Feather(
         dk.mutable_data_ptr(),
         dv.mutable_data_ptr(),
         delta.mutable_data_ptr(),
-        dq_acc.mutable_data_ptr(),
-        dk_acc.mutable_data_ptr(),
-        dv_acc.mutable_data_ptr(),
         static_cast<int32_t>(head_count),
         static_cast<int32_t>(n_q),
         static_cast<int32_t>(n_kv),
         static_cast<float>(sm_scale),
         reinterpret_cast<hipStream_t>(raw_stream)};
-    const BackwardLauncher launcher = SelectBackwardLauncher(implementation);
-
     (void)hipGetLastError();
-    const bool launched = launcher(params);
+    const bool launched = feather_attn_bwd_d64_fused(params);
     const hipError_t launch_error = hipGetLastError();
     STD_TORCH_CHECK(launched && launch_error == hipSuccess,
                     "FeatherAttn backward launch failed: ",
@@ -562,7 +506,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn_fp16, m)
         "attn_bwd_fp16_feather("
         "Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor dout, "
         "Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) delta, "
-        "Tensor(e!) dq_acc, Tensor(f!) dk_acc, Tensor(g!) dv_acc, "
         "float sm_scale, int implementation"
         ") -> ()");
 }
