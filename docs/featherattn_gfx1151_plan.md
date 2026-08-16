@@ -7,8 +7,10 @@ The gfx1151 forward kernel is production-qualified for dense non-causal FP16 att
 The current result is:
 - `168/168` public-contract cases pass.
 - The complete 36-row performance matrix is shown below, with no aggregate or representative-row summary replacing individual shapes.
-- All 20 linked forward images stay at or below 191 used VGPRs, 32,768 bytes LDS, zero private memory, and zero SGPR/VGPR spills.
-- No forward optimization experiment is currently open. New work must be justified by a measured bottleneck and an explicit promotion gate.
+- All 20 qualified forward images stay at or below 191 used VGPRs, 32,768 bytes LDS, zero private memory, and zero SGPR/VGPR spills.
+- A disposable packed-RNE encoding candidate passed the public contract and resource gates, but did not produce a repeatable complete-kernel speedup. It was not promoted.
+- A disposable truncation candidate reduced code further but failed the attention numerical gate. It is closed.
+- No production optimization is currently open. Any reopening must follow the ranked plan and promotion gates below.
 
 Hardware and execution assumptions:
 
@@ -19,6 +21,22 @@ Hardware and execution assumptions:
 | Wave size | 32 |
 | Main comparison | FlashAttention AITER Triton `attn_fwd` |
 | Arithmetic | FP16 WMMA with FP32 score and output accumulation |
+
+## Investigation Closeout
+
+The final exploratory question was whether the Q FP16-to-E5M2 path could remove RNE work or use explicit packed operations without changing the production contract.
+
+| Candidate | Numerical result | Linked resource result | Timing result | Decision |
+| --- | --- | --- | --- | --- |
+| Packed RNE encoding | `168/168` public cases; bitwise identical to the scalar-RNE aligned image in the focused comparison | Same 20-image resource envelope; D64/D128 stayed at the existing VGPR and LDS values | 12 aligned paired rows: `0.9969x` geometric mean, 4/12 wins, range `0.9828x-1.0063x` | Promising ISA experiment, no promotion |
+| Naive E5M2 truncation | Exhaustive 65,536-pattern conversion probe had zero GPU-reference mismatches, but attention tests reached `Rel-L2` about `0.122-0.125` and failed elementwise cases | No resource issue in the disposable aligned image | Not relevant after numerical failure | Closed |
+| Half-up alternative | Finite and contract-qualified in the prior campaign, but not output-exact and had no repeatable timing gain | No useful allocation transition | Prior robust result was `-0.176%` overall | Closed; retain RNE |
+
+The packed-RNE candidate was compiled with the recovered production-equivalent command, linked with all aligned, query-tail, KV-tail, combined-tail, and D64 NHD strided translation units, and exercised through the host selector. Its ISA reduction is real: in representative HND symbols, D64 changed from 8,224 to 7,500 code bytes and from 1,250 to 1,158 encoded instructions; D128 changed from 13,104 to 11,620 bytes and from 1,949 to 1,739 instructions. Scalar `v_lshrrev_b16` and `v_add_nc_u16` packing operations were replaced by packed 16-bit operations and byte permutes. The work is paid once per query tile and is therefore mostly amortized by the KV loop, which explains the neutral complete-kernel timing.
+
+The truncation probe is useful for understanding conversion semantics, not for promotion. It preserved signs and did not increase finite magnitudes, but 510 of 2,046 subnormal inputs became zero and 510 of 2,046 NaN inputs became infinity. Removing RNE is consequently a numerical-policy change, not an instruction substitution.
+
+The screening timing used the frozen phase-11c aligned baseline and 20 alternating samples per row. It did not replace the authoritative 36-row matrix or exercise a production selector change. Production source, ABI, dispatch, and registration remain unchanged.
 
 ## Public Contract
 
@@ -95,6 +113,8 @@ The kernel is compile-time specialized by:
 
 The base set contains 16 images. Four additional D64 NHD strided images implement the accepted long-sequence partition-aware mapping.
 
+The host selector is `SelectLauncher(int64_t head_dim, bool nhd, bool pad_q, bool pad_kv)`. It selects the D64 or D128 HND/NHD entry point from the query-tail and KV-tail flags; aligned, query-tail, KV-tail, and combined-tail paths are distinct symbols. The separate D64 NHD strided selector is used only after the long-sequence grouping policy admits partition-aware launches. This selector topology and the raw ABI are part of the qualified contract.
+
 HND uses flattened batch/head ownership. NHD makes head the fastest grid axis so adjacent workgroups touch adjacent head offsets. Two bounded host policies handle long NHD tensors:
 - D128 may split heads into sequential LLC-sized groups when the total K/V working set is large enough to benefit.
 - D64 may use the strided physical-head mapping `group_index + local_head * group_count`. The selector avoids group counts divisible by eight because those strides recreate the gfx1151 memory-partition cliff.
@@ -104,6 +124,19 @@ All sublaunches run on the caller's current stream. Tail selection and grouping 
 ### Q Decode Caching
 
 D64 HND has enough register headroom to cache decoded Q fragments across KV tiles. Aligned, query-tail, and combined-tail images cache all four D16 fragments; the KV-tail image caches three. D64 NHD and all D128 images retain decode-on-use because their measured tradeoffs or resource pressure do not justify persistent decoded Q state.
+
+### E5M2 Conversion and Packing
+
+The numerical baseline is RNE. The current scalar encoder is equivalent to:
+
+```text
+rounded = fp16_bits + 0x007f + ((fp16_bits >> 8) & 1)
+e5m2 = rounded >> 8
+```
+
+The decode path already loads packed bytes and uses `v_perm_b32`. gfx1151 has no native FP8 WMMA path, so Q quantization and decode are VALU/frontend work around FP16 WMMA; prior tracing attributed roughly 23% of math-pipeline execution to unpacking. Explicit `uint32` packing with `0x07050301` byte-permute control is the strongest low-risk instruction-level lead found so far, but its setup cost is too small relative to the KV loop to justify a standalone production change.
+
+The packed candidate must be treated as an integrated kernel candidate. A standalone pack microbenchmark measured `0.0563 ms` versus `0.0974 ms` for scalar packing, but the complete aligned kernel did not reproduce that gain. Future work should only revisit packing when it is fused with Q load/scale and also shortens live state or creates an occupancy transition.
 
 ### Source Organization
 
@@ -126,7 +159,7 @@ The table reports exact loaded gfx1151 metadata from the qualified production ex
 | Kernel group | Used VGPRs | LDS | Private/spills | Notes |
 | --- | ---: | ---: | ---: | --- |
 | D64 HND, all tail modes | 171-175 | 16,384 B | 0 / 0 | Expanded decoded-Q cache |
-| D64 NHD, base and strided | 130-151 | 16,384 B | 0 / 0 | Includes four partition-aware images |
+| D64 NHD, base and strided | 130-162 | 16,384 B | 0 / 0 | Includes four partition-aware images; the combined-tail image is the upper end |
 | D128 HND, all tail modes | 191 | 32,768 B | 0 / 0 | Resource-pinned |
 | D128 NHD, all tail modes | 191 | 32,768 B | 0 / 0 | Resource-pinned; optional grouped launches |
 
@@ -256,15 +289,28 @@ The D128 residual is not the primary bottleneck: prior pressure profiles measure
 | D64 HND `Br=128,Bc=128` | 242 VGPRs, 50 above the hard gate | Rejected before timing |
 | Tile-local FP16 PV WMMA buffer | Correct at existing tolerances, but HND geomean `-8.739%` and near-192-VGPR pressure | Rejected |
 | D128 decoded-Q cache or double buffering | D128 already uses 191 VGPRs and the full 32 KiB LDS budget | Not admitted without prior resource reduction |
+| Packed RNE Q encoding | Representative HND code size fell 8.8% at D64 and 11.3% at D128, but the 12-row aligned screening geomean was `0.9969x` with no resource transition | Keep as a future fused-frontend lead, not a standalone change |
+| Naive E5M2 truncation | Attention numerical failures despite a clean exhaustive bit-conversion probe; it changes subnormal and NaN behavior | Closed unless a separately specified numerical policy is approved |
 
-## Remaining Work
+## Ranked Forward Plan
 
-The forward path is closed for production optimization until new profiling identifies a material opportunity. Remaining work is maintenance or explicitly deferred scope:
-- Keep the `168/168` public contract and 36-row AITER matrix as regression gates for any shared host, ABI, compiler, or CK Tile change.
-- Revisit D128 only if a source change first lowers the loaded image below the current 191-VGPR or 32-KiB limit. Do not add persistent state to the current image.
-- Admit a local schedule change only with at least a repeatable `0.5%` target-domain geomean gain, majority wins, no regression above `1%`, unchanged correctness, and no resource regression.
-- Admit a new tile shape or launch policy only with at least a `5%` target-domain geomean gain and no effect on non-target dispatches.
-- Treat causal attention, masks, dropout, bias, GQA/MQA, additional dtypes, and wide-index kernels as separate feature campaigns rather than extensions of the current optimized path.
+The production path remains unchanged. The following are the only currently promising directions, ordered by expected leverage and evidence quality:
+- Lower D128 live state before adding persistent state. D128 is pinned at 191 VGPRs and 32 KiB LDS, so decoded-Q caching, double buffering, or a larger tile cannot be admitted directly. Inspect source-to-MIR-to-ISA liveness around Q decode, FP8 unpack, WMMA fragments, and the output epilogue. A candidate is interesting only if it creates a natural allocation or occupancy transition without private memory or spills.
+- Fuse packed RNE encoding into the Q frontend. The packed-RNE experiment materially reduced symbol bytes and scalar packing instructions while preserving bitwise output. Its complete-kernel geomean did not improve because the work is once per query tile. Reopen it only as part of a load/scale/decode schedule that reduces live values or exposes useful overlap; do not add a helper launch or a standalone conversion pass.
+- Maintain and, only with new evidence, tune long-NHD grouping. Partition-aware D64 NHD mapping and bounded D128 LLC grouping are the largest measured forward wins. Threshold or group-count changes are more promising than generic LDS or DRAM work, but they must be evaluated through the existing selector and complete matrix because they affect launch count and cache residency.
+- Defer new tile shapes and local schedule changes. Existing profiles show low LDS conflict cost and the prior local schedule experiments were neutral or negative. Reopen this category only after a new symbol-matched counter or MIR/ISA result identifies a specific dependency or occupancy transition.
+
+### Promotion Gates
+
+Every candidate must satisfy all gates before any production source or selector change:
+- The repository public fixture remains `168/168`, including HND/NHD, D64/D128, independent tails, odd heads, and batch two. Outputs must be finite; directional screening requires cosine at least `0.997`, with `Rel-L2 <= 0.10` preferred and `< 0.20` exploratory, in addition to the public elementwise envelope.
+- Every affected linked gfx1151 image stays within 192 campaign-rounded VGPRs, 32,768 bytes LDS, zero private/scratch memory, and zero spills. Inspect the exact runtime symbol, metadata, ISA, and code-object hash.
+- The raw ABI, operator IDs, selector behavior, current-device validation, and current-stream execution remain unchanged unless the candidate is explicitly a host-policy experiment.
+- Timing uses complete execution, including all helper launches, conversions, synchronization, and selector sublaunches. A local change needs a repeatable at least `0.5%` target-domain geomean gain, majority wins, and no regression above `1%`. The full 36-row matrix remains the final regression gate.
+
+### Closed Directions
+
+RNE removal by truncation, half-up conversion, forced register allocation, generic bandwidth/cache claims, and direct FP8 compression of persistent attention state are closed for the current design. Causal attention, masks, dropout, bias, GQA/MQA, additional dtypes, and wide-index kernels remain separate feature campaigns.
 
 Hard resource gates remain 192 allocated VGPRs, 32,768 bytes LDS, zero private/scratch memory, zero spills, and no material LDS-bank-conflict regression.
 
@@ -274,6 +320,10 @@ Primary repository checks:
 - `test_attn_hip.py`: `168/168` public-contract cases.
 - `benchmark_attn_hip.py`: AITER/Feather benchmark harness.
 - `kernel_attn/hip/build/attn_hip_ext/build.ninja`: current independent forward translation units.
+- `~/tmp/feather_attn/fwd_reopen_20260816/`: disposable packed-RNE and truncation sources, linked images, metadata, ISA summaries, contract output, and focused timing.
+- `~/tmp/feather_attn/e5m2_truncation_campaign/e5m2_exhaustive.json`: exhaustive conversion probe.
+- `~/tmp/feather_attn/e5m2_truncation_campaign/pack_benchmark.json`: standalone scalar versus permute pack probe.
+- `~/tmp/feather_attn/phase11e4_half_up_robust.json`: prior half-up timing and output evidence.
 
 Authoritative artifacts:
 - Final matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
@@ -283,4 +333,4 @@ Authoritative artifacts:
 - D64 NHD strided timing/profile: `~/tmp/feather_attn/phase11c_selected_domain_paired.json` and `phase11c_strided_profiles/`.
 - Broader AITER/Feather counter review: `~/tmp/feather_attn/review/counter_matrix_summary.txt`.
 
-Historical experiment details remain in the `~/tmp/feather_attn/phase*` logs. They are evidence for the accepted/rejected table, not the current implementation roadmap.
+The disposable forward reopen used `~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/bin/hipcc` with `-O3 -fno-gpu-rdc --offload-arch=gfx1151`, recovered from Ninja. Candidate artifacts are evidence only; they are not production build inputs. Historical experiment details remain in the `~/tmp/feather_attn/phase*` logs. They are evidence for the accepted/rejected table, not the current implementation roadmap.
