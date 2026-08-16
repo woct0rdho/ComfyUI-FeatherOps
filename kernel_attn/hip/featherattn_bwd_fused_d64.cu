@@ -122,6 +122,7 @@ __global__ void DeltaKernel(
     delta[linear] = value;
 }
 
+template<int kPhase>
 __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ k,
@@ -164,13 +165,16 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     const int lane_group = lane / kInnerBlock;
     const int q_tiles = (n_q + kOwnerBlock - 1) / kOwnerBlock;
     const int kv_tiles = (n_kv + kOwnerBlock - 1) / kOwnerBlock;
-    const int owner_tiles = q_tiles > kv_tiles ? q_tiles : kv_tiles;
+    const int owner_tiles =
+        kPhase == 1 ? kv_tiles
+                    : (kPhase == 2 ? q_tiles
+                                   : (q_tiles > kv_tiles ? q_tiles : kv_tiles));
     const int owner_tile = static_cast<int>(blockIdx.x) % owner_tiles;
     const int head_linear = static_cast<int>(blockIdx.x) / owner_tiles;
     const int q_offset = head_linear * n_q * kHeadDim;
     const int kv_offset = head_linear * n_kv * kHeadDim;
 
-    if(owner_tile < kv_tiles)
+    if(kPhase != 2 && owner_tile < kv_tiles)
     {
         const int kv_start = owner_tile * kOwnerBlock;
 #pragma unroll
@@ -364,7 +368,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
         }
     }
 
-    if(owner_tile < q_tiles)
+    if(kPhase != 1 && owner_tile < q_tiles)
     {
         const int q_block_start = owner_tile * kOwnerBlock;
         const int q_start = q_block_start + wave * kInnerBlock;
@@ -558,26 +562,73 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
         q_rows);
 
     const dim3 main_block(kThreads);
-    const dim3 main_grid(
-        static_cast<uint32_t>(params.head_count * owner_tiles));
-    hipLaunchKernelGGL(
-        SevenGemmD64Kernel,
-        main_grid,
-        main_block,
-        0,
-        params.stream,
-        q,
-        k,
-        v,
-        dout,
-        lse,
-        delta,
-        dq,
-        dk,
-        dv,
-        params.n_q,
-        params.n_kv,
-        params.scale);
+    if(params.n_q >= 4096 && params.n_kv >= 4096)
+    {
+        const dim3 kv_grid(
+            static_cast<uint32_t>(params.head_count * kv_tiles));
+        hipLaunchKernelGGL(
+            (SevenGemmD64Kernel<1>),
+            kv_grid,
+            main_block,
+            0,
+            params.stream,
+            q,
+            k,
+            v,
+            dout,
+            lse,
+            delta,
+            dq,
+            dk,
+            dv,
+            params.n_q,
+            params.n_kv,
+            params.scale);
+
+        const dim3 q_grid(
+            static_cast<uint32_t>(params.head_count * q_tiles));
+        hipLaunchKernelGGL(
+            (SevenGemmD64Kernel<2>),
+            q_grid,
+            main_block,
+            0,
+            params.stream,
+            q,
+            k,
+            v,
+            dout,
+            lse,
+            delta,
+            dq,
+            dk,
+            dv,
+            params.n_q,
+            params.n_kv,
+            params.scale);
+    }
+    else
+    {
+        const dim3 main_grid(
+            static_cast<uint32_t>(params.head_count * owner_tiles));
+        hipLaunchKernelGGL(
+            (SevenGemmD64Kernel<0>),
+            main_grid,
+            main_block,
+            0,
+            params.stream,
+            q,
+            k,
+            v,
+            dout,
+            lse,
+            delta,
+            dq,
+            dk,
+            dv,
+            params.n_q,
+            params.n_kv,
+            params.scale);
+    }
     return hipPeekAtLastError() == hipSuccess;
 }
 
