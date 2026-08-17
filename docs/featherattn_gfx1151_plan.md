@@ -10,7 +10,9 @@ The current result is:
 - All 20 qualified forward images stay at or below 191 used VGPRs, 32,768 bytes LDS, zero private memory, and zero SGPR/VGPR spills.
 - A disposable packed-RNE encoding candidate passed the public contract and resource gates, but did not produce a repeatable complete-kernel speedup. It was not promoted.
 - Scalar and packed truncation candidates reduced conversion work but failed the attention numerical gate. The production-tree scalar experiment passed only `52/168` public cases, so truncation is closed.
-- No production optimization is currently open. Any reopening must follow the ranked plan and promotion gates below.
+- The D64 NHD strided grouping policy now covers arbitrary head counts after the original divisibility guard was shown to leave repeatable long-H56 gains unused.
+- The final accepted-selector matrix has `31/36` Feather wins; this run's Feather/AITER geometric mean is `1.093648x` (`+9.365%`).
+- No further forward source change is currently admitted; any reopening requires new symbol-matched evidence and the promotion gates below.
 
 Hardware and execution assumptions:
 
@@ -36,7 +38,7 @@ The packed-RNE candidate was compiled with the recovered production-equivalent c
 
 The truncation probe is useful for understanding conversion semantics, not for promotion. It preserved signs and did not increase finite magnitudes, but 510 of 2,046 subnormal inputs became zero and 510 of 2,046 NaN inputs became infinity. The later scalar production-tree experiment confirmed the attention-level cost: only `52/168` public cases passed, despite exercising the same ABI, dispatch, and tail paths as the qualified kernel. Removing RNE is consequently a rejected numerical-policy change, not an instruction substitution.
 
-The screening timing used the frozen phase-11c aligned baseline and 20 alternating samples per row. It did not replace the authoritative 36-row matrix or exercise a production selector change. Production source, ABI, dispatch, and registration remain unchanged.
+The screening timing used the frozen phase-11c aligned baseline and 20 alternating samples per row. It did not replace the authoritative 36-row matrix or exercise a production selector change. Production arithmetic, ABI, and registration remain unchanged; the later selector-only grouping refinement is documented separately below.
 
 ## Public Contract
 
@@ -117,7 +119,7 @@ The host selector is `SelectLauncher(int64_t head_dim, bool nhd, bool pad_q, boo
 
 HND uses flattened batch/head ownership. NHD makes head the fastest grid axis so adjacent workgroups touch adjacent head offsets. Two bounded host policies handle long NHD tensors:
 - D128 may split heads into sequential LLC-sized groups when the total K/V working set is large enough to benefit.
-- D64 may use the strided physical-head mapping `group_index + local_head * group_count`. The selector avoids group counts divisible by eight because those strides recreate the gfx1151 memory-partition cliff.
+- D64 may use the strided physical-head mapping `group_index + local_head * group_count` for any admitted positive head count. The selector avoids group counts divisible by eight because those strides recreate the gfx1151 memory-partition cliff; it does not require the physical head count to be divisible by 16.
 
 All sublaunches run on the caller's current stream. Tail selection and grouping do not change the tensor layout or require a physical transpose.
 
@@ -180,7 +182,7 @@ TFLOPS = FLOPs / elapsed_seconds / 1e12
 
 `Feather / AITER` is the throughput ratio. Values above `1.000x` favor FeatherAttn. AITER consumes zero-copy transposed views for the HND comparison.
 
-Raw matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
+Raw matrix: `~/tmp/feather_attn/fwd_autonomous_20260817/non16_selector_final_matrix/attn.csv`.
 
 ### D64 Results
 
@@ -188,47 +190,47 @@ Every layout, head count, and sequence length in the authoritative matrix is lis
 
 | Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 16 | 4096 | 33.981 | 35.898 | 1.056x |
-| HND | 16 | 8192 | 32.144 | 33.999 | 1.058x |
-| HND | 16 | 16384 | 31.747 | 33.580 | 1.058x |
-| HND | 32 | 4096 | 32.698 | 34.870 | 1.066x |
-| HND | 32 | 8192 | 31.047 | 33.793 | 1.088x |
-| HND | 32 | 16384 | 29.395 | 33.654 | 1.145x |
-| HND | 56 | 4096 | 29.749 | 33.776 | 1.135x |
-| HND | 56 | 8192 | 28.972 | 33.386 | 1.152x |
-| HND | 56 | 16384 | 29.140 | 33.761 | 1.159x |
-| NHD | 16 | 4096 | 32.908 | 32.522 | 0.988x |
-| NHD | 16 | 8192 | 32.007 | 31.376 | 0.980x |
-| NHD | 16 | 16384 | 31.943 | 31.197 | 0.977x |
-| NHD | 32 | 4096 | 31.037 | 31.258 | 1.007x |
-| NHD | 32 | 8192 | 28.596 | 29.960 | 1.048x |
-| NHD | 32 | 16384 | 22.754 | 29.088 | 1.278x |
-| NHD | 56 | 4096 | 29.068 | 30.820 | 1.060x |
-| NHD | 56 | 8192 | 28.092 | 29.749 | 1.059x |
-| NHD | 56 | 16384 | 28.228 | 29.959 | 1.061x |
+| HND | 16 | 4096 | 33.404 | 35.164 | 1.053x |
+| HND | 16 | 8192 | 32.099 | 33.716 | 1.050x |
+| HND | 16 | 16384 | 31.537 | 32.957 | 1.045x |
+| HND | 32 | 4096 | 32.135 | 34.279 | 1.067x |
+| HND | 32 | 8192 | 31.051 | 33.300 | 1.072x |
+| HND | 32 | 16384 | 29.375 | 33.076 | 1.126x |
+| HND | 56 | 4096 | 29.635 | 32.508 | 1.097x |
+| HND | 56 | 8192 | 28.657 | 32.990 | 1.151x |
+| HND | 56 | 16384 | 28.514 | 33.278 | 1.167x |
+| NHD | 16 | 4096 | 32.392 | 32.101 | 0.991x |
+| NHD | 16 | 8192 | 31.949 | 30.833 | 0.965x |
+| NHD | 16 | 16384 | 31.358 | 31.397 | 1.001x |
+| NHD | 32 | 4096 | 30.716 | 30.543 | 0.994x |
+| NHD | 32 | 8192 | 28.486 | 29.233 | 1.026x |
+| NHD | 32 | 16384 | 22.831 | 27.303 | 1.196x |
+| NHD | 56 | 4096 | 28.803 | 30.388 | 1.055x |
+| NHD | 56 | 8192 | 27.700 | 30.803 | 1.112x |
+| NHD | 56 | 16384 | 28.015 | 30.947 | 1.105x |
 
 ### D128 Results
 
 | Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 16 | 4096 | 35.015 | 34.262 | 0.978x |
-| HND | 16 | 8192 | 32.737 | 33.444 | 1.022x |
-| HND | 16 | 16384 | 31.653 | 34.120 | 1.078x |
-| HND | 32 | 4096 | 31.800 | 34.731 | 1.092x |
-| HND | 32 | 8192 | 30.872 | 33.641 | 1.090x |
-| HND | 32 | 16384 | 30.822 | 34.419 | 1.117x |
-| HND | 56 | 4096 | 28.927 | 34.007 | 1.176x |
-| HND | 56 | 8192 | 30.109 | 33.727 | 1.120x |
-| HND | 56 | 16384 | 30.628 | 34.372 | 1.122x |
-| NHD | 16 | 4096 | 31.842 | 31.202 | 0.980x |
-| NHD | 16 | 8192 | 30.660 | 30.811 | 1.005x |
-| NHD | 16 | 16384 | 24.062 | 30.240 | 1.257x |
-| NHD | 32 | 4096 | 26.009 | 30.367 | 1.168x |
-| NHD | 32 | 8192 | 21.718 | 30.168 | 1.389x |
-| NHD | 32 | 16384 | 21.566 | 27.393 | 1.270x |
-| NHD | 56 | 4096 | 26.901 | 30.890 | 1.148x |
-| NHD | 56 | 8192 | 27.655 | 31.598 | 1.143x |
-| NHD | 56 | 16384 | 28.485 | 31.454 | 1.104x |
+| HND | 16 | 4096 | 34.359 | 33.885 | 0.986x |
+| HND | 16 | 8192 | 32.751 | 32.848 | 1.003x |
+| HND | 16 | 16384 | 31.654 | 33.334 | 1.053x |
+| HND | 32 | 4096 | 30.745 | 34.161 | 1.111x |
+| HND | 32 | 8192 | 30.186 | 33.196 | 1.100x |
+| HND | 32 | 16384 | 30.341 | 33.940 | 1.119x |
+| HND | 56 | 4096 | 28.877 | 33.373 | 1.156x |
+| HND | 56 | 8192 | 29.861 | 32.915 | 1.102x |
+| HND | 56 | 16384 | 30.454 | 34.064 | 1.119x |
+| NHD | 16 | 4096 | 31.619 | 30.817 | 0.975x |
+| NHD | 16 | 8192 | 30.039 | 30.655 | 1.021x |
+| NHD | 16 | 16384 | 23.497 | 30.425 | 1.295x |
+| NHD | 32 | 4096 | 25.827 | 30.121 | 1.166x |
+| NHD | 32 | 8192 | 21.628 | 30.361 | 1.404x |
+| NHD | 32 | 16384 | 21.486 | 26.542 | 1.235x |
+| NHD | 56 | 4096 | 26.712 | 30.479 | 1.141x |
+| NHD | 56 | 8192 | 27.398 | 31.168 | 1.138x |
+| NHD | 56 | 16384 | 28.308 | 31.180 | 1.101x |
 
 Short, independent-tail, arbitrary-head, and batch-two cases are correctness requirements rather than part of this throughput matrix. The `168/168` public test covers lengths from 1 through 16,384, the `1023/1024/1025` tolerance boundary, independent query/KV tails, odd head counts, and batch two.
 
@@ -240,6 +242,7 @@ Short, independent-tail, arbitrary-head, and batch-two cases are correctness req
 | --- | --- | --- |
 | Expanded D64 HND decoded-Q cache | `+0.789%` geomean, 9/9 wins; dynamic VALU `-3.39%`; LDS instructions `-3.83%` | Enabled for D64 HND |
 | Partition-aware D64 NHD strided groups | `+21.280%` selected-domain geomean, 12/12 wins | Guarded long-NHD selector |
+| Arbitrary-head D64 NHD strided eligibility | Non-16 paired screen `+2.406%`, 7/8 wins; two complete nine-row brackets pooled to `+1.274%`, 15/18 wins. Newly selected H56/N8192 and H56/N16384 won every bracket by `3.99-5.60%`. | Removed the obsolete head-count divisibility guard; all LLC and partition gates remain |
 | D64 NHD H32/N16384 traffic | Fetch `15.830 -> 13.554 GiB`; GCEA reads `15.858 -> 13.460 GiB`; L2 hit `2.08% -> 12.93%` | Explains the `1.278x` AITER ratio at this row |
 | Bounded D128 NHD LLC grouping | `1.135x` focused geomean over ungrouped, 9/9 wins; H32/N16384 fetch approximately `31.435 -> 14.822 GiB` | Enabled when the K/V working set crosses the LLC gate |
 
@@ -276,6 +279,7 @@ The actionable WMMA boundaries range from 176 to 209 virtual VGPRs as score and 
 | Bounded D128 NHD head grouping | Accepted for large K/V working sets |
 | Expanded D64 HND decoded-Q cache | Accepted |
 | Partition-aware D64 NHD strided grouping | Accepted |
+| Arbitrary-head D64 NHD strided grouping | Accepted; `168/168` public cases and repeatable complete-path gains with unchanged kernel images and ABI |
 
 ## Rejected Work
 
@@ -298,17 +302,15 @@ The actionable WMMA boundaries range from 176 to 209 virtual VGPRs as score and 
 | D128 two-by-two V row staging | Halving the live V-load tuple did not change either aligned D128 image from 191 VGPRs and replaced wide LDS stores with additional narrow stores | Rejected before timing |
 | CK WMMA builtin in place of tied inline assembly | Aligned VGPRs changed from `175/130/191/191` to `184/132/192/191` for HND-D64, NHD-D64, HND-D128, and NHD-D128. D128 instruction counts fell slightly, but no layout gained an allocation transition. | Rejected before correctness or timing; retain the tied accumulator assembly |
 | D128 per-tile opaque QK address dependency | Both aligned D128 images rose to 192 VGPRs and introduced private storage and VGPR spills: 20 bytes/four spills for HND and 28 bytes/six spills for NHD. | Rejected before correctness or timing; retain compiler-scheduled LDS addressing |
+| D128 packed persistent FP16 output state | Aligned HND-D128 fell from 191 to 182 VGPRs with 32 KiB LDS, zero private memory, and zero spills. `168/168` public cases passed; baseline-relative `Rel-L2` stayed at or below `0.00237` and cosine stayed above `0.999997`. Complete paired HND timing regressed all 9 rows for `-2.624%` geometric mean. | Rejected; retain the FP32 cross-key-tile output state |
 | Packed RTZ probability conversion | `168/168` public cases passed, but the complete 36-row screen reached only `0.9806x` geometric mean against the frozen RNE matrix and won `3/36` rows. Linked VGPRs were `171/131/191/191`; the numerical policy also changes FP32-to-FP16 probabilities from RNE to RTZ. | Rejected; restore scalar RNE probability conversion |
 | Packed RNE Q encoding | Representative HND code size fell 8.8% at D64 and 11.3% at D128, but the 12-row aligned screening geomean was `0.9969x` with no resource transition | Keep as a future fused-frontend lead, not a standalone change |
+| Direct packed-RNE D64 HND Q cache | Exact packed RNE plus direct register decode reduced aligned HND-D64 from 175 to 174 VGPRs, 16 KiB to 8 KiB LDS, 8,224 to 8,012 symbol bytes, and 1,250 to 1,199 instructions. The public fixture passed `168/168` and paired outputs were bitwise exact, but all 9 HND rows regressed for a `0.99277x` geometric mean. | Rejected; the duplicated scale/decode frontend costs more than the removed Q LDS traffic |
 | Scalar and packed E5M2 truncation | The scalar production-tree candidate passed only `52/168`; packed focused rows also failed. The policy changes subnormal and NaN behavior despite a clean exhaustive bit-conversion probe. | Rejected; RNE restored |
 
 ## Ranked Forward Plan
 
-The production path remains unchanged. The following are the only currently promising directions, ordered by expected leverage and evidence quality:
-- Maintain and, only with new evidence, tune long-NHD grouping. Partition-aware D64 NHD mapping and bounded D128 LLC grouping are the largest measured forward wins. Threshold or group-count changes are more promising than generic LDS or DRAM work, but they must be evaluated through the existing selector and complete matrix because they affect launch count and cache residency.
-- Fuse packed RNE encoding into the Q frontend. The packed-RNE experiment materially reduced symbol bytes and scalar packing instructions while preserving bitwise output. Its complete-kernel geomean did not improve because the work is once per query tile. Reopen it only as part of a load/scale/decode schedule that reduces live values or exposes useful overlap; do not add a helper launch or a standalone conversion pass.
-- Reopen D128 live-state work only for a structural state reduction. D128 is pinned at 191 VGPRs and 32 KiB LDS, but the obvious staging, WMMA, and address-lifetime changes are now rejected. Decoded-Q caching, double buffering, and larger tiles remain inadmissible until a candidate removes persistent score/output state or otherwise creates a natural linked allocation transition without private memory, spills, extra passes, or additional LDS traffic.
-- Defer new tile shapes and local schedule changes. Existing profiles show low LDS conflict cost and the prior local schedule experiments were neutral or negative. Reopen this category only after a new symbol-matched counter or MIR/ISA result identifies a specific dependency or occupancy transition.
+The accepted selector refinement above is the only new production change in this campaign. No further forward source change is currently admitted: packed-RNE frontend integration and D128 live-state reduction both failed their complete-path gates. Any reopening requires new symbol-matched evidence and the promotion gates below.
 
 ### Promotion Gates
 
@@ -342,10 +344,17 @@ Primary repository checks:
 - `~/tmp/feather_attn/fwd_autonomous_20260817/mir_baseline/`: optimized device LLVM, extracted D128 HND MIR, and `LiveIntervals` pressure report.
 - `~/tmp/feather_attn/fwd_autonomous_20260817/restored_rne_contract.log`: final restored-RNE public fixture (`168/168`).
 - `~/tmp/feather_attn/fwd_autonomous_20260817/final_extension/`: final linked gfx1151 extraction, disassembly, metadata, symbols, and hashes.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/strided_non16_screen.json` and `strided_non16_robust.json`: paired raw-launch arbitrary-head qualification.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/non16_selector_bracket/`: two complete production-path D64 NHD baseline/candidate brackets.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/non16_selector_matrix/`: initial complete 36-row accepted-selector matrix.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/non16_selector_final_matrix/`: final complete 36-row accepted-selector matrix.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/non16_selector_contract.log`: accepted-selector public fixture (`168/168`).
+- `~/tmp/feather_attn/fwd_autonomous_20260817/direct_qcache_packed_rne/`: rejected direct packed-RNE Q-cache source snapshot, linked image, metadata, ISA summary, public fixture, and 100-sample paired timing.
 - `~/tmp/feather_attn/phase11e4_half_up_robust.json`: prior half-up timing and output evidence.
 
 Authoritative artifacts:
-- Final matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
+- Final matrix: `~/tmp/feather_attn/fwd_autonomous_20260817/non16_selector_final_matrix/attn.csv`.
+- Frozen pre-refinement matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
 - Final loaded metadata: `~/tmp/feather_attn/phase11_final/metadata.txt`.
 - Final LDS conflicts: `~/tmp/feather_attn/phase11_final/lds_bank_conflicts/summary.json`.
 - D64 HND cache timing/profile: `~/tmp/feather_attn/phase11b_qcache_full_paired_robust.json` and `phase11b_qcache_profiles/`.
