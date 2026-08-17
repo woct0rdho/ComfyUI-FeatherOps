@@ -109,9 +109,6 @@ int64_t ResolveNhdHeadGroupSize(int64_t heads, int64_t n_kv, int64_t head_dim)
 
 int64_t ResolveNhdD64StridedGroupCount(int64_t heads, int64_t n_kv)
 {
-    if(heads % 16 != 0)
-        return 1;
-
     constexpr __int128 kLlcBytes = static_cast<__int128>(32) * 1024 * 1024;
     constexpr int64_t kHeadDim  = 64;
     const __int128 kv_bytes_per_head =
