@@ -9,7 +9,7 @@ The current result is:
 - The complete 36-row performance matrix is shown below, with no aggregate or representative-row summary replacing individual shapes.
 - All 20 qualified forward images stay at or below 191 used VGPRs, 32,768 bytes LDS, zero private memory, and zero SGPR/VGPR spills.
 - A disposable packed-RNE encoding candidate passed the public contract and resource gates, but did not produce a repeatable complete-kernel speedup. It was not promoted.
-- A disposable truncation candidate reduced code further but failed the attention numerical gate. It is closed.
+- Scalar and packed truncation candidates reduced conversion work but failed the attention numerical gate. The production-tree scalar experiment passed only `52/168` public cases, so truncation is closed.
 - No production optimization is currently open. Any reopening must follow the ranked plan and promotion gates below.
 
 Hardware and execution assumptions:
@@ -29,12 +29,12 @@ The final exploratory question was whether the Q FP16-to-E5M2 path could remove 
 | Candidate | Numerical result | Linked resource result | Timing result | Decision |
 | --- | --- | --- | --- | --- |
 | Packed RNE encoding | `168/168` public cases; bitwise identical to the scalar-RNE aligned image in the focused comparison | Same 20-image resource envelope; D64/D128 stayed at the existing VGPR and LDS values | 12 aligned paired rows: `0.9969x` geometric mean, 4/12 wins, range `0.9828x-1.0063x` | Promising ISA experiment, no promotion |
-| Naive E5M2 truncation | Exhaustive 65,536-pattern conversion probe had zero GPU-reference mismatches, but attention tests reached `Rel-L2` about `0.122-0.125` and failed elementwise cases | No resource issue in the disposable aligned image | Not relevant after numerical failure | Closed |
+| Scalar and packed E5M2 truncation | Exhaustive 65,536-pattern conversion probe had zero GPU-reference mismatches, but the production-tree scalar candidate passed only `52/168` public cases. Scalar and packed attention runs reached `Rel-L2` about `0.12-0.125` and failed elementwise cases in HND/NHD and D64/D128. | No resource issue in the disposable aligned image | Not relevant after numerical failure | Rejected; RNE restored |
 | Half-up alternative | Finite and contract-qualified in the prior campaign, but not output-exact and had no repeatable timing gain | No useful allocation transition | Prior robust result was `-0.176%` overall | Closed; retain RNE |
 
 The packed-RNE candidate was compiled with the recovered production-equivalent command, linked with all aligned, query-tail, KV-tail, combined-tail, and D64 NHD strided translation units, and exercised through the host selector. Its ISA reduction is real: in representative HND symbols, D64 changed from 8,224 to 7,500 code bytes and from 1,250 to 1,158 encoded instructions; D128 changed from 13,104 to 11,620 bytes and from 1,949 to 1,739 instructions. Scalar `v_lshrrev_b16` and `v_add_nc_u16` packing operations were replaced by packed 16-bit operations and byte permutes. The work is paid once per query tile and is therefore mostly amortized by the KV loop, which explains the neutral complete-kernel timing.
 
-The truncation probe is useful for understanding conversion semantics, not for promotion. It preserved signs and did not increase finite magnitudes, but 510 of 2,046 subnormal inputs became zero and 510 of 2,046 NaN inputs became infinity. Removing RNE is consequently a numerical-policy change, not an instruction substitution.
+The truncation probe is useful for understanding conversion semantics, not for promotion. It preserved signs and did not increase finite magnitudes, but 510 of 2,046 subnormal inputs became zero and 510 of 2,046 NaN inputs became infinity. The later scalar production-tree experiment confirmed the attention-level cost: only `52/168` public cases passed, despite exercising the same ABI, dispatch, and tail paths as the qualified kernel. Removing RNE is consequently a rejected numerical-policy change, not an instruction substitution.
 
 The screening timing used the frozen phase-11c aligned baseline and 20 alternating samples per row. It did not replace the authoritative 36-row matrix or exercise a production selector change. Production source, ABI, dispatch, and registration remain unchanged.
 
@@ -253,6 +253,12 @@ Short, independent-tail, arbitrary-head, and batch-two cases are correctness req
 
 The D128 residual is not the primary bottleneck: prior pressure profiles measured Feather `ALUStalledByLDS` at only `0.026-0.029%`. D128 is instead constrained by its 191-VGPR, 32-KiB image and by instruction/dependency work. Long NHD cases are primarily controller-traffic and cross-workgroup reuse problems, which is why launch grouping produced larger gains than local arithmetic edits.
 
+### D128 Compiler Pressure
+
+Optimized gfx1151 MIR at `-stop-after=phi-node-elimination` reports a maximum virtual VGPR pressure of 216 at the KV-loop backedge, with 225 virtual registers live. That point is dominated by overlapping old and new phi-copy versions of the 64 scalar FP32 output components. Linked allocation coalesces those versions and remains authoritative at 191 VGPRs with no private memory or spills; the MIR peak is not evidence of a linked spill.
+
+The actionable WMMA boundaries range from 176 to 209 virtual VGPRs as score and PV fragments become live alongside the eight FP32 output fragments. Direct source attempts did not produce a usable reduction: splitting D128 V staging preserved 191 VGPRs, replacing the tied WMMA assembly worsened at least one layout, and constraining QK address lifetimes introduced spills. Further D128 work therefore needs to eliminate persistent fragment state or change its representation without extra passes or LDS traffic. More local lifetime barriers are not an open direction.
+
 ## Accepted Work
 
 | Work | Result |
@@ -289,15 +295,19 @@ The D128 residual is not the primary bottleneck: prior pressure profiles measure
 | D64 HND `Br=128,Bc=128` | 242 VGPRs, 50 above the hard gate | Rejected before timing |
 | Tile-local FP16 PV WMMA buffer | Correct at existing tolerances, but HND geomean `-8.739%` and near-192-VGPR pressure | Rejected |
 | D128 decoded-Q cache or double buffering | D128 already uses 191 VGPRs and the full 32 KiB LDS budget | Not admitted without prior resource reduction |
+| D128 two-by-two V row staging | Halving the live V-load tuple did not change either aligned D128 image from 191 VGPRs and replaced wide LDS stores with additional narrow stores | Rejected before timing |
+| CK WMMA builtin in place of tied inline assembly | Aligned VGPRs changed from `175/130/191/191` to `184/132/192/191` for HND-D64, NHD-D64, HND-D128, and NHD-D128. D128 instruction counts fell slightly, but no layout gained an allocation transition. | Rejected before correctness or timing; retain the tied accumulator assembly |
+| D128 per-tile opaque QK address dependency | Both aligned D128 images rose to 192 VGPRs and introduced private storage and VGPR spills: 20 bytes/four spills for HND and 28 bytes/six spills for NHD. | Rejected before correctness or timing; retain compiler-scheduled LDS addressing |
+| Packed RTZ probability conversion | `168/168` public cases passed, but the complete 36-row screen reached only `0.9806x` geometric mean against the frozen RNE matrix and won `3/36` rows. Linked VGPRs were `171/131/191/191`; the numerical policy also changes FP32-to-FP16 probabilities from RNE to RTZ. | Rejected; restore scalar RNE probability conversion |
 | Packed RNE Q encoding | Representative HND code size fell 8.8% at D64 and 11.3% at D128, but the 12-row aligned screening geomean was `0.9969x` with no resource transition | Keep as a future fused-frontend lead, not a standalone change |
-| Naive E5M2 truncation | Attention numerical failures despite a clean exhaustive bit-conversion probe; it changes subnormal and NaN behavior | Closed unless a separately specified numerical policy is approved |
+| Scalar and packed E5M2 truncation | The scalar production-tree candidate passed only `52/168`; packed focused rows also failed. The policy changes subnormal and NaN behavior despite a clean exhaustive bit-conversion probe. | Rejected; RNE restored |
 
 ## Ranked Forward Plan
 
 The production path remains unchanged. The following are the only currently promising directions, ordered by expected leverage and evidence quality:
-- Lower D128 live state before adding persistent state. D128 is pinned at 191 VGPRs and 32 KiB LDS, so decoded-Q caching, double buffering, or a larger tile cannot be admitted directly. Inspect source-to-MIR-to-ISA liveness around Q decode, FP8 unpack, WMMA fragments, and the output epilogue. A candidate is interesting only if it creates a natural allocation or occupancy transition without private memory or spills.
-- Fuse packed RNE encoding into the Q frontend. The packed-RNE experiment materially reduced symbol bytes and scalar packing instructions while preserving bitwise output. Its complete-kernel geomean did not improve because the work is once per query tile. Reopen it only as part of a load/scale/decode schedule that reduces live values or exposes useful overlap; do not add a helper launch or a standalone conversion pass.
 - Maintain and, only with new evidence, tune long-NHD grouping. Partition-aware D64 NHD mapping and bounded D128 LLC grouping are the largest measured forward wins. Threshold or group-count changes are more promising than generic LDS or DRAM work, but they must be evaluated through the existing selector and complete matrix because they affect launch count and cache residency.
+- Fuse packed RNE encoding into the Q frontend. The packed-RNE experiment materially reduced symbol bytes and scalar packing instructions while preserving bitwise output. Its complete-kernel geomean did not improve because the work is once per query tile. Reopen it only as part of a load/scale/decode schedule that reduces live values or exposes useful overlap; do not add a helper launch or a standalone conversion pass.
+- Reopen D128 live-state work only for a structural state reduction. D128 is pinned at 191 VGPRs and 32 KiB LDS, but the obvious staging, WMMA, and address-lifetime changes are now rejected. Decoded-Q caching, double buffering, and larger tiles remain inadmissible until a candidate removes persistent score/output state or otherwise creates a natural linked allocation transition without private memory, spills, extra passes, or additional LDS traffic.
 - Defer new tile shapes and local schedule changes. Existing profiles show low LDS conflict cost and the prior local schedule experiments were neutral or negative. Reopen this category only after a new symbol-matched counter or MIR/ISA result identifies a specific dependency or occupancy transition.
 
 ### Promotion Gates
@@ -323,6 +333,15 @@ Primary repository checks:
 - `~/tmp/feather_attn/fwd_reopen_20260816/`: disposable packed-RNE and truncation sources, linked images, metadata, ISA summaries, contract output, and focused timing.
 - `~/tmp/feather_attn/e5m2_truncation_campaign/e5m2_exhaustive.json`: exhaustive conversion probe.
 - `~/tmp/feather_attn/e5m2_truncation_campaign/pack_benchmark.json`: standalone scalar versus permute pack probe.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/scalar_trunc_contract.log`: production-tree scalar truncation public fixture (`52/168`).
+- `~/tmp/feather_attn/fwd_autonomous_20260817/d128_v_rows_2x2/`: rejected D128 split-V linked image, metadata, symbols, and ISA.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/wmma_builtin/`: rejected CK WMMA-builtin aligned image, metadata, symbols, ISA, and hashes.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/d128_qk_bounded_addresses/`: rejected D128 bounded-QK-address image with linked spill metadata, symbols, ISA, and hashes.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/packed_rtz_p_contract.log`: packed RTZ probability public fixture (`168/168`).
+- `~/tmp/feather_attn/fwd_autonomous_20260817/packed_rtz_p_matrix/`: complete packed RTZ probability timing screen and CSV.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/mir_baseline/`: optimized device LLVM, extracted D128 HND MIR, and `LiveIntervals` pressure report.
+- `~/tmp/feather_attn/fwd_autonomous_20260817/restored_rne_contract.log`: final restored-RNE public fixture (`168/168`).
+- `~/tmp/feather_attn/fwd_autonomous_20260817/final_extension/`: final linked gfx1151 extraction, disassembly, metadata, symbols, and hashes.
 - `~/tmp/feather_attn/phase11e4_half_up_robust.json`: prior half-up timing and output evidence.
 
 Authoritative artifacts:
