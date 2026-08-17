@@ -57,9 +57,35 @@ python -m pytest -q \
   Tensile/Tests/unit/test_local_read_pack_allocation.py \
   Tensile/Tests/unit/characterization/LocalRead/test_r3_localread_char.py \
   Tensile/Tests/unit/test_initc_iter_wmma.py \
+  Tensile/Tests/unit/test_valu_first_vgpr_layout.py \
   Tensile/Tests/unit/test_occupancy.py \
   Tensile/Tests/unit/test_occupancy_buildtime.py
 ```
+
+For workgroup-mapping changes, run the direct static-WGM regression. Its minimal kernel fixture must include current required kernel defaults such as `WorkGroupMappingXCC`:
+
+```bash
+python -m pytest -q \
+  Tensile/Tests/unit/test_static_wgm.py
+```
+
+For StreamK, HalfPLR, or instruction-prefetch changes, run the adjacent scheduler and rejection tests:
+
+```bash
+python -m pytest -q \
+  Tensile/Tests/unit/test_PrefetchAcrossPersistent.py \
+  Tensile/Tests/unit/test_halfplr_streamk_rejects.py \
+  Tensile/Tests/unit/test_sw_instruction_prefetch.py
+```
+
+For VGPR resource-limit or `ForceGenerateKernel` changes, run:
+
+```bash
+python -m pytest -q \
+  Tensile/Tests/unit/test_vgpr_overflow_force_generate.py
+```
+
+This verifies that VGPR overflow warns and reaches `checkResources()` instead of failing during `_initKernel`, while AGPR overflow remains fatal. That distinction allows `ForceGenerateKernel=1` to preserve rejected kernel source for debugging.
 
 `Tensile/Tests/unit/test_MatrixInstructionConversion.py` may be slow (~2 minutes) at collecting tests.
 
@@ -80,14 +106,16 @@ python -m pytest -q \
   Tensile/Tests/unit/test_prefetchgl2_streamk_guard.py \
   Tensile/Tests/unit/test_subtile_gl2_prefetch.py \
   Tensile/Tests/unit/characterization/_codegen/test_cluster_padding_gfx1250_char.py \
-  Tensile/Tests/unit/characterization/_codegen/test_streamk_cluster_gfx1250_char.py
+  Tensile/Tests/unit/characterization/_codegen/test_streamk_cluster_gfx1250_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_r3_streamk_tdm_sgpr_budget_gfx1250_char.py
 ```
 
 Coverage and hardware requirements for this set:
 - `test_gl2_prefetch_offset.py` is the direct production address-generation verifier. It covers TLU and non-TLU tensors, address increments, strided batches, MX scales, FP4/FP8 byte widths, sparse metadata, whole-cluster fan-out, and edge/non-power-of-two cases. It runs only on a real gfx1250 GPU.
 - `test_prefetchgl2_streamk_guard.py` validates the DP-first StreamK (`StreamK==3`) PrefetchGL2 guard with both `StreamKForceDPOnly` modes. It uses gfx1250 assembler/capability data but does not require a gfx1250 GPU. It skips if the installed `amdclang++` cannot describe gfx1250.
 - `test_subtile_gl2_prefetch.py` is a Python-only scheduler test and does not require a GPU.
-- The two `_codegen` tests validate gfx1250 cluster decoding, padded boundary clusters, and StreamK cluster handling through generated assembly. They require a toolchain that can emit gfx1250 code, but do not launch a GPU kernel.
+- `test_cluster_padding_gfx1250_char.py` and `test_streamk_cluster_gfx1250_char.py` validate cluster decoding, padded boundary clusters, and StreamK cluster handling through generated assembly.
+- `test_r3_streamk_tdm_sgpr_budget_gfx1250_char.py` covers the newer StreamK/TDM/PrefetchGL2 SGPR-budget path. The `_codegen` tests require a toolchain that can emit gfx1250 code, but do not launch a GPU kernel.
 
 On gfx1151, the direct address verifier is expected to skip all of its gfx1250 cases. The guard, scheduler, and codegen tests can still pass when the ROCm toolchain supports gfx1250.
 
@@ -109,24 +137,29 @@ The Python unit tests do not need `tensilelite-client`. YAML/common tests do. Re
 
 Then run a focused common-test set with the prebuilt client and current source checkout:
 
+Common YAMLs are parameters of `Tensile/Tests/common/test_config.py`; naming a YAML directly no longer collects a test. Select the exact parameterized node ID:
+
 ```bash
 python -m pytest \
   --prebuilt-client ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
   --global-parameters CheckASMCodeSize=True \
   --gpu-targets gfx1151 \
-  Tensile/Tests/common/gemm/gfx11/fp16_tn_gfx11.yaml
+  'Tensile/Tests/common/test_config.py::test_config[Tensile/Tests/common/gemm/gfx11/fp16_tn_gfx11.yaml]'
 ```
 
-For the generalized/sparse GL2 path, add the gfx1250 sparse common test to the prebuilt-client workflow:
+For the generalized/sparse GL2 path, use the split-CI build-only entry point when gfx1250 hardware is unavailable:
 
 ```bash
+artifact_dir="$(mktemp -d /tmp/tensilelite-sparse-gl2.XXXXXX)"
 python -m pytest \
+  --build-only \
+  --artifact-dir "$artifact_dir" \
   --prebuilt-client ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
   --global-parameters CheckASMCodeSize=True \
   --gpu-targets gfx1250 \
-  Tensile/Tests/common/sparse/gfx1250/spmm_tdm_gl2prefetch.yaml
+  'Tensile/Tests/common/test_config_build.py::test_config_build[Tensile/Tests/common/sparse/gfx1250/spmm_tdm_gl2prefetch.yaml]'
 ```
 
-This is code-generation coverage for sparse metadata plus GL2 prefetch. It does not replace the real-GPU address verifier.
+This compiles and packages gfx1250 code-generation coverage for sparse metadata plus GL2 prefetch without launching it on the local GPU. It does not replace the real-gfx1250 address verifier or the corresponding `test_config_run.py` artifact-consumption phase on gfx1250 hardware.
 
 For routine local codegen edits, start with targeted unit tests plus direct TensileLite generation/validation of the HHH/HHS candidates described in `doc/tensile_fp16_nt_hhh.md` and `doc/tensile_fp16_nt_hhs.md`.

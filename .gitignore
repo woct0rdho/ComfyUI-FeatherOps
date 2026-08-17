@@ -203,4 +203,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 *.hip
+*_hip.cpp
+!/cpp_benchmarks/*_hip.cpp
 /.rocprofv3/

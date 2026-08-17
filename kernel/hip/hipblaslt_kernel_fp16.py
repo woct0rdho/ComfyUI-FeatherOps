@@ -1,5 +1,6 @@
 import os
 
+import _rocm_sdk_core
 import torch
 from torch.utils.cpp_extension import load
 
@@ -11,15 +12,10 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
     os.makedirs(build_dir, exist_ok=True)
 
     includes = []
-    try:
-        import _rocm_sdk_core
 
-        if _rocm_sdk_core.__file__ is not None:
-            rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
-            if os.path.exists(rocm_sdk_inc):
-                includes.append(rocm_sdk_inc)
-    except ImportError:
-        pass
+    rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
+    if os.path.exists(rocm_sdk_inc):
+        includes.append(rocm_sdk_inc)
 
     extra_cflags = [
         "-O3",

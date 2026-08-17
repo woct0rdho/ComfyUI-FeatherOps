@@ -1,11 +1,52 @@
 import os
 from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
 
+import _rocm_sdk_core
 import torch
 import triton
 from torch._inductor.kernel.custom_op import CustomOpConfig
 from torch.fx.experimental.symbolic_shapes import optimization_hint
-from torch.utils.cpp_extension import load
+from torch.utils import cpp_extension
+
+
+def _add_hip_ninja_depfile_rule(ninja_path: Path) -> None:
+    content = ninja_path.read_text()
+    rule_start = content.find("rule cuda_compile\n")
+    if rule_start < 0:
+        return
+
+    rule_end = content.find("\n\n", rule_start)
+    if rule_end < 0:
+        rule_end = len(content)
+    rule = content[rule_start:rule_end]
+    if "\n  depfile = " in rule:
+        return
+
+    command = "  command = $nvcc "
+    if command not in rule:
+        raise RuntimeError(f"Unsupported PyTorch HIP Ninja rule in {ninja_path}")
+
+    rule = rule.replace(command, f"{command}-MMD -MF $out.d ", 1)
+    rule += "\n  depfile = $out.d\n  deps = gcc"
+    ninja_path.write_text(content[:rule_start] + rule + content[rule_end:])
+
+
+@contextmanager
+def _hip_ninja_depfiles():
+    run_ninja_build = cpp_extension._run_ninja_build
+
+    def run_ninja_build_with_depfiles(build_directory: str, verbose: bool, error_prefix: str) -> None:
+        # PyTorch omits CUDA dependency generation on ROCm. Modern hipcc accepts
+        # Clang's -MMD form, so teach Ninja about the resulting depfile here.
+        _add_hip_ninja_depfile_rule(Path(build_directory, "build.ninja"))
+        run_ninja_build(build_directory, verbose, error_prefix)
+
+    extension_globals = vars(cpp_extension)
+    extension_globals["_run_ninja_build"] = run_ninja_build_with_depfiles
+    yield
+    extension_globals["_run_ninja_build"] = run_ninja_build
 
 
 def get_rocm_lib_dirs() -> list[str]:
@@ -16,32 +57,31 @@ def get_rocm_lib_dirs() -> list[str]:
             rocm_lib_dirs.append(os.path.join(rocm_home, "lib"))
             rocm_lib_dirs.append(os.path.join(rocm_home, "lib64"))
     for mod_name in ("_rocm_sdk_devel", "_rocm_sdk_core"):
-        try:
-            mod = __import__(mod_name)
-            if mod.__file__ is not None:
-                mod_dir = os.path.dirname(mod.__file__)
-                rocm_lib_dirs.append(os.path.join(mod_dir, "lib"))
-        except ImportError:
-            continue
+        mod = __import__(mod_name)
+        assert mod.__file__ is not None
+        mod_dir = os.path.dirname(mod.__file__)
+        rocm_lib_dirs.append(os.path.join(mod_dir, "lib"))
     return [d for d in rocm_lib_dirs if os.path.isdir(d)]
 
 
-def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str) -> None:
+def load_hip_stable_extension(
+    name: str,
+    cur_dir: str,
+    source_filename: str | list[str],
+    extra_cflags: list[str] | None = None,
+    extra_cuda_cflags: list[str] | None = None,
+) -> None:
     build_dir = os.path.join(cur_dir, "build", name)
     os.makedirs(build_dir, exist_ok=True)
+    source_filenames = [source_filename] if isinstance(source_filename, str) else source_filename
+    sources = [os.path.join(cur_dir, filename) for filename in source_filenames]
 
     includes = []
-    try:
-        import _rocm_sdk_core
+    rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
+    if os.path.exists(rocm_sdk_inc):
+        includes.append(rocm_sdk_inc)
 
-        if _rocm_sdk_core.__file__ is not None:
-            rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
-            if os.path.exists(rocm_sdk_inc):
-                includes.append(rocm_sdk_inc)
-    except ImportError:
-        pass
-
-    extra_cflags = [
+    common_cflags = [
         "-O3",
         "--std=c++20",
         "-Wall",
@@ -52,33 +92,41 @@ def load_hip_stable_extension(name: str, cur_dir: str, source_filename: str) -> 
         "-Wno-unused-parameter",
         "-DPy_LIMITED_API=0x03090000",
     ]
+    cflags = common_cflags.copy()
+    if extra_cflags:
+        cflags.extend(extra_cflags)
+
+    cuda_cflags = common_cflags + [
+        "-U__HIP_NO_HALF_CONVERSIONS__",
+        "-U__HIP_NO_HALF_OPERATORS__",
+        "-U__HIP_NO_HALF2_OPERATORS__",
+        "-U__HIP_NO_BFLOAT16_CONVERSIONS__",
+        "-U__HIP_NO_BFLOAT16_OPERATORS__",
+        "-U__HIP_NO_BFLOAT162_OPERATORS__",
+    ]
+    if os.name == "nt":
+        # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
+        cuda_cflags.append("-nohipwrapperinc")
+    if extra_cuda_cflags:
+        cuda_cflags.extend(extra_cuda_cflags)
 
     extra_ldflags = []
     for lib_dir in get_rocm_lib_dirs():
         extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
 
-    load(
-        name=name,
-        sources=[os.path.join(cur_dir, source_filename)],
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cflags
-        + [
-            # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
-            "-nohipwrapperinc",
-            "-U__HIP_NO_HALF_CONVERSIONS__",
-            "-U__HIP_NO_HALF_OPERATORS__",
-            "-U__HIP_NO_HALF2_OPERATORS__",
-            "-U__HIP_NO_BFLOAT16_CONVERSIONS__",
-            "-U__HIP_NO_BFLOAT16_OPERATORS__",
-            "-U__HIP_NO_BFLOAT162_OPERATORS__",
-        ],
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=includes,
-        build_directory=build_dir,
-        with_cuda=True,
-        verbose=False,
-        is_python_module=False,
-    )
+    with _hip_ninja_depfiles():
+        cpp_extension.load(
+            name=name,
+            sources=sources,
+            extra_cflags=cflags,
+            extra_cuda_cflags=cuda_cflags,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=includes,
+            build_directory=build_dir,
+            with_cuda=True,
+            verbose=False,
+            is_python_module=False,
+        )
 
 
 def _config_compatible(cfg: tuple[int, int, int, int, int], M: int, N: int, K: int) -> bool:
