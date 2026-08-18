@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 
@@ -61,6 +62,91 @@ def feather_attn(
     return _feather_attn(q, k, v, layout_id)
 
 
+def _use_nhd_hnd_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    dout: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    delta: torch.Tensor,
+    sm_scale: float,
+) -> bool:
+    attention = (q, k, v, out, dout, dq, dk, dv)
+    if not all(tensor.is_cuda and tensor.dtype == torch.float16 and tensor.ndim == 4 for tensor in attention):
+        return False
+    if not all(tensor.device == q.device and tensor.is_contiguous() for tensor in attention):
+        return False
+    if lse.device != q.device or delta.device != q.device:
+        return False
+    if lse.dtype != torch.float32 or delta.dtype != torch.float32:
+        return False
+    if lse.ndim != 3 or delta.ndim != 3 or not lse.is_contiguous() or not delta.is_contiguous():
+        return False
+    batch, n_q, heads, head_dim = q.shape
+    if batch != 1 or heads not in (32, 56) or n_q < 8192 or n_q > 16384 or head_dim != 64:
+        return False
+    if k.shape != q.shape or v.shape != q.shape:
+        return False
+    if out.shape != q.shape or dout.shape != q.shape or dq.shape != q.shape:
+        return False
+    if dk.shape != k.shape or dv.shape != v.shape:
+        return False
+    if lse.shape != (batch, heads, n_q) or delta.shape != lse.shape:
+        return False
+    if not math.isfinite(sm_scale) or sm_scale <= 0.0:
+        return False
+    max_int32 = 2**31 - 1
+    if q.numel() * q.element_size() - q.element_size() > max_int32:
+        return False
+    return lse.numel() * lse.element_size() - lse.element_size() <= max_int32
+
+
+def _nhd_hnd_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    dout: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    delta: torch.Tensor,
+    sm_scale: float,
+    implementation_id: int,
+) -> None:
+    q_hnd = q.transpose(1, 2).contiguous()
+    k_hnd = k.transpose(1, 2).contiguous()
+    v_hnd = v.transpose(1, 2).contiguous()
+    out_hnd = out.transpose(1, 2).contiguous()
+    dout_hnd = dout.transpose(1, 2).contiguous()
+    dq_hnd = torch.empty_like(q_hnd)
+    dk_hnd = torch.empty_like(k_hnd)
+    dv_hnd = torch.empty_like(v_hnd)
+    torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(
+        q_hnd,
+        k_hnd,
+        v_hnd,
+        out_hnd,
+        lse,
+        dout_hnd,
+        dq_hnd,
+        dk_hnd,
+        dv_hnd,
+        delta,
+        sm_scale,
+        implementation_id,
+        0,
+    )
+    dq.copy_(dq_hnd.transpose(1, 2))
+    dk.copy_(dk_hnd.transpose(1, 2))
+    dv.copy_(dv_hnd.transpose(1, 2))
+
+
 def feather_attn_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -96,6 +182,39 @@ def feather_attn_backward(
     dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv
     delta = torch.empty(lse.shape, dtype=torch.float32, device=lse.device) if delta is None else delta
+    implementation_id = implementation_ids[normalized_implementation]
+    if layout_id == 1 and _use_nhd_hnd_backward(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dout,
+        dq,
+        dk,
+        dv,
+        delta,
+        float(sm_scale),
+    ):
+        try:
+            _nhd_hnd_backward(
+                q,
+                k,
+                v,
+                out,
+                lse,
+                dout,
+                dq,
+                dk,
+                dv,
+                delta,
+                float(sm_scale),
+                implementation_id,
+            )
+        except torch.OutOfMemoryError:
+            pass
+        else:
+            return dq, dk, dv, delta
     torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(
         q,
         k,
@@ -108,7 +227,7 @@ def feather_attn_backward(
         dv,
         delta,
         float(sm_scale),
-        implementation_ids[normalized_implementation],
+        implementation_id,
         layout_id,
     )
     return dq, dk, dv, delta
