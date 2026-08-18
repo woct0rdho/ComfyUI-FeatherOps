@@ -52,6 +52,9 @@ struct BackwardLaunchParams
     int32_t head_count;
     int32_t n_q;
     int32_t n_kv;
+    int32_t num_heads;
+    int32_t layout;
+    int32_t nhd_group_count;
     float scale;
     hipStream_t stream;
 };

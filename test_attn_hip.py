@@ -10,7 +10,8 @@ BENCHMARK_HEAD_COUNTS = (16, 32, 56)
 GENERAL_HEAD_COUNTS = (1, 2, 3, 4, 7, 24, 30, 40, 48)
 HEAD_DIMS = (64, 128)
 LAYOUTS = ("HND", "NHD")
-BENCHMARK_SEQ_LENS = (257, 4096, 8192)
+BENCHMARK_SEQ_LENS = (4096, 8192, 16384)
+GENERAL_HEAD_SEQ_LEN = 257
 GENERAL_SEQ_LENS = (
     1,
     16,
@@ -31,7 +32,11 @@ GENERAL_SEQ_LENS = (
     4095,
     4096,
     4097,
+    8191,
     8192,
+    8193,
+    16383,
+    16385,
 )
 
 
@@ -40,7 +45,7 @@ def _contract_cases() -> list[tuple[int, int, int, int, int]]:
     for head_dim in HEAD_DIMS:
         cases.extend((BATCH, heads, seq_len, seq_len, head_dim) for heads in BENCHMARK_HEAD_COUNTS for seq_len in BENCHMARK_SEQ_LENS)
         cases.extend((BATCH, BENCHMARK_HEAD_COUNTS[0], seq_len, seq_len, head_dim) for seq_len in GENERAL_SEQ_LENS if seq_len not in BENCHMARK_SEQ_LENS)
-        cases.extend((BATCH, heads, BENCHMARK_SEQ_LENS[0], BENCHMARK_SEQ_LENS[0], head_dim) for heads in GENERAL_HEAD_COUNTS if heads not in BENCHMARK_HEAD_COUNTS)
+        cases.extend((BATCH, heads, GENERAL_HEAD_SEQ_LEN, GENERAL_HEAD_SEQ_LEN, head_dim) for heads in GENERAL_HEAD_COUNTS if heads not in BENCHMARK_HEAD_COUNTS)
         cases.extend(
             (
                 (1, 3, 1, 65, head_dim),

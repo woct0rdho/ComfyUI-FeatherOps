@@ -5,14 +5,29 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 
 from kernel_attn.hip.hip_kernel import feather_attn_backward
 
+LAYOUTS = ("HND", "NHD")
 CASES = (
-    (1, 2, 33, 35, 64),
-    (1, 3, 65, 67, 64),
+    (1, 16, 33, 35, 64),
+    (1, 32, 65, 67, 64),
+    (1, 56, 65, 129, 64),
     (2, 2, 65, 129, 64),
+    (1, 1, 4095, 4097, 64),
+    (1, 1, 4097, 4099, 64),
+    (1, 1, 8191, 67, 64),
+    (1, 1, 65, 8193, 64),
+    (1, 1, 16383, 67, 64),
+    (1, 1, 65, 16385, 64),
+    (1, 32, 65, 16385, 64),
 )
 
 
-def _reference(q, k, v, out, lse, dout, scale):
+def _hnd(tensor, layout):
+    return tensor if layout == "HND" else tensor.transpose(1, 2)
+
+
+def _reference(q, k, v, out, lse, dout, scale, layout):
+    q, k, v = (_hnd(tensor, layout) for tensor in (q, k, v))
+    out, dout = (_hnd(tensor, layout) for tensor in (out, dout))
     qf, kf, vf = q.float(), k.float(), v.float()
     outf, doutf, lsef = out.float(), dout.float(), lse.float()
     scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
@@ -20,28 +35,28 @@ def _reference(q, k, v, out, lse, dout, scale):
     delta = (outf * doutf).sum(-1)
     d_probability = torch.matmul(doutf, vf.transpose(-1, -2))
     d_score = probabilities * (d_probability - delta.unsqueeze(-1))
-    return (
-        torch.matmul(d_score, kf) * scale,
-        torch.matmul(d_score.transpose(-1, -2), qf) * scale,
-        torch.matmul(probabilities.transpose(-1, -2), doutf),
-        delta,
-    )
+    dq = torch.matmul(d_score, kf) * scale
+    dk = torch.matmul(d_score.transpose(-1, -2), qf) * scale
+    dv = torch.matmul(probabilities.transpose(-1, -2), doutf)
+    if layout == "NHD":
+        dq, dk, dv = (tensor.transpose(1, 2) for tensor in (dq, dk, dv))
+    return dq, dk, dv, delta
 
 
-def _saved_state(batch, heads, n_q, n_kv, head_dim, seed):
+def _saved_state(batch, heads, n_q, n_kv, head_dim, seed, layout):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     shape_q = (batch, heads, n_q, head_dim)
     shape_kv = (batch, heads, n_kv, head_dim)
-    q = torch.randn(shape_q, device="cuda", dtype=torch.float16, generator=generator)
-    k = torch.randn(shape_kv, device="cuda", dtype=torch.float16, generator=generator)
-    v = torch.randn(shape_kv, device="cuda", dtype=torch.float16, generator=generator)
-    dout = torch.randn(shape_q, device="cuda", dtype=torch.float16, generator=generator)
+    q_hnd = torch.randn(shape_q, device="cuda", dtype=torch.float16, generator=generator)
+    k_hnd = torch.randn(shape_kv, device="cuda", dtype=torch.float16, generator=generator)
+    v_hnd = torch.randn(shape_kv, device="cuda", dtype=torch.float16, generator=generator)
+    dout_hnd = torch.randn(shape_q, device="cuda", dtype=torch.float16, generator=generator)
     scale = head_dim**-0.5
     out_bshd, lse, _, _ = flash_attn_2.fwd(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
+        q_hnd.transpose(1, 2),
+        k_hnd.transpose(1, 2),
+        v_hnd.transpose(1, 2),
         out=None,
         alibi_slopes=None,
         dropout_p=0.0,
@@ -52,7 +67,13 @@ def _saved_state(batch, heads, n_q, n_kv, head_dim, seed):
         softcap=0.0,
         return_softmax=False,
     )
-    return q, k, v, out_bshd.transpose(1, 2).contiguous(), lse.contiguous(), dout, scale
+    if layout == "HND":
+        q, k, v, dout = q_hnd, k_hnd, v_hnd, dout_hnd
+        out = out_bshd.transpose(1, 2).contiguous()
+    else:
+        q, k, v, dout = (tensor.transpose(1, 2).contiguous() for tensor in (q_hnd, k_hnd, v_hnd, dout_hnd))
+        out = out_bshd.contiguous()
+    return q, k, v, out, lse.contiguous(), dout, scale
 
 
 def _check(actual, expected, n_kv):
@@ -64,27 +85,59 @@ def _check(actual, expected, n_kv):
     assert float((difference.abs() / tolerance).max()) <= 1.0
 
 
+def _check_d128_rejected(layout):
+    tensor = torch.empty((1, 1, 1, 128), device="cuda", dtype=torch.float16)
+    lse = torch.empty((1, 1, 1), device="cuda", dtype=torch.float32)
+    try:
+        feather_attn_backward(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            lse,
+            tensor,
+            implementation="fused",
+            layout=layout,
+        )
+    except ValueError as exc:
+        assert "only D64" in str(exc)
+    else:
+        raise AssertionError("D128 backward must remain unsupported")
+    print(f"PASS implementation=fused layout={layout} D128 rejected")
+
+
 def main():
     total = 0
-    for case_index, (batch, heads, n_q, n_kv, head_dim) in enumerate(CASES):
-        state = _saved_state(batch, heads, n_q, n_kv, head_dim, seed=20260813 + case_index)
-        q, k, v, out, lse, dout, scale = state
-        expected = _reference(q, k, v, out, lse, dout, scale)
-        implementation = "fused"
-        actual = feather_attn_backward(
-            q,
-            k,
-            v,
-            out,
-            lse,
-            dout,
-            sm_scale=scale,
-            implementation=implementation,
-        )
-        for result, reference in zip(actual, expected):
-            _check(result, reference, n_kv)
-        total += 1
-        print(f"PASS implementation={implementation} B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}")
+    for layout in LAYOUTS:
+        for case_index, (batch, heads, n_q, n_kv, head_dim) in enumerate(CASES):
+            state = _saved_state(
+                batch,
+                heads,
+                n_q,
+                n_kv,
+                head_dim,
+                seed=20260813 + case_index,
+                layout=layout,
+            )
+            q, k, v, out, lse, dout, scale = state
+            expected = _reference(q, k, v, out, lse, dout, scale, layout)
+            implementation = "fused"
+            actual = feather_attn_backward(
+                q,
+                k,
+                v,
+                out,
+                lse,
+                dout,
+                sm_scale=scale,
+                implementation=implementation,
+                layout=layout,
+            )
+            for result, reference in zip(actual, expected):
+                _check(result, reference, n_kv)
+            total += 1
+            print(f"PASS implementation={implementation} layout={layout} B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}")
+        _check_d128_rejected(layout)
     print(f"Summary: {total} D64 saved-state cases passed")
 
 

@@ -8,17 +8,19 @@ The current production backward surface contains one explicit implementation:
 | ---: | --- | --- |
 | 64 | `implementation="fused"` | Seven-GEMM direct-output kernel, linked and contract-tested |
 
-The saved-state contract is contiguous HND `[B,H,N,D]`, FP16 `(Q,K,V,O,dO)`, FP32 natural-log LSE, dense non-causal attention, equal query/KV heads, current-device validation, and current-stream execution. The current operator returns FP16 `dQ`, `dK`, `dV`, and FP32 `Delta`.
+The saved-state contract is contiguous HND `[B,H,N,D]` or NHD `[B,N,H,D]`, FP16 `(Q,K,V,O,dO)`, FP32 natural-log LSE `[B,H,NQ]`, dense non-causal attention, equal query/KV heads, current-device validation, and current-stream execution. The current operator returns FP16 `dQ`, `dK`, `dV` in the input layout and FP32 `Delta` in logical `[B,H,NQ]` order.
+
+The 18-row dual-layout performance matrix is an optimization target, not a dispatch whitelist. Query and KV lengths remain independent arbitrary positive values within the existing signed-int32 dimension and addressability checks. Runtime ceil-divided tile counts and row guards handle tails. Lengths select only the existing fused or long phase-split images; they do not create per-length specializations, and each selected image has fixed per-workgroup VGPR/LDS requirements.
 
 ## Public Contract and Source Layout
 
 The public wrapper is:
 
 ```text
-feather_attn_backward(Q, K, V, O, LSE, dO, *, implementation, sm_scale=None, ...)
+feather_attn_backward(Q, K, V, O, LSE, dO, *, implementation, layout="HND", sm_scale=None, ...)
 ```
 
-The backward arguments are fixed HND tensors. There is no backward `layout` selector and no full-gradient workspace argument. The seven-GEMM kernel owns each output element and writes the final FP16 gradients directly; this removes the old FP32 accumulation buffers, atomic updates, clear kernel, and conversion kernels.
+The backward arguments are contiguous HND or NHD tensors selected by `layout`; there is no full-gradient workspace argument. The seven-GEMM kernel owns each output element and writes the final FP16 gradients directly; this removes the old FP32 accumulation buffers, atomic updates, clear kernel, and conversion kernels.
 
 | File | Role |
 | --- | --- |
@@ -26,6 +28,8 @@ The backward arguments are fixed HND tensors. There is no backward `layout` sele
 | `kernel_attn/hip/hip_kernel.cpp` | Shared validation, fused dispatch, current-stream lookup, and Torch registration |
 | `kernel_attn/hip/hip_kernel.h` | Raw forward/backward launch ABI |
 | `kernel_attn/hip/featherattn_bwd_fused_d64.cu` | D64 Delta helper and seven-GEMM device launcher |
+| `benchmark_attn_hip_backward.py` | Paired AITER/Feather D64 primary-matrix benchmark |
+| `test_attn_hip_backward.py` | Saved-state D64 correctness and arbitrary-length coverage |
 
 ## Current Production Design
 
@@ -47,7 +51,7 @@ The D64 kernel uses one 128-thread workgroup per head and ownership tile. Short 
 
 The KV-owned portion stages V in LDS, caches K rows, and cooperatively stages each Q and dO tile into the stride-20 transpose layout. Its compile-time long-sequence specialization also stages the exact dO rows with a padded 72-half stride, so dP reuses aligned LDS loads instead of loading dO from global memory a second time. It computes four GEMM-equivalent operations: QK score, dO/V dP, dS/Q dK, and P/dO dV. The Q-owned portion stages K and V in two 16-row tiles, caches Q and dO rows, and computes three operations: QK score, dO/V dP, and dS/K dQ. The C-to-A WMMA handoff converts each FP32 C fragment to the FP16 A-fragment layout with lane permutes.
 
-The complete launch is a Delta helper followed by either the fused seven-GEMM kernel or ordered KV-only and Q-only phase kernels. All launches use the caller's current stream. No initialization, workspace clear, FP32-to-FP16 gradient conversion, or reduction helper remains in the current path.
+The complete launch is a Delta helper followed by either the fused seven-GEMM kernel or ordered KV-only and Q-only phase kernels. NHD uses direct strided D-vector addressing; its owner ordering is head-fast for partition-periodic `H % 16 == 0` cases, with the forward-derived LLC group permutation enabled when selected, and tile-fast otherwise. All launches use the caller's current stream. No initialization, workspace clear, FP32-to-FP16 gradient conversion, or reduction helper remains in the current path.
 
 ## D128 Scope
 
@@ -80,20 +84,32 @@ The relaxed exploratory tier is for internal candidate comparison and does not s
 
 ## Current Benchmarks
 
-The current matrix uses B1, contiguous HND inputs, equal Q/KV lengths, H `{16,32}`, N `{2048,4096,8192}`, eight warmups, and 30 timed samples per provider. AITER is the FlashAttention Triton backward control. The values below are recomputed with `F7`, not the older five-GEMM field.
+The primary matrix matches the forward plan: B1, contiguous HND and NHD inputs, D64, equal Q/KV lengths, H `{16,32,56}`, and N `{4096,8192,16384}`. `benchmark_attn_hip_backward.py` constructs one saved forward state outside timing, preallocates each provider's outputs, performs eight warmups, and collects 30 samples per provider in alternating order. AITER FlashAttention Triton backward is the control. Throughput uses `F7`; `Feather / AITER` is the median paired elapsed-time ratio.
 
-Every H/N row in the current D64 matrix is shown. The current direct-output Feather kernel does not allocate gradient workspaces.
+Every H/N row in the primary D64 matrix is shown. The current direct-output Feather kernel does not allocate gradient workspaces. HND wins `9/9` rows with a `1.202605x` geometric mean; NHD wins `7/9` with a `1.094688x` geometric mean. Overall, Feather wins `16/18` rows with a `1.147379x` geometric mean paired speedup.
 
 | Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 16 | 2048 | 25.286 | 27.641 | 1.093x |
-| HND | 16 | 4096 | 26.290 | 28.567 | 1.087x |
-| HND | 16 | 8192 | 26.459 | 30.107 | 1.138x |
-| HND | 32 | 2048 | 25.483 | 27.667 | 1.086x |
-| HND | 32 | 4096 | 25.381 | 29.878 | 1.177x |
-| HND | 32 | 8192 | 25.174 | 30.281 | 1.203x |
+| HND | 16 | 4096 | 25.892 | 29.311 | 1.128x |
+| HND | 16 | 8192 | 25.851 | 29.656 | 1.152x |
+| HND | 16 | 16384 | 24.643 | 29.895 | 1.215x |
+| HND | 32 | 4096 | 24.986 | 29.971 | 1.198x |
+| HND | 32 | 8192 | 24.758 | 29.758 | 1.202x |
+| HND | 32 | 16384 | 24.120 | 29.462 | 1.221x |
+| HND | 56 | 4096 | 23.711 | 29.695 | 1.245x |
+| HND | 56 | 8192 | 24.077 | 29.586 | 1.229x |
+| HND | 56 | 16384 | 23.775 | 29.436 | 1.239x |
+| NHD | 16 | 4096 | 25.058 | 28.050 | 1.118x |
+| NHD | 16 | 8192 | 25.304 | 28.412 | 1.121x |
+| NHD | 16 | 16384 | 25.032 | 27.328 | 1.092x |
+| NHD | 32 | 4096 | 23.174 | 27.327 | 1.187x |
+| NHD | 32 | 8192 | 23.665 | 23.178 | 0.981x |
+| NHD | 32 | 16384 | 21.909 | 20.233 | 0.920x |
+| NHD | 56 | 4096 | 23.275 | 28.776 | 1.231x |
+| NHD | 56 | 8192 | 23.655 | 26.139 | 1.105x |
+| NHD | 56 | 16384 | 21.267 | 24.096 | 1.132x |
 
-The public D64 contract screen additionally covers `(NQ,NKV) = (33,35), (65,67), (65,129)` and batch two. The private candidate screen covers `(65,64), (129,65), (256,256), (257,257), (512,513)`, plus batch two and a cancellation pattern.
+The public D64 contract screen covers H `{16,32,56}`, batch two, the long-path selector boundary, and arbitrary asymmetric lengths through 16,385: `(4095,4097)`, `(4097,4099)`, `(8191,67)`, `(65,8193)`, `(16383,67)`, and `(65,16385)`. The private candidate screen additionally covers `(65,64)`, `(129,65)`, `(256,256)`, `(257,257)`, `(512,513)`, and a cancellation pattern.
 
 ## Resource and Profile Results
 
@@ -101,12 +117,16 @@ The symbol-matched linked production image has the following gfx1151 profile:
 
 | Symbol/workgroup | Logical VGPRs | Allocated VGPRs | SGPRs | LDS | Private/spills |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| D64 fused main, 128 threads | 178 | 192 | 45 | 13,312 B | 0 / 0 |
-| D64 KV-only long phase, 128 threads | 169 | 192 | 33 | 15,616 B | 0 / 0 |
-| D64 Q-only long phase, 128 threads | 162 | 168 | 34 | 13,312 B | 0 / 0 |
-| Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 |
+| HND D64 fused main, 128 threads | 178 | 192 | 46 | 13,312 B | 0 / 0 |
+| HND D64 KV-only long phase, 128 threads | 169 | 192 | 33 | 15,616 B | 0 / 0 |
+| HND D64 Q-only long phase, 128 threads | 162 | 168 | 33 | 13,312 B | 0 / 0 |
+| NHD D64 fused main, 128 threads | 178 | 192 | 50 | 13,312 B | 0 / 0 |
+| NHD D64 KV-only long phase, 128 threads | 169 | 192 | 36 | 15,616 B | 0 / 0 |
+| NHD D64 Q-only long phase, 128 threads | 163 | 168 | 38 | 13,312 B | 0 / 0 |
+| HND Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 |
+| NHD Delta helper | 66 | 72 | 14 | 0 B | 0 / 0 |
 
-The linked fused symbol contains 2,748 static instructions: 40 WMMA, 1,540 VALU, 941 SALU, 32 `v_perm_b32`, 16 cross-half permutes, 72 LDS loads, 40 LDS stores, 54 global loads, and 96 global stores. The linked dO-staged KV-only and unchanged Q-only symbols contain 1,489 and 1,242 static instructions respectively, with 16 WMMA for KV and 24 WMMA for Q. Relative to the pre-stage KV image, the new symbol removes eight static global `b128` loads and adds eight LDS `b128` loads; fused and Q-only code and resources remain unchanged. The six-case production correctness snapshot reports maximum relative L2 `0.00030144`, minimum per-head cosine `0.99999988`, and maximum absolute error `0.00119209`. The earlier full-image counter pass reports occupancy `46.62%`, `426.889 M` VALU instructions, `77.611 M` LDS instructions, `12.457 B` wave cycles, `2.440 B` wait-any cycles, `1.076 B` barrier waits, LDS latency `106.73` cycles, LDS conflict metric `24.32`, and ALU stalled by LDS `2.10%` for the fused baseline.
+The pre-NHD HND linked fused symbol contains 2,748 static instructions: 40 WMMA, 1,540 VALU, 941 SALU, 32 `v_perm_b32`, 16 cross-half permutes, 72 LDS loads, 40 LDS stores, 54 global loads, and 96 global stores. The linked dO-staged KV-only and unchanged Q-only symbols contain 1,489 and 1,242 static instructions respectively, with 16 WMMA for KV and 24 WMMA for Q. Relative to the pre-stage KV image, the new symbol removes eight static global `b128` loads and adds eight LDS `b128` loads; fused and Q-only code and resources remain unchanged. The six-case production correctness snapshot reports maximum relative L2 `0.00030144`, minimum per-head cosine `0.99999988`, and maximum absolute error `0.00119209`. The earlier full-image counter pass reports occupancy `46.62%`, `426.889 M` VALU instructions, `77.611 M` LDS instructions, `12.457 B` wave cycles, `2.440 B` wait-any cycles, `1.076 B` barrier waits, LDS latency `106.73` cycles, LDS conflict metric `24.32`, and ALU stalled by LDS `2.10%` for the fused baseline.
 
 The post-dO-stage H16/N4096/D64 production matrix result is `8.419482 ms` (`28.567 TFLOPS` under F7). The private exact leader result was `8.495935 ms` (`28.310 TFLOPS`), and the former campaign target was `8.417913 ms`; none is a fixed promotion gate. A candidate may be retained at any margin when repeated paired measurements provide credible evidence that it is faster. The component result remains the phase attribution for the exact leader:
 
@@ -297,6 +317,13 @@ The historical owned variants `owned-order`, `owned-lifetime`, `owned-exp2`, `ow
 | KV Q-row staging | Rejected: bit-identical and `1.0082x` in one focused H16/N4096 run, but raises the KV specialization to 192 logical VGPRs and 15,360 B LDS; it is a materially worse resource image than dO-only staging |
 | Linear 64-half dO row staging | Rejected: bit-identical but severe LDS bank conflicts regress H16/N4096 from `8.324604` to `11.090252 ms` |
 | Padded 72-half dO row staging | Accepted and integrated only for long-sequence KV-only: bit-identical, 169 logical/192 allocated VGPRs, 33 SGPRs, 15,616 B LDS, zero private memory/spills, and `1.015714x` linked-image paired geometric speedup with 48/48 block wins |
+| NHD physical D64 backward layout | Accepted: contiguous `[B,N,H,D]` validation, layout-aware Delta and seven-GEMM images, direct strided D-vector addressing, `22/22` dual-layout saved-state cases passed, and linked HND/NHD images remain within 192 campaign-rounded VGPRs, 32 KiB LDS, zero private memory, and zero spills |
+| NHD head-order policy | Accepted for the current topology: NHD uses the exact quotient/remainder LLC group permutation when the forward-derived count is greater than one and `H % 16 == 0`, head-fast ownership for the remaining periodic cases, and tile-fast ownership for other head strides; the policy is compile-time image-preserving and keeps arbitrary head counts supported |
+| NHD long phase fusion | Rejected: combining KV and Q ownership for NHD improved some short rows but the focused nine-row NHD screen reached only `0.956310x` geometric Feather/AITER, with H16/N16384 at `0.943x`, H32/N8192 at `0.738x`, and H32/N16384 at `0.760x`; retain long phase fission |
+| NHD all-head LLC grouping | Rejected as a blanket policy: applying the forward-style grouped head permutation to non-periodic H56 strides regressed the focused N8192 and N16384 rows to `0.941x` and `1.045x`; grouping is now admitted only when `H % 16 == 0` |
+| NHD H32/N16384 group-count sweep | Rejected beyond the forward-derived count 4: corrected uneven permutations with counts 5 and 3 reached only `0.904842x` and `0.911481x` Feather/AITER; count 4 remains selected |
+| Initial equal-size NHD head-group permutation | Rejected and corrected before timing: the H32/group-count-5 trial generated an illegal address because its group count did not divide `H`; no result was admitted from that image |
+| Uneven NHD head-group permutation | Accepted correctness fix: one-launch grouped ordering now uses quotient/remainder group sizes within each batch, preventing out-of-range physical heads when the group count does not divide `H`; the new H32/NKV16385 asymmetric case passes in both layouts |
 | Combined Q-row and dO-row staging | Rejected: bit-identical at 173 logical VGPRs and 17,408 B LDS, but focused timing is only `1.0014x` versus fission and does not beat dO-only at `1.0205x` |
 | Nine-wave launch bound | Rejected as an allocator diagnostic: LLVM's final occupancy is eight waves and cannot satisfy `__launch_bounds__(128, 9)` |
 | Forced 168-VGPR attribute | Rejected: deprecated `amdgpu_num_vgpr` changes every specialization and lowers logical counts to 161 for dO-stage, 167 for KV baseline, and 168 for fused without changing the 192-VGPR campaign class. Four-way H16/N4096 timing is uncapped fission `8.471286 ms`, uncapped dO-stage `8.264328 ms`, capped fission `8.326294 ms`, and capped dO-stage `8.284446 ms`; the naturally allocated dO image is faster and has no spills |
@@ -338,7 +365,7 @@ The remaining hypotheses have the following disposition:
 
 ## Ranked Stop/Go Plan
 
-No current candidate satisfies all promotion gates, so production remains unchanged. If another D64 campaign is opened, evaluate only compile-time phase-local variants in this order:
+No pending kernel-schedule candidate satisfies all promotion gates. The accepted NHD layout and ownership work is recorded above; if another D64 campaign is opened, evaluate only compile-time phase-local variants in this order:
 
 | Rank | Experiment | Go signal | Immediate stop signal |
 | ---: | --- | --- | --- |
@@ -350,13 +377,13 @@ No current candidate satisfies all promotion gates, so production remains unchan
 
 ### Admission Gates
 
-- Keep each experiment private and compile-time in the KV-only specialization. Do not add a public selector or alter HND, FP16 inputs/outputs, natural-log FP32 LSE, device validation, stream semantics, or the raw ABI.
+- Keep each experiment private and compile-time in the KV-only specialization. Do not add a public selector or alter the HND/NHD layout contract, FP16 inputs/outputs, natural-log FP32 LSE, device validation, stream semantics, or the raw ABI.
 - Compile with the production-equivalent `clang -O3 -fno-gpu-rdc --offload-arch=gfx1151` path and inspect the exact linked symbol. Require at most 192 campaign-rounded VGPRs, at most 32,768 bytes of LDS, zero private memory, and zero spills.
 - Compare MIR only from matched-generation snapshots using block, slot, interval, and physical-ISA alignment. Virtual register numbers from separate snapshots are not identities.
 - Run the six research correctness cases and the public D64 contract. Directional candidates require cosine at least `0.997`; Rel-L2 at most `0.10` is preferred and below `0.20` is exploratory. Exact scheduling/layout changes should retain the current approximately `0.0003` Rel-L2 behavior.
 - Use phase-local H16/N4096 and H32/N8192 profiling only for triage. Promotion requires complete provider timing, including Delta, every main/helper launch, synchronization, conversions, and provider work, normalized with `F7`.
-- Run repeated alternating paired measurements on all H `{16,32}` x N `{2048,4096,8192}` rows. Require credible positive complete-path evidence with no material row regression; a phase-only win, static resource reduction, or isolated fast sample is not sufficient.
-- Re-run the `168/168` forward contract, the backward public contract, and explicit D128 rejection before integration.
+- Run repeated alternating paired measurements on all H `{16,32,56}` x N `{4096,8192,16384}` rows. Require credible positive complete-path evidence with no material row regression; a phase-only win, static resource reduction, or isolated fast sample is not sufficient.
+- Re-run the `188/188` forward contract, the backward public contract, and explicit D128 rejection before integration.
 
 ### Stop Conditions
 
@@ -367,7 +394,8 @@ D128 is a separate seven-GEMM design effort. It remains unsupported and must con
 ## Artifacts
 
 - Forward matrix: `~/tmp/feather_attn/phase11_final/matrix/attn.csv`.
-- Current D64 timing run: `/tmp/feather_current_bwd_matrix.json`.
+- Current dual-layout D64 timing run: `/tmp/feather_bwd_primary_matrix_hnd_nhd_final.json` (SHA256 `d8b26761da45169067495e51da111742badd56fad59adacf4fd62824530538aa`).
+- Current linked backward resource inspection: `/tmp/feather_bwd_nhd_final_inspect_20260818/`.
 - Private D64 leader timing: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/timing_phases_clean.json`.
 - Private D64 leader correctness: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/correctness.json`.
 - Private D64 metadata/disassembly: `~/tmp/feather_attn/candidates/seven_gemm_packed/profile/opt_stride20_all_lds13312/build/attn_stride20_all_lds13312_hip_ext/`.

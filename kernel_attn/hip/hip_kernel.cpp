@@ -352,10 +352,13 @@ void AttnBwdFp16Feather(
     torch::stable::Tensor& dv,
     torch::stable::Tensor& delta,
     double sm_scale,
-    int64_t implementation)
+    int64_t implementation,
+    int64_t layout)
 {
     STD_TORCH_CHECK(implementation == 1,
                     "only fused D64 backward is currently supported");
+    STD_TORCH_CHECK(layout == 0 || layout == 1,
+                    "layout must be 0 (HND) or 1 (NHD)");
     STD_TORCH_CHECK(q.is_cuda(), "all backward tensors must be CUDA tensors");
     const auto device_index = q.get_device_index();
     auto CheckDevice = [&](const torch::stable::Tensor& tensor) {
@@ -396,11 +399,14 @@ void AttnBwdFp16Feather(
     CheckAttentionDim(dk);
     CheckAttentionDim(dv);
 
+    const bool nhd = layout == 1;
+    const int64_t head_axis = nhd ? 2 : 1;
+    const int64_t seq_axis = nhd ? 1 : 2;
     const int64_t batch = q.size(0);
-    const int64_t heads = q.size(1);
-    const int64_t n_q = q.size(2);
+    const int64_t heads = q.size(head_axis);
+    const int64_t n_q = q.size(seq_axis);
     const int64_t head_dim = q.size(3);
-    const int64_t n_kv = k.size(2);
+    const int64_t n_kv = k.size(seq_axis);
     STD_TORCH_CHECK(batch > 0 && heads > 0 && n_q > 0 && n_kv > 0,
                     "attention dimensions must be positive");
     STD_TORCH_CHECK(head_dim == 64,
@@ -412,16 +418,22 @@ void AttnBwdFp16Feather(
                         dq.size(0) == batch && dk.size(0) == batch &&
                         dv.size(0) == batch,
                     "batch dimensions must match");
-    STD_TORCH_CHECK(k.size(1) == heads && v.size(1) == heads &&
-                        out.size(1) == heads && dout.size(1) == heads &&
-                        dq.size(1) == heads && dk.size(1) == heads &&
-                        dv.size(1) == heads,
+    STD_TORCH_CHECK(k.size(head_axis) == heads &&
+                        v.size(head_axis) == heads &&
+                        out.size(head_axis) == heads &&
+                        dout.size(head_axis) == heads &&
+                        dq.size(head_axis) == heads &&
+                        dk.size(head_axis) == heads &&
+                        dv.size(head_axis) == heads,
                     "head dimensions must match");
-    STD_TORCH_CHECK(k.size(2) == n_kv && v.size(2) == n_kv &&
-                        dk.size(2) == n_kv && dv.size(2) == n_kv,
+    STD_TORCH_CHECK(k.size(seq_axis) == n_kv &&
+                        v.size(seq_axis) == n_kv &&
+                        dk.size(seq_axis) == n_kv &&
+                        dv.size(seq_axis) == n_kv,
                     "key/value sequence dimensions must match");
-    STD_TORCH_CHECK(out.size(2) == n_q && dout.size(2) == n_q &&
-                        dq.size(2) == n_q,
+    STD_TORCH_CHECK(out.size(seq_axis) == n_q &&
+                        dout.size(seq_axis) == n_q &&
+                        dq.size(seq_axis) == n_q,
                     "query/output sequence dimensions must match");
     STD_TORCH_CHECK(k.size(3) == head_dim && v.size(3) == head_dim &&
                         out.size(3) == head_dim && dout.size(3) == head_dim &&
@@ -434,7 +446,7 @@ void AttnBwdFp16Feather(
                     "lse and delta shapes must be [B, H, NQ]");
     auto CheckAttentionLayout = [&](const torch::stable::Tensor& tensor) {
         STD_TORCH_CHECK(tensor.is_contiguous(),
-                        "HND backward tensors must be contiguous");
+                        "backward attention tensors must be contiguous");
         STD_TORCH_CHECK(IsInt32Addressable(tensor, sizeof(uint16_t)),
                         "an attention tensor exceeds signed-int32 addressing");
     };
@@ -466,6 +478,11 @@ void AttnBwdFp16Feather(
                         kv_rows <= INT32_MAX && q_elements <= INT32_MAX &&
                         kv_elements <= INT32_MAX,
                     "backward tensor size exceeds signed int32");
+    int64_t nhd_group_count =
+        nhd ? ResolveNhdD64StridedGroupCount(heads, n_kv) : 1;
+    STD_TORCH_CHECK(nhd_group_count > 0 && nhd_group_count <= heads &&
+                        nhd_group_count <= INT32_MAX,
+                    "NHD backward group count exceeds head or int32 limits");
 
     torch::stable::accelerator::DeviceGuard device_guard(device_index);
     void* raw_stream = nullptr;
@@ -485,6 +502,9 @@ void AttnBwdFp16Feather(
         static_cast<int32_t>(head_count),
         static_cast<int32_t>(n_q),
         static_cast<int32_t>(n_kv),
+        static_cast<int32_t>(heads),
+        static_cast<int32_t>(layout),
+        static_cast<int32_t>(nhd_group_count),
         static_cast<float>(sm_scale),
         reinterpret_cast<hipStream_t>(raw_stream)};
     (void)hipGetLastError();
@@ -503,7 +523,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(feather_attn_fp16, m)
         "attn_bwd_fp16_feather("
         "Tensor q, Tensor k, Tensor v, Tensor out, Tensor lse, Tensor dout, "
         "Tensor(a!) dq, Tensor(b!) dk, Tensor(c!) dv, Tensor(d!) delta, "
-        "float sm_scale, int implementation"
+        "float sm_scale, int implementation, int layout"
         ") -> ()");
 }
 
