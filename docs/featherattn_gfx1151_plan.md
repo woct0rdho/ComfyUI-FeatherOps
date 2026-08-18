@@ -5,7 +5,7 @@
 The gfx1151 forward kernel is production-qualified for dense non-causal FP16 attention with contiguous HND and NHD tensors and head dimensions 64 and 128. The accepted kernel body was qualified at commit `01454e3`; the later source cleanup changed file ownership and build organization but did not change forward arithmetic or dispatch.
 
 The current result is:
-- `168/168` public-contract cases pass.
+- `188/188` public-contract cases pass.
 - The complete 36-row performance matrix is shown below, with no aggregate or representative-row summary replacing individual shapes.
 - All 20 qualified forward images stay at or below 191 used VGPRs, 32,768 bytes LDS, zero private memory, and zero SGPR/VGPR spills.
 - A disposable packed-RNE encoding candidate passed the public contract and resource gates, but did not produce a repeatable complete-kernel speedup. It was not promoted.
@@ -232,7 +232,7 @@ Every layout, head count, and sequence length in the authoritative matrix is lis
 | NHD | 56 | 8192 | 27.398 | 31.168 | 1.138x |
 | NHD | 56 | 16384 | 28.308 | 31.180 | 1.101x |
 
-Short, independent-tail, arbitrary-head, and batch-two cases are correctness requirements rather than part of this throughput matrix. The `168/168` public test covers lengths from 1 through 16,384, the `1023/1024/1025` tolerance boundary, independent query/KV tails, odd head counts, and batch two.
+Short, independent-tail, arbitrary-head, and batch-two cases are correctness requirements rather than part of this throughput matrix. The `188/188` public test covers lengths from 1 through 16,385, tails on both sides of every primary sequence length, the `1023/1024/1025` tolerance boundary, independent query/KV tails, odd head counts, and batch two.
 
 ## Current Profile Results
 
@@ -315,7 +315,7 @@ The accepted selector refinement above is the only new production change in this
 ### Promotion Gates
 
 Every candidate must satisfy all gates before any production source or selector change:
-- The repository public fixture remains `168/168`, including HND/NHD, D64/D128, independent tails, odd heads, and batch two. Outputs must be finite; directional screening requires cosine at least `0.997`, with `Rel-L2 <= 0.10` preferred and `< 0.20` exploratory, in addition to the public elementwise envelope.
+- The repository public fixture remains `188/188`, including HND/NHD, D64/D128, independent tails, odd heads, and batch two. Outputs must be finite; directional screening requires cosine at least `0.997`, with `Rel-L2 <= 0.10` preferred and `< 0.20` exploratory, in addition to the public elementwise envelope.
 - Every affected linked gfx1151 image stays within 192 campaign-rounded VGPRs, 32,768 bytes LDS, zero private/scratch memory, and zero spills. Inspect the exact runtime symbol, metadata, ISA, and code-object hash.
 - The raw ABI, operator IDs, selector behavior, current-device validation, and current-stream execution remain unchanged unless the candidate is explicitly a host-policy experiment.
 - Timing uses complete execution, including all helper launches, conversions, synchronization, and selector sublaunches. A local change needs a repeatable at least `0.5%` target-domain geomean gain, majority wins, and no regression above `1%`. The full 36-row matrix remains the final regression gate.
@@ -329,7 +329,7 @@ Hard resource gates remain 192 allocated VGPRs, 32,768 bytes LDS, zero private/s
 ## Verification and Artifacts
 
 Primary repository checks:
-- `test_attn_hip.py`: `168/168` public-contract cases.
+- `test_attn_hip.py`: `188/188` public-contract cases.
 - `benchmark_attn_hip.py`: AITER/Feather benchmark harness.
 - `kernel_attn/hip/build/attn_hip_ext/build.ninja`: current independent forward translation units.
 - `~/tmp/feather_attn/fwd_reopen_20260816/`: disposable packed-RNE and truncation sources, linked images, metadata, ISA summaries, contract output, and focused timing.

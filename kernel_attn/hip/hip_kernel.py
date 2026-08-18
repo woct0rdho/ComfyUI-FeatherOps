@@ -75,6 +75,7 @@ def feather_attn_backward(
     delta: torch.Tensor | None = None,
     *,
     implementation: str,
+    layout: str = "HND",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
@@ -84,6 +85,13 @@ def feather_attn_backward(
         raise ValueError("only implementation='fused' is currently supported")
     if q.shape[-1] != 64:
         raise ValueError("only D64 fused backward is currently supported")
+    normalized_layout = layout.upper()
+    if normalized_layout == "HND":
+        layout_id = 0
+    elif normalized_layout == "NHD":
+        layout_id = 1
+    else:
+        raise ValueError(f"layout must be 'HND' or 'NHD', got {layout!r}")
     dq = torch.empty_like(q) if dq is None else dq
     dk = torch.empty_like(k) if dk is None else dk
     dv = torch.empty_like(v) if dv is None else dv
@@ -101,5 +109,6 @@ def feather_attn_backward(
         delta,
         float(sm_scale),
         implementation_ids[normalized_implementation],
+        layout_id,
     )
     return dq, dk, dv, delta

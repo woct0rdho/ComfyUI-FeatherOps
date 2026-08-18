@@ -104,25 +104,54 @@ __device__ inline Half16 CFragmentToA(
     return __builtin_bit_cast(Half16, words);
 }
 
+template<bool kNhd>
+__device__ inline int HeadOffset(
+    int head_linear,
+    int rows,
+    int num_heads)
+{
+    if constexpr(kNhd)
+    {
+        const int batch = head_linear / num_heads;
+        const int head = head_linear - batch * num_heads;
+        return (batch * rows * num_heads + head) * kHeadDim;
+    }
+    return head_linear * rows * kHeadDim;
+}
+
+template<bool kNhd>
 __global__ void DeltaKernel(
     const __half* __restrict__ out,
     const __half* __restrict__ dout,
     float* __restrict__ delta,
-    int rows)
+    int rows,
+    int n_q,
+    int num_heads)
 {
     const int linear = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if(linear >= rows)
         return;
-    const __half* out_row = out + linear * kHeadDim;
-    const __half* dout_row = dout + linear * kHeadDim;
+    int physical_row = linear;
+    int delta_row = linear;
+    if constexpr(kNhd)
+    {
+        const int batch = linear / (n_q * num_heads);
+        const int batch_row = linear - batch * n_q * num_heads;
+        const int q_row = batch_row / num_heads;
+        const int head = batch_row - q_row * num_heads;
+        delta_row = (batch * num_heads + head) * n_q + q_row;
+    }
+    const int offset = physical_row * kHeadDim;
+    const __half* out_row = out + offset;
+    const __half* dout_row = dout + offset;
     float value = 0.0f;
 #pragma unroll
     for(int d = 0; d < kHeadDim; ++d)
         value += __half2float(out_row[d]) * __half2float(dout_row[d]);
-    delta[linear] = value;
+    delta[delta_row] = value;
 }
 
-template<int kPhase>
+template<int kPhase, bool kNhd>
 __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ k,
@@ -135,6 +164,9 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     __half* __restrict__ dv,
     int n_q,
     int n_kv,
+    int num_heads,
+    int head_count,
+    int nhd_group_count,
     float scale)
 {
     constexpr int kv_bytes = kOwnerBlock * kHeadDim * sizeof(_Float16);
@@ -178,10 +210,56 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
         kPhase == 1 ? kv_tiles
                     : (kPhase == 2 ? q_tiles
                                    : (q_tiles > kv_tiles ? q_tiles : kv_tiles));
-    const int owner_tile = static_cast<int>(blockIdx.x) % owner_tiles;
-    const int head_linear = static_cast<int>(blockIdx.x) / owner_tiles;
-    const int q_offset = head_linear * n_q * kHeadDim;
-    const int kv_offset = head_linear * n_kv * kHeadDim;
+    int owner_tile;
+    int head_linear;
+    if constexpr(kNhd)
+    {
+        if(nhd_group_count > 1 && num_heads % 16 == 0)
+        {
+            const int head_slot = static_cast<int>(blockIdx.x) % head_count;
+            const int batch = head_slot / num_heads;
+            const int slot = head_slot - batch * num_heads;
+            const int small_group_size = num_heads / nhd_group_count;
+            const int large_groups = num_heads % nhd_group_count;
+            const int large_group_size = small_group_size + 1;
+            const int large_span = large_groups * large_group_size;
+            int group;
+            int local_head;
+            if(slot < large_span)
+            {
+                group = slot / large_group_size;
+                local_head = slot - group * large_group_size;
+            }
+            else
+            {
+                const int small_slot = slot - large_span;
+                group = large_groups + small_slot / small_group_size;
+                local_head = small_slot % small_group_size;
+            }
+            head_linear = batch * num_heads + group +
+                          local_head * nhd_group_count;
+            owner_tile = static_cast<int>(blockIdx.x) / head_count;
+        }
+        else if(num_heads % 16 == 0)
+        {
+            head_linear = static_cast<int>(blockIdx.x) % head_count;
+            owner_tile = static_cast<int>(blockIdx.x) / head_count;
+        }
+        else
+        {
+            owner_tile = static_cast<int>(blockIdx.x) % owner_tiles;
+            head_linear = static_cast<int>(blockIdx.x) / owner_tiles;
+        }
+    }
+    else
+    {
+        owner_tile = static_cast<int>(blockIdx.x) % owner_tiles;
+        head_linear = static_cast<int>(blockIdx.x) / owner_tiles;
+    }
+    const int q_offset = HeadOffset<kNhd>(head_linear, n_q, num_heads);
+    const int kv_offset = HeadOffset<kNhd>(head_linear, n_kv, num_heads);
+    const int q_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
+    const int kv_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
 
     if(kPhase != 2 && owner_tile < kv_tiles)
     {
@@ -196,7 +274,8 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
             if(kv_start + row < n_kv)
             {
                 const int global_offset =
-                    kv_offset + (kv_start + row) * kHeadDim + chunk * kPacked;
+                    kv_offset + (kv_start + row) * kv_row_stride +
+                    chunk * kPacked;
                 v_value = *reinterpret_cast<const Half8*>(v + global_offset);
             }
             *reinterpret_cast<Half8*>(kv_v_lds + KVLdsOffset(row, chunk)) =
@@ -215,7 +294,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
             if(kv_start + kv_row < n_kv)
             {
                 const int global_offset =
-                    kv_offset + (kv_start + kv_row) * kHeadDim +
+                    kv_offset + (kv_start + kv_row) * kv_row_stride +
                     d_tile * kInnerBlock;
                 k_rows[d_tile] = *reinterpret_cast<const Half16*>(
                     k + global_offset);
@@ -232,7 +311,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
             if(q_start + stage_row < n_q)
             {
                 const int global_offset =
-                    q_offset + (q_start + stage_row) * kHeadDim +
+                    q_offset + (q_start + stage_row) * q_row_stride +
                     stage_chunk * kPacked;
                 q_stage = *reinterpret_cast<const Half8*>(q + global_offset);
                 do_stage = *reinterpret_cast<const Half8*>(dout + global_offset);
@@ -261,7 +340,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
                 if(q_start + lane_row < n_q)
                 {
                     const int offset =
-                        q_offset + (q_start + lane_row) * kHeadDim +
+                        q_offset + (q_start + lane_row) * q_row_stride +
                         d_tile * 16;
                     q_row = *reinterpret_cast<const Half16*>(q + offset);
                 }
@@ -321,7 +400,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
                 else if(q_start + lane_row < n_q)
                 {
                     const int offset =
-                        q_offset + (q_start + lane_row) * kHeadDim +
+                        q_offset + (q_start + lane_row) * q_row_stride +
                         d_tile * 16;
                     do_row = *reinterpret_cast<const Half16*>(dout + offset);
                 }
@@ -381,7 +460,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
                 {
                     const int d = d_tile * kInnerBlock + lane_row;
                     const int offset =
-                        kv_offset + (kv_start + row) * kHeadDim + d;
+                        kv_offset + (kv_start + row) * kv_row_stride + d;
                     dk[offset] = __float2half(dk_accum[d_tile][i] * scale);
                     dv[offset] = __float2half(dv_accum[d_tile][i]);
                 }
@@ -401,7 +480,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
             if(q_start + lane_row < n_q)
             {
                 const int offset =
-                    q_offset + (q_start + lane_row) * kHeadDim +
+                    q_offset + (q_start + lane_row) * q_row_stride +
                     d_tile * kInnerBlock;
                 q_rows[d_tile] = *reinterpret_cast<const Half16*>(q + offset);
             }
@@ -413,7 +492,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
             if(q_start + lane_row < n_q)
             {
                 const int offset =
-                    q_offset + (q_start + lane_row) * kHeadDim +
+                    q_offset + (q_start + lane_row) * q_row_stride +
                     d_tile * kInnerBlock;
                 do_rows[d_tile] = *reinterpret_cast<const Half16*>(
                     dout + offset);
@@ -442,7 +521,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
                 if(kv_start + stage_row < n_kv)
                 {
                     const int global_offset =
-                        kv_offset + (kv_start + stage_row) * kHeadDim +
+                        kv_offset + (kv_start + stage_row) * kv_row_stride +
                         stage_chunk * kPacked;
                     k_stage = *reinterpret_cast<const Half8*>(k + global_offset);
                     v_stage = *reinterpret_cast<const Half8*>(v + global_offset);
@@ -539,7 +618,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
                 if(q_start + row < n_q)
                 {
                     const int d = d_tile * kInnerBlock + lane_row;
-                    dq[q_offset + (q_start + row) * kHeadDim + d] =
+                    dq[q_offset + (q_start + row) * q_row_stride + d] =
                         __float2half(dq_accum[d_tile][i] * scale);
                 }
             }
@@ -547,6 +626,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     }
 }
 
+template<bool kNhd>
 bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
 {
     const auto* q = reinterpret_cast<const __half*>(params.q_ptr);
@@ -572,7 +652,7 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
         (static_cast<uint32_t>(q_rows) + kRowsBlock - 1) /
         kRowsBlock);
     hipLaunchKernelGGL(
-        DeltaKernel,
+        (DeltaKernel<kNhd>),
         delta_grid,
         delta_block,
         0,
@@ -580,7 +660,9 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
         out,
         dout,
         delta,
-        q_rows);
+        q_rows,
+        params.n_q,
+        params.num_heads);
 
     const dim3 main_block(kThreads);
     if(params.n_q >= 4096 && params.n_kv >= 4096)
@@ -588,7 +670,7 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
         const dim3 kv_grid(
             static_cast<uint32_t>(params.head_count * kv_tiles));
         hipLaunchKernelGGL(
-            (SevenGemmD64Kernel<1>),
+            (SevenGemmD64Kernel<1, kNhd>),
             kv_grid,
             main_block,
             0,
@@ -604,12 +686,15 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
             dv,
             params.n_q,
             params.n_kv,
+            params.num_heads,
+            params.head_count,
+            params.nhd_group_count,
             params.scale);
 
         const dim3 q_grid(
             static_cast<uint32_t>(params.head_count * q_tiles));
         hipLaunchKernelGGL(
-            (SevenGemmD64Kernel<2>),
+            (SevenGemmD64Kernel<2, kNhd>),
             q_grid,
             main_block,
             0,
@@ -625,6 +710,9 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
             dv,
             params.n_q,
             params.n_kv,
+            params.num_heads,
+            params.head_count,
+            params.nhd_group_count,
             params.scale);
     }
     else
@@ -632,7 +720,7 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
         const dim3 main_grid(
             static_cast<uint32_t>(params.head_count * owner_tiles));
         hipLaunchKernelGGL(
-            (SevenGemmD64Kernel<0>),
+            (SevenGemmD64Kernel<0, kNhd>),
             main_grid,
             main_block,
             0,
@@ -648,6 +736,9 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
             dv,
             params.n_q,
             params.n_kv,
+            params.num_heads,
+            params.head_count,
+            params.nhd_group_count,
             params.scale);
     }
     return hipPeekAtLastError() == hipSuccess;
@@ -658,7 +749,8 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
 extern "C" bool feather_attn_bwd_d64_fused(
     const BackwardLaunchParams& params)
 {
-    return LaunchSevenGemmBackward(params);
+    return params.layout == 1 ? LaunchSevenGemmBackward<true>(params)
+                              : LaunchSevenGemmBackward<false>(params);
 }
 
 } // namespace feather_attn
