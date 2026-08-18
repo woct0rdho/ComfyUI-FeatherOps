@@ -85,5 +85,7 @@ extern "C" bool feather_attn_nhd_d64_strided_query_key_tail(
     const StridedLaunchParams& params);
 extern "C" bool feather_attn_bwd_d64_fused(
     const BackwardLaunchParams& params);
+extern "C" bool feather_attn_bwd_d128_fused(
+    const BackwardLaunchParams& params);
 
 } // namespace feather_attn

@@ -273,6 +273,7 @@ def _write_result(
 
 
 def main() -> None:
+    global HEAD_DIM
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--shapes",
@@ -284,6 +285,7 @@ def main() -> None:
         default=",".join(LAYOUTS),
         help="comma-separated physical layouts (HND and/or NHD)",
     )
+    parser.add_argument("--head-dim", type=int, choices=(64, 128), default=HEAD_DIM)
     parser.add_argument("--warmups", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--seed", type=int, default=640117)
@@ -291,6 +293,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.warmups < 0 or args.repeats <= 0:
         raise ValueError("warmups must be non-negative and repeats must be positive")
+    HEAD_DIM = args.head_dim
 
     shapes = _parse_shapes(args.shapes)
     layouts = _parse_layouts(args.layouts)

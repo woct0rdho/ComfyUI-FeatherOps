@@ -19,6 +19,7 @@ CASES = (
     (1, 1, 65, 16385, 64),
     (1, 32, 65, 16385, 64),
 )
+D128_CASES = tuple((*case[:4], 128) for case in CASES)
 
 
 def _hnd(tensor, layout):
@@ -85,35 +86,14 @@ def _check(actual, expected, n_kv):
     assert float((difference.abs() / tolerance).max()) <= 1.0
 
 
-def _check_d128_rejected(layout):
-    tensor = torch.empty((1, 1, 1, 128), device="cuda", dtype=torch.float16)
-    lse = torch.empty((1, 1, 1), device="cuda", dtype=torch.float32)
-    try:
-        feather_attn_backward(
-            tensor,
-            tensor,
-            tensor,
-            tensor,
-            lse,
-            tensor,
-            implementation="fused",
-            layout=layout,
-        )
-    except ValueError as exc:
-        assert "only D64" in str(exc)
-    else:
-        raise AssertionError("D128 backward must remain unsupported")
-    print(f"PASS implementation=fused layout={layout} D128 rejected")
-
-
-def _check_nhd_hnd_dispatch():
+def _check_nhd_hnd_dispatch(head_dim):
     q, k, v, out, lse, dout, scale = _saved_state(
         1,
         32,
         8192,
         8192,
-        64,
-        seed=20260818,
+        head_dim,
+        seed=20260818 + head_dim,
         layout="NHD",
     )
     expected = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
@@ -144,43 +124,44 @@ def _check_nhd_hnd_dispatch():
     )
     for result, direct in zip(actual, (*expected, expected_delta)):
         assert torch.equal(result, direct)
-    print("PASS NHD H32 N8192 HND-dispatch exact equivalence")
+    print(f"PASS NHD H32 N8192 D{head_dim} HND-dispatch exact equivalence")
 
 
 def main():
     total = 0
     for layout in LAYOUTS:
-        for case_index, (batch, heads, n_q, n_kv, head_dim) in enumerate(CASES):
-            state = _saved_state(
-                batch,
-                heads,
-                n_q,
-                n_kv,
-                head_dim,
-                seed=20260813 + case_index,
-                layout=layout,
-            )
-            q, k, v, out, lse, dout, scale = state
-            expected = _reference(q, k, v, out, lse, dout, scale, layout)
-            implementation = "fused"
-            actual = feather_attn_backward(
-                q,
-                k,
-                v,
-                out,
-                lse,
-                dout,
-                sm_scale=scale,
-                implementation=implementation,
-                layout=layout,
-            )
-            for result, reference in zip(actual, expected):
-                _check(result, reference, n_kv)
-            total += 1
-            print(f"PASS implementation={implementation} layout={layout} B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}")
-        _check_d128_rejected(layout)
-    _check_nhd_hnd_dispatch()
-    print(f"Summary: {total} D64 saved-state cases passed")
+        for dimension_index, cases in enumerate((CASES, D128_CASES)):
+            for case_index, (batch, heads, n_q, n_kv, head_dim) in enumerate(cases):
+                state = _saved_state(
+                    batch,
+                    heads,
+                    n_q,
+                    n_kv,
+                    head_dim,
+                    seed=20260813 + dimension_index * 1000 + case_index,
+                    layout=layout,
+                )
+                q, k, v, out, lse, dout, scale = state
+                expected = _reference(q, k, v, out, lse, dout, scale, layout)
+                implementation = "fused"
+                actual = feather_attn_backward(
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    dout,
+                    sm_scale=scale,
+                    implementation=implementation,
+                    layout=layout,
+                )
+                for result, reference in zip(actual, expected):
+                    _check(result, reference, n_kv)
+                total += 1
+                print(f"PASS implementation={implementation} layout={layout} B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}")
+    for head_dim in (64, 128):
+        _check_nhd_hnd_dispatch(head_dim)
+    print(f"Summary: {total} D64/D128 saved-state cases passed")
 
 
 if __name__ == "__main__":
