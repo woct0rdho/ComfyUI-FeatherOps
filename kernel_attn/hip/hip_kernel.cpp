@@ -356,7 +356,7 @@ void AttnBwdFp16Feather(
     int64_t layout)
 {
     STD_TORCH_CHECK(implementation == 1,
-                    "only fused D64 backward is currently supported");
+                    "only fused backward is currently supported");
     STD_TORCH_CHECK(layout == 0 || layout == 1,
                     "layout must be 0 (HND) or 1 (NHD)");
     STD_TORCH_CHECK(q.is_cuda(), "all backward tensors must be CUDA tensors");
@@ -409,8 +409,8 @@ void AttnBwdFp16Feather(
     const int64_t n_kv = k.size(seq_axis);
     STD_TORCH_CHECK(batch > 0 && heads > 0 && n_q > 0 && n_kv > 0,
                     "attention dimensions must be positive");
-    STD_TORCH_CHECK(head_dim == 64,
-                    "only D64 fused backward is currently supported");
+    STD_TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                    "fused backward supports D64 and D128 only");
     STD_TORCH_CHECK(lse.dim() == 3 && delta.dim() == 3,
                     "lse and delta must be [B, H, N]");
     STD_TORCH_CHECK(k.size(0) == batch && v.size(0) == batch &&
@@ -479,7 +479,8 @@ void AttnBwdFp16Feather(
                         kv_elements <= INT32_MAX,
                     "backward tensor size exceeds signed int32");
     int64_t nhd_group_count =
-        nhd ? ResolveNhdD64StridedGroupCount(heads, n_kv) : 1;
+        nhd && head_dim == 64 ? ResolveNhdD64StridedGroupCount(heads, n_kv)
+                              : 1;
     STD_TORCH_CHECK(nhd_group_count > 0 && nhd_group_count <= heads &&
                         nhd_group_count <= INT32_MAX,
                     "NHD backward group count exceeds head or int32 limits");
@@ -508,7 +509,9 @@ void AttnBwdFp16Feather(
         static_cast<float>(sm_scale),
         reinterpret_cast<hipStream_t>(raw_stream)};
     (void)hipGetLastError();
-    const bool launched = feather_attn_bwd_d64_fused(params);
+    const bool launched = head_dim == 64
+                              ? feather_attn_bwd_d64_fused(params)
+                              : feather_attn_bwd_d128_fused(params);
     const hipError_t launch_error = hipGetLastError();
     STD_TORCH_CHECK(launched && launch_error == hipSuccess,
                     "FeatherAttn backward launch failed: ",

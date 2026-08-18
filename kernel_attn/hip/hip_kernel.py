@@ -12,6 +12,7 @@ _ck_tile_root = Path(_ck_tile_root).expanduser()
 _extension_sources = [
     "hip_kernel.cpp",
     "featherattn_bwd_fused_d64.cu",
+    "featherattn_bwd_fused_d128.cu",
     "featherattn_fwd_aligned.cu",
     "featherattn_fwd_query_tail.cu",
     "featherattn_fwd_key_tail.cu",
@@ -87,7 +88,9 @@ def _use_nhd_hnd_backward(
     if lse.ndim != 3 or delta.ndim != 3 or not lse.is_contiguous() or not delta.is_contiguous():
         return False
     batch, n_q, heads, head_dim = q.shape
-    if batch != 1 or heads not in (32, 56) or n_q < 8192 or n_q > 16384 or head_dim != 64:
+    d64_shape = head_dim == 64 and heads in (32, 56) and 8192 <= n_q <= 16384
+    d128_shape = head_dim == 128 and heads in (16, 32, 56) and 4096 <= n_q <= 16384
+    if batch != 1 or not (d64_shape or d128_shape):
         return False
     if k.shape != q.shape or v.shape != q.shape:
         return False
@@ -169,8 +172,8 @@ def feather_attn_backward(
     normalized_implementation = implementation.lower()
     if normalized_implementation not in implementation_ids:
         raise ValueError("only implementation='fused' is currently supported")
-    if q.shape[-1] != 64:
-        raise ValueError("only D64 fused backward is currently supported")
+    if q.shape[-1] not in (64, 128):
+        raise ValueError("fused backward supports D64 and D128 only")
     normalized_layout = layout.upper()
     if normalized_layout == "HND":
         layout_id = 0
