@@ -106,6 +106,47 @@ def _check_d128_rejected(layout):
     print(f"PASS implementation=fused layout={layout} D128 rejected")
 
 
+def _check_nhd_hnd_dispatch():
+    q, k, v, out, lse, dout, scale = _saved_state(
+        1,
+        32,
+        8192,
+        8192,
+        64,
+        seed=20260818,
+        layout="NHD",
+    )
+    expected = (torch.empty_like(q), torch.empty_like(k), torch.empty_like(v))
+    expected_delta = torch.empty_like(lse)
+    torch.ops.feather_attn_fp16.attn_bwd_fp16_feather.default(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dout,
+        *expected,
+        expected_delta,
+        scale,
+        1,
+        1,
+    )
+    actual = feather_attn_backward(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dout,
+        sm_scale=scale,
+        implementation="fused",
+        layout="NHD",
+    )
+    for result, direct in zip(actual, (*expected, expected_delta)):
+        assert torch.equal(result, direct)
+    print("PASS NHD H32 N8192 HND-dispatch exact equivalence")
+
+
 def main():
     total = 0
     for layout in LAYOUTS:
@@ -138,6 +179,7 @@ def main():
             total += 1
             print(f"PASS implementation={implementation} layout={layout} B={batch} H={heads} NQ={n_q} NKV={n_kv} D={head_dim}")
         _check_d128_rejected(layout)
+    _check_nhd_hnd_dispatch()
     print(f"Summary: {total} D64 saved-state cases passed")
 
 
