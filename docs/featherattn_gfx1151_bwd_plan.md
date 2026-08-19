@@ -83,7 +83,7 @@ The D128 pipeline may differ from D64 where doubling the channel fragments chang
 | 256-row, 512-thread D128 Q owner | The 512-thread/256-row form remains zero-private/zero-spill at 246 VGPRs and 13,312 B LDS. It is tied/slightly faster at N4096 (`23.32/46.94/82.05` ms), then consistently faster at N8192 (`92.83/183.95/329.33` ms versus `93.20/186.28/331.97` ms) and reaches `378.56/761.07/1338.30` ms at N16384 for H16/H32/H56, all around 20.1-20.7 normalized TFLOPS. | Accepted as the final Q owner topology: the four-wave/SIMD residency limit is offset by halved block count and staging overhead. |
 | Final D128 production qualification | The permanent backward screen passes `44/44` D64/D128 cases plus exact D64/D128 NHD-dispatch checks; forward remains `188/188`. The production D128 matrix wins `18/18` at `2.776753x` geometric (`2.803848x` HND, `2.749920x` NHD). Final linked Delta/KV/Q images all have zero private bytes, zero spills, and zero scratch instructions. | Accepted for production. D64 remains `18/18` at `1.175870x`, within run variance of the prior `1.182570x`. |
 
-The final D128 implementation uses separate Delta, KV, and Q kernels. The 512-thread Q owner keeps exact FP16 Q/dO fragments in registers, accumulates dQ in FP32, and streams one 16-row K/V tile at a time. The 128-thread KV owner assigns dK and dV to separate wave pairs so each lane carries one eight-fragment FP32 output bank rather than both. E5M2 is not used: exact FP16 fits the zero-spill envelope, and no tested byte representation created a justified latency/resource transition.
+The current D128 implementation uses separate Delta, KV, and Q kernels. The 512-thread Q owner keeps exact FP16 Q/dO fragments in registers, accumulates dQ in FP32, and streams one 16-row K/V tile at a time. The 256-thread KV owner assigns dK and dV to separate four-wave groups over 64 KV rows so each lane carries one eight-fragment FP32 output bank rather than both. E5M2 is not used: exact FP16 fits the zero-spill envelope, and no tested byte representation created a justified latency/resource transition.
 
 ## Throughput Convention
 
@@ -141,32 +141,32 @@ Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp3b_d64_kv_hnd_owner128_wg
 
 ### D128 Production Matrix
 
-The final D128 matrix uses the production `benchmark_attn_hip_backward.py --head-dim 128` entry point with five warmups and ten alternating samples per provider. Feather wins `18/18` rows at `2.776753x` geometric speedup. HND is `2.803848x`; NHD, including all eight in-provider transposes, is `2.749920x`. The minimum row speedup is `2.377893x`.
+The current D128 matrix uses the production `benchmark_attn_hip_backward.py --head-dim 128` entry point with five warmups and ten alternating samples per provider. Feather wins `18/18` rows at `3.022769x` geometric speedup. HND is `3.133169x`; NHD, including all eight in-provider transposes, is `2.916258x`. The minimum row speedup is `2.548777x`.
 
-Artifact: `/tmp/feather_bwd_d128_final_matrix_production.json`
+Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp4_d128_kv_owner64_wg256/aiter_matrix.json`
 
 | Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 16 | 4096 | 7.004 | 20.307 | 2.876x |
-| HND | 16 | 8192 | 7.158 | 20.087 | 2.787x |
-| HND | 16 | 16384 | 7.409 | 20.358 | 2.740x |
-| HND | 32 | 4096 | 7.150 | 20.679 | 2.873x |
-| HND | 32 | 8192 | 7.217 | 20.386 | 2.804x |
-| HND | 32 | 16384 | 7.323 | 20.123 | 2.746x |
-| HND | 56 | 4096 | 6.971 | 20.255 | 2.861x |
-| HND | 56 | 8192 | 7.281 | 20.201 | 2.782x |
-| HND | 56 | 16384 | 7.209 | 19.992 | 2.771x |
-| NHD | 16 | 4096 | 6.724 | 16.010 | 2.378x |
-| NHD | 16 | 8192 | 6.508 | 17.793 | 2.722x |
-| NHD | 16 | 16384 | 6.260 | 18.655 | 2.972x |
-| NHD | 32 | 4096 | 6.444 | 16.130 | 2.507x |
-| NHD | 32 | 8192 | 6.077 | 17.927 | 2.957x |
-| NHD | 32 | 16384 | 5.921 | 18.646 | 3.146x |
-| NHD | 56 | 4096 | 6.618 | 17.522 | 2.638x |
-| NHD | 56 | 8192 | 6.822 | 18.659 | 2.742x |
-| NHD | 56 | 16384 | 6.911 | 19.156 | 2.772x |
+| HND | 16 | 4096 | 7.003 | 22.328 | 3.170x |
+| HND | 16 | 8192 | 7.238 | 22.779 | 3.126x |
+| HND | 16 | 16384 | 7.246 | 22.628 | 3.129x |
+| HND | 32 | 4096 | 7.050 | 22.232 | 3.120x |
+| HND | 32 | 8192 | 7.156 | 22.486 | 3.135x |
+| HND | 32 | 16384 | 7.162 | 22.493 | 3.140x |
+| HND | 56 | 4096 | 6.995 | 22.110 | 3.162x |
+| HND | 56 | 8192 | 7.149 | 22.296 | 3.118x |
+| HND | 56 | 16384 | 7.140 | 22.179 | 3.098x |
+| NHD | 16 | 4096 | 6.660 | 16.943 | 2.549x |
+| NHD | 16 | 8192 | 6.611 | 18.515 | 2.813x |
+| NHD | 16 | 16384 | 6.274 | 20.092 | 3.193x |
+| NHD | 32 | 4096 | 6.466 | 16.996 | 2.651x |
+| NHD | 32 | 8192 | 6.107 | 18.673 | 3.057x |
+| NHD | 32 | 16384 | 5.930 | 20.116 | 3.392x |
+| NHD | 56 | 4096 | 6.606 | 18.339 | 2.765x |
+| NHD | 56 | 8192 | 6.889 | 19.821 | 2.879x |
+| NHD | 56 | 16384 | 6.823 | 20.743 | 3.046x |
 
-The post-D128 regression matrix was `18/18` at `1.175870x` geometric speedup (`1.200022x` HND, `1.152203x` NHD). The later 128-row/256-thread Q owner raises the fresh 10-pair production screen to `18/18` at `1.191276x` (`1.208877x` HND, `1.173930x` NHD). Artifacts are `/tmp/feather_bwd_d64_regression_matrix_after_d128.json` and `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/aiter_matrix.json`.
+The post-D128 regression matrix was `18/18` at `1.175870x` geometric speedup (`1.200022x` HND, `1.152203x` NHD). The later 128-row/256-thread Q owner reached `18/18` at `1.191276x` (`1.208877x` HND, `1.173930x` NHD), and the current HND-only 128-row KV owner reaches `18/18` at `1.203970x` (`1.229918x` HND, `1.178570x` NHD). Artifacts are `/tmp/feather_bwd_d64_regression_matrix_after_d128.json`, `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/aiter_matrix.json`, and `~/tmp/feather_attn/postprod_bwd_campaign/exp3b_d64_kv_hnd_owner128_wg256/aiter_matrix.json`.
 
 The public backward contract screen now covers both D64 and D128 over H `{16,32,56}`, batch two, the long-path selector boundary, and arbitrary asymmetric lengths through 16,385: `(4095,4097)`, `(4097,4099)`, `(8191,67)`, `(65,8193)`, `(16383,67)`, and `(65,16385)`. Dedicated H32/N8192 tests also require bit-exact `dQ/dK/dV/Delta` equivalence between the accepted transpose dispatch and the direct NHD image for both head dimensions. The private candidate screen additionally covers `(65,64)`, `(129,65)`, `(256,256)`, `(257,257)`, `(512,513)`, and a cancellation pattern.
 
@@ -191,13 +191,13 @@ The final D128 symbols in the linked gfx1151 image are:
 | --- | ---: | ---: | ---: | ---: |
 | HND Delta | 81 / 96 | 10 | 0 B | 0 / 0 |
 | NHD Delta | 81 / 96 | 14 | 0 B | 0 / 0 |
-| HND KV direct Q/dO, 128 threads | 209 / 216 | 40 | 18,432 B | 0 / 0 |
-| NHD KV direct Q/dO, 128 threads | 210 / 216 | 43 | 18,432 B | 0 / 0 |
-| NHD KV direct Q/cached dO, 128 threads | 205 / 216 | 43 | 22,784 B | 0 / 0 |
+| HND KV direct Q/dO, 256 threads | 214 / 216 | 40 | 26,624 B | 0 / 0 |
+| NHD KV direct Q/dO, 256 threads | 214 / 216 | 42 | 26,624 B | 0 / 0 |
+| NHD KV direct Q/cached dO, 256 threads | 209 / 216 | 42 | 30,976 B | 0 / 0 |
 | HND Q, 512 threads | 246 / 256 | 32 | 13,312 B | 0 / 0 |
 | NHD Q, 512 threads | 246 / 256 | 34 | 13,312 B | 0 / 0 |
 
-The entire linked D128 code object contains zero scratch load/store instructions. HND KV reaches seven waves/SIMD from both its 216-VGPR and 18,432-byte LDS limits. Q's 16-wave workgroup and 256-VGPR tier admit one workgroup per WGP, or four waves/SIMD. Final inspection artifacts are in `/tmp/feather_bwd_d128_final_inspect`.
+The entire linked D128 code object contains zero scratch load/store instructions. KV remains in the 216-VGPR allocation tier; its eight-wave workgroup makes the effective limit six resident waves/SIMD. Q's 16-wave workgroup and 256-VGPR tier admit one workgroup per WGP, or four waves/SIMD. Current KV inspection artifacts are in `~/tmp/feather_attn/postprod_bwd_campaign/exp4_d128_kv_owner64_wg256/`; the pre-campaign inspection remains in `/tmp/feather_bwd_d128_final_inspect`.
 
 The pre-NHD HND linked fused symbol contains 2,748 static instructions: 40 WMMA, 1,540 VALU, 941 SALU, 32 `v_perm_b32`, 16 cross-half permutes, 72 LDS loads, 40 LDS stores, 54 global loads, and 96 global stores. The linked dO-staged KV-only and unchanged Q-only symbols contain 1,489 and 1,242 static instructions respectively, with 16 WMMA for KV and 24 WMMA for Q. Relative to the pre-stage KV image, the new symbol removes eight static global `b128` loads and adds eight LDS `b128` loads; fused and Q-only code and resources remain unchanged. The six-case production correctness snapshot reports maximum relative L2 `0.00030144`, minimum per-head cosine `0.99999988`, and maximum absolute error `0.00119209`. The earlier full-image counter pass reports occupancy `46.62%`, `426.889 M` VALU instructions, `77.611 M` LDS instructions, `12.457 B` wave cycles, `2.440 B` wait-any cycles, `1.076 B` barrier waits, LDS latency `106.73` cycles, LDS conflict metric `24.32`, and ALU stalled by LDS `2.10%` for the fused baseline.
 
@@ -457,7 +457,7 @@ Fresh profiling reopens the campaign only for mechanisms whose assumptions diffe
 | 1 | D128 Q stage 32 K/V rows per loop | Rejected: focused H32 timing gate failed |
 | 2 | D64 Q 128-row / 256-thread owner | Accepted: `1.011283x` candidate/control matrix |
 | 3 | D64 KV 128-row / 256-thread owner | Accepted for HND: `1.010580x` candidate/control matrix |
-| 4 | D128 KV 64-row / 256-thread owner | Planned |
+| 4 | D128 KV 64-row / 256-thread owner | Accepted: `1.101567x` candidate/control matrix |
 | 5 | Current-topology base-2 probability reconstruction | Planned |
 | 6 | Precompute log2-scaled LSE with Delta | Blocked on rank 5 winning |
 | 7 | gfx1151 ISA/vectorized global-to-LDS staging | Planned after topology and exponential trials |
@@ -467,7 +467,7 @@ Fresh profiling reopens the campaign only for mechanisms whose assumptions diffe
 - D128 Q 32-row K/V stage. Advance the Q loop by 32, cooperatively load 32 K/V rows, and process two 16-row WMMA subtiles without duplicating persistent Q/dO or dQ fragments. Expected LDS is 26,624 B; the approximately 246 logical/256 allocated VGPR tier and one-workgroup-per-WGP limit should remain unchanged. Require zero private memory, spills, and scratch; a linked reduction in loop barriers; bit-exact output including K/V lengths 15/16/17/31/32/33; paired Q-phase wins at H16/N4096 and H32/N8192; then a positive complete D128 matrix result with no material row regression and all AITER rows still won. Stop at the first resource, correctness, linked-ISA, or focused-timing failure. **Result:** rejected. Fully unrolling two subtiles produced 32 VGPR spills and 68 B private memory in both layouts. Keeping the loop rolled linked at 233 logical VGPRs, 26,624 B LDS, and zero private/spill/scratch state, and passed 16/16 focused HND/NHD cases bit-exactly. Alternating complete HND timing reached `1.003698x` at H16/N4096 with 95% CI `[1.001384, 1.006057]`, but only `1.000558x` at H32/N8192 with CI `[0.999812, 1.001292]`; separate traces put the H32 Q median at 53.23 ms versus 51.90 ms for production. The source was restored without a full matrix. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp1b_d128_q_stage32_rolled/`.
 - D64 Q 128-row / 256-thread owner. Use eight waves to own 128 Q rows in the long Q-only image, retaining the 32-row K/V stage. Expected LDS remains 13,312 B and per-thread allocation should remain in the 168-VGPR tier, with workgroup granularity limiting residency to eight waves/SIMD. Require zero private/spill/scratch state, bit-exact owner-boundary and public-contract results, and paired Q-phase wins at both focused shapes before the full D64 matrix. Test 512 threads only if 256 threads wins. **Result:** accepted. HND/NHD Q images link at 166 logical/168 allocated VGPRs and 13,312 B LDS with zero private/spill/scratch state. Fourteen focused long-path cases are bit-exact. H16/N4096 confirms at `1.004365x` with 95% CI `[1.001832, 1.007086]`; H32/N8192 reaches `1.012734x` with CI `[1.010203, 1.015090]`. The complete 18-row candidate/control matrix wins every row and is `1.011283x` geometric. The production AITER screen remains `18/18` at `1.191276x`, and qualification passes backward `44/44` plus forward `188/188`. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/`.
 - D64 KV 128-row / 256-thread owner. Use eight waves to own 128 KV rows in the long KV-only image, halving owner blocks and repeated Q/dO stages. Expected LDS is 23,808 B and VGPR allocation at most the existing 192 tier. Require zero private/spill/scratch state, bit-exact asymmetric/tail results, and focused KV-phase wins despite the larger barrier domain before complete-path qualification. **Result:** accepted for HND only. The universal HND/NHD form linked at 169 logical/192 allocated VGPRs and 23,808 B LDS with zero private/spill/scratch state and passed 14/14 focused cases bit-exactly, but its complete matrix regressed direct NHD at H16/N4096 to `0.990913x` (95% CI `[0.986831, 0.994932]`) and H32/N4096 to `0.994464x` (CI `[0.992459, 0.996184]`). The retained policy emits the wide image only for HND; direct NHD keeps 128 threads, 64 rows, and 15,616 B LDS, while transpose-routed NHD uses HND and benefits. The accepted image remains at 169 logical/192 allocated VGPRs with zero private/spill/scratch state, passes 14/14 focused cases bit-exactly, and reaches `1.010580x` geometric against the frozen rank-2 image across the complete 18-row matrix with no credible row regression. Focused H16/N4096 is neutral at `1.001456x` with CI `[0.998272, 1.004664]`; H32/N8192 wins at `1.015059x` with CI `[1.013473, 1.016958]`. Production qualification wins AITER `18/18` at `1.203970x` geometric (`1.229918x` HND, `1.178570x` NHD) and passes backward `44/44` plus forward `188/188`. Artifacts: rejected universal policy `~/tmp/feather_attn/postprod_bwd_campaign/exp3_d64_kv_owner128_wg256/`; accepted policy `~/tmp/feather_attn/postprod_bwd_campaign/exp3b_d64_kv_hnd_owner128_wg256/`.
-- D128 KV 64-row / 256-thread owner. Assign four waves each to dK and dV with `owner_wave = wave % 4`. Expected LDS is 26,624 B for direct/direct and 30,976 B for cached-dO, with at most the 216-VGPR tier; workgroup granularity is expected to reduce residency from seven to six waves/SIMD. Qualify HND and direct NHD separately. Direct NHD must win complete fallback shapes and may not be promoted from isolated kernel timing.
+- D128 KV 64-row / 256-thread owner. Assign four waves each to dK and dV with `owner_wave = wave % 4`. Expected LDS is 26,624 B for direct/direct and 30,976 B for cached-dO, with at most the 216-VGPR tier; workgroup granularity is expected to reduce residency from seven to six waves/SIMD. Qualify HND and direct NHD separately. Direct NHD must win complete fallback shapes and may not be promoted from isolated kernel timing. **Result:** accepted universally. HND and direct-NHD direct/direct images link at 214 logical/216 allocated VGPRs and 26,624 B LDS; cached-dO NHD links at 209/216 VGPRs and 30,976 B LDS. Every image has zero private/spill/scratch state, and 16/16 focused owner-boundary cases are bit-exact. Focused HND complete timing wins by `1.088755x` at H16/N4096 with 95% CI `[1.083026, 1.094355]` and `1.110533x` at H32/N8192 with CI `[1.108554, 1.112072]`. Direct-NHD fallback timing also wins complete asymmetric shapes: H16/4096x4097 is `1.062713x`, H32/4096x4097 `1.186132x`, H56/4096x4097 `1.204449x`, and H32/8192x8193 `1.356115x`, with every confidence interval above one. The complete 18-row candidate/control matrix wins every row and all 54 blocks at `1.101567x` geometric. Production qualification wins AITER `18/18` at `3.022769x` geometric (`3.133169x` HND, `2.916258x` NHD) and passes backward `44/44` plus forward `188/188`. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp4_d128_kv_owner64_wg256/`.
 - Base-2 reconstruction. Specialize Q and KV independently to evaluate `exp2(score * scale * log2(e) - lse * log2(e))`, first for D128 and then D64 on the current topology. LDS, occupancy, and allocation tier must not increase, and linked ISA must show a real hot-loop reduction. Require the full backward contract, per-head cosine at least 0.9999, no material error growth, focused phase wins, and a positive complete matrix before promotion per dimension.
 - Preprocessed log2 LSE. Attempt only if rank 5 wins. Extend the internal preprocessing path to produce log2-scaled LSE without changing the public Delta layout or raw ABI. Include allocation, preprocessing, and all memory traffic in timing. Stop if storage becomes caller-visible or complete latency does not beat the accepted base-2 form.
 - gfx1151 global-to-LDS staging. First establish a supported direct global-to-LDS opcode and constraints in a microfixture, then replace one V-only row-major stage at a time. Do not apply it to transpose scatters or duplicate global reads. Require the intended linked opcode, removal of the old VGPR-mediated pair, unchanged resource tiers, bit-exact output, a focused site win, and the relevant full matrix. Retain a portable non-gfx1151 path.

@@ -9,7 +9,7 @@ namespace feather_attn {
 namespace {
 
 constexpr int kRowsBlock = 256;
-constexpr int kThreads = 128;
+constexpr int kKVThreads = 256;
 constexpr int kQThreads = 512;
 constexpr int kWaveSize = 32;
 constexpr int kInnerBlock = 16;
@@ -18,7 +18,7 @@ constexpr int kPacked = 8;
 constexpr int kTransposeStride = 20;
 constexpr int kRowStride = 136;
 constexpr int kQOwnerBlock = 256;
-constexpr int kKVOwnerBlock = 32;
+constexpr int kKVOwnerBlock = 64;
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 using Half4 = _Float16 __attribute__((ext_vector_type(4)));
@@ -173,7 +173,7 @@ __global__ void DeltaD128Kernel(
 }
 
 template<bool kNhd, bool kCacheQRows, bool kCacheDoRows>
-__global__ __launch_bounds__(kThreads) void D128KVKernel(
+__global__ __launch_bounds__(kKVThreads) void D128KVKernel(
     const __half* __restrict__ q,
     const __half* __restrict__ k,
     const __half* __restrict__ v,
@@ -198,10 +198,10 @@ __global__ __launch_bounds__(kThreads) void D128KVKernel(
         v_bytes + 2 * transpose_bytes +
         (kCacheQRows ? row_bytes : 0) +
         (kCacheDoRows ? row_bytes : 0);
-    static_assert(v_bytes == 8192);
+    static_assert(v_bytes == 16384);
     static_assert(transpose_bytes == 5120);
     static_assert(row_bytes == 4352);
-    static_assert(lds_bytes >= 18432 && lds_bytes <= 27136);
+    static_assert(lds_bytes >= 26624 && lds_bytes <= 30976);
 
     alignas(16) __shared__ uint8_t lds[lds_bytes];
     auto* v_lds = reinterpret_cast<_Float16*>(lds);
@@ -218,8 +218,8 @@ __global__ __launch_bounds__(kThreads) void D128KVKernel(
     const int lane = tid % kWaveSize;
     const int lane_row = lane % kInnerBlock;
     const int lane_group = lane / kInnerBlock;
-    const bool owns_dk = wave < 2;
-    const int owner_wave = wave % 2;
+    const bool owns_dk = wave < 4;
+    const int owner_wave = wave % 4;
     const int kv_tiles = (n_kv + kKVOwnerBlock - 1) / kKVOwnerBlock;
     int owner_tile;
     int head_linear;
@@ -238,9 +238,11 @@ __global__ __launch_bounds__(kThreads) void D128KVKernel(
     const int kv_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
 
 #pragma unroll
-    for(int issue = 0; issue < 4; ++issue)
+    for(int issue = 0;
+        issue < kKVOwnerBlock * kHeadDim / kPacked / kKVThreads;
+        ++issue)
     {
-        const int linear_chunk = tid + issue * kThreads;
+        const int linear_chunk = tid + issue * kKVThreads;
         const int row = linear_chunk / (kHeadDim / kPacked);
         const int chunk = linear_chunk % (kHeadDim / kPacked);
         Half8 value = {};
@@ -274,9 +276,11 @@ __global__ __launch_bounds__(kThreads) void D128KVKernel(
     {
         __syncthreads();
 #pragma unroll
-        for(int issue = 0; issue < 2; ++issue)
+        for(int issue = 0;
+            issue < kInnerBlock * kHeadDim / kPacked / kKVThreads;
+            ++issue)
         {
-            const int linear_chunk = tid + issue * kThreads;
+            const int linear_chunk = tid + issue * kKVThreads;
             const int stage_row = linear_chunk / (kHeadDim / kPacked);
             const int stage_chunk = linear_chunk % (kHeadDim / kPacked);
             Half8 q_stage = {};
@@ -693,7 +697,7 @@ bool LaunchD128Backward(const BackwardLaunchParams& params)
         params.n_q,
         params.num_heads);
 
-    const dim3 kv_block(kThreads);
+    const dim3 kv_block(kKVThreads);
     const dim3 kv_grid(
         static_cast<uint32_t>(params.head_count * kv_tiles));
     auto launch_kv = [&]<bool kCacheQRows, bool kCacheDoRows>() {
