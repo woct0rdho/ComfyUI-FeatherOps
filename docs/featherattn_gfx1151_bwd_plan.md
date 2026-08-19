@@ -114,30 +114,30 @@ The relaxed exploratory tier is for internal candidate comparison and does not s
 
 The primary matrix matches the forward plan: B1, contiguous HND and NHD inputs, D64, equal Q/KV lengths, H `{16,32,56}`, and N `{4096,8192,16384}`. `benchmark_attn_hip_backward.py` constructs one saved forward state outside timing, preallocates each provider's outputs, performs five warmups, and collects ten samples per provider in alternating order. AITER FlashAttention Triton backward is the control. Throughput uses `F7`; `Feather / AITER` is the ratio of provider medians.
 
-Every H/N row in the post-rank-3 D64 matrix is shown. HND wins `9/9` rows with a `1.229918x` geometric mean; NHD wins `9/9` with a `1.178570x` geometric mean. Overall, Feather wins `18/18` rows with a `1.203970x` geometric mean speedup. Against the frozen post-rank-2 Feather image, the accepted HND-only KV widening is `1.010580x` geometric across the same 18 rows and removes the N4096 direct-NHD regressions of the rejected universal policy.
+Every H/N row in the post-rank-5 D64 matrix is shown. HND wins `9/9` rows with a `1.240937x` geometric mean; NHD wins `9/9` with a `1.181039x` geometric mean. Overall, Feather wins `18/18` rows with a `1.210618x` geometric mean speedup. Against the frozen post-D128/rank-4 Feather image, the accepted base-2 reconstruction is `1.008737x` geometric across the same 18 rows.
 
-Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp3b_d64_kv_hnd_owner128_wg256/aiter_matrix.json`
+Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5f_d64_kv_q_exp2/aiter_matrix.json`
 
 | Layout | H | N | AITER TFLOPS | Feather TFLOPS | Feather / AITER |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND | 16 | 4096 | 26.225 | 29.785 | 1.150x |
-| HND | 16 | 8192 | 25.699 | 30.387 | 1.183x |
-| HND | 16 | 16384 | 24.424 | 30.583 | 1.250x |
-| HND | 32 | 4096 | 24.866 | 30.126 | 1.218x |
-| HND | 32 | 8192 | 24.801 | 30.376 | 1.225x |
-| HND | 32 | 16384 | 24.159 | 30.337 | 1.255x |
-| HND | 56 | 4096 | 24.439 | 31.028 | 1.268x |
-| HND | 56 | 8192 | 23.953 | 30.282 | 1.260x |
-| HND | 56 | 16384 | 23.877 | 30.236 | 1.266x |
-| NHD | 16 | 4096 | 25.073 | 28.378 | 1.129x |
-| NHD | 16 | 8192 | 25.386 | 28.858 | 1.139x |
-| NHD | 16 | 16384 | 25.003 | 28.101 | 1.124x |
-| NHD | 32 | 4096 | 23.116 | 27.406 | 1.183x |
-| NHD | 32 | 8192 | 23.824 | 24.535 | 1.035x |
-| NHD | 32 | 16384 | 22.015 | 27.066 | 1.226x |
-| NHD | 56 | 4096 | 23.651 | 29.422 | 1.241x |
-| NHD | 56 | 8192 | 23.535 | 27.831 | 1.185x |
-| NHD | 56 | 16384 | 21.173 | 29.078 | 1.373x |
+| HND | 16 | 4096 | 26.006 | 29.666 | 1.150x |
+| HND | 16 | 8192 | 25.910 | 30.800 | 1.189x |
+| HND | 16 | 16384 | 24.571 | 31.032 | 1.261x |
+| HND | 32 | 4096 | 24.721 | 30.426 | 1.232x |
+| HND | 32 | 8192 | 24.858 | 30.927 | 1.242x |
+| HND | 32 | 16384 | 24.395 | 30.758 | 1.259x |
+| HND | 56 | 4096 | 24.478 | 31.490 | 1.281x |
+| HND | 56 | 8192 | 24.107 | 30.734 | 1.272x |
+| HND | 56 | 16384 | 23.757 | 30.630 | 1.290x |
+| NHD | 16 | 4096 | 24.979 | 28.792 | 1.142x |
+| NHD | 16 | 8192 | 25.458 | 29.138 | 1.146x |
+| NHD | 16 | 16384 | 25.159 | 28.383 | 1.132x |
+| NHD | 32 | 4096 | 22.967 | 27.706 | 1.202x |
+| NHD | 32 | 8192 | 23.637 | 24.612 | 1.041x |
+| NHD | 32 | 16384 | 22.192 | 26.985 | 1.213x |
+| NHD | 56 | 4096 | 23.609 | 29.627 | 1.252x |
+| NHD | 56 | 8192 | 23.751 | 27.737 | 1.167x |
+| NHD | 56 | 16384 | 21.187 | 28.880 | 1.361x |
 
 ### D128 Production Matrix
 
@@ -166,7 +166,7 @@ Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5c_d128_kv_q_exp2/aiter_m
 | NHD | 56 | 8192 | 6.894 | 19.633 | 2.847x |
 | NHD | 56 | 16384 | 6.901 | 20.673 | 2.991x |
 
-The post-D128 regression matrix was `18/18` at `1.175870x` geometric speedup (`1.200022x` HND, `1.152203x` NHD). The later 128-row/256-thread Q owner reached `18/18` at `1.191276x` (`1.208877x` HND, `1.173930x` NHD), and the current HND-only 128-row KV owner reaches `18/18` at `1.203970x` (`1.229918x` HND, `1.178570x` NHD). Artifacts are `/tmp/feather_bwd_d64_regression_matrix_after_d128.json`, `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/aiter_matrix.json`, and `~/tmp/feather_attn/postprod_bwd_campaign/exp3b_d64_kv_hnd_owner128_wg256/aiter_matrix.json`.
+The post-D128 regression matrix was `18/18` at `1.175870x` geometric speedup (`1.200022x` HND, `1.152203x` NHD). The later 128-row/256-thread Q owner reached `18/18` at `1.191276x` (`1.208877x` HND, `1.173930x` NHD), the HND-only 128-row KV owner reached `18/18` at `1.203970x` (`1.229918x` HND, `1.178570x` NHD), and the current base-2 image reaches `18/18` at `1.210618x` (`1.240937x` HND, `1.181039x` NHD). Artifacts are `/tmp/feather_bwd_d64_regression_matrix_after_d128.json` and the corresponding rank-2, rank-3, and rank-5 campaign directories.
 
 The public backward contract screen now covers both D64 and D128 over H `{16,32,56}`, batch two, the long-path selector boundary, and arbitrary asymmetric lengths through 16,385: `(4095,4097)`, `(4097,4099)`, `(8191,67)`, `(65,8193)`, `(16383,67)`, and `(65,16385)`. Dedicated H32/N8192 tests also require bit-exact `dQ/dK/dV/Delta` equivalence between the accepted transpose dispatch and the direct NHD image for both head dimensions. The private candidate screen additionally covers `(65,64)`, `(129,65)`, `(256,256)`, `(257,257)`, `(512,513)`, and a cancellation pattern.
 
@@ -176,14 +176,16 @@ The symbol-matched linked production image has the following gfx1151 profile:
 
 | Symbol/workgroup | Logical VGPRs | Allocated VGPRs | SGPRs | LDS | Private/spills |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| HND D64 fused main, 128 threads | 178 | 192 | 46 | 13,312 B | 0 / 0 |
-| HND D64 KV-only long phase, 256 threads | 169 | 192 | 34 | 23,808 B | 0 / 0 |
+| HND D64 fused main, 128 threads | 178 | 192 | 48 | 13,312 B | 0 / 0 |
+| HND D64 KV-only long phase, 256 threads | 169 | 192 | 36 | 23,808 B | 0 / 0 |
 | HND D64 Q-only long phase, 256 threads | 166 | 168 | 33 | 13,312 B | 0 / 0 |
-| NHD D64 fused main, 128 threads | 178 | 192 | 50 | 13,312 B | 0 / 0 |
-| NHD D64 KV-only long phase, 128 threads | 169 | 192 | 37 | 15,616 B | 0 / 0 |
+| NHD D64 fused main, 128 threads | 178 | 192 | 52 | 13,312 B | 0 / 0 |
+| NHD D64 KV-only long phase, 128 threads | 169 | 192 | 38 | 15,616 B | 0 / 0 |
 | NHD D64 Q-only long phase, 256 threads | 166 | 168 | 38 | 13,312 B | 0 / 0 |
 | HND Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 |
 | NHD Delta helper | 66 | 72 | 14 | 0 B | 0 / 0 |
+
+The rank-5 base-2 rewrite preserves every D64 VGPR allocation and LDS tier and leaves all images at zero private bytes, zero spills, and zero scratch instructions. Relative to the frozen rank-4 image, the HND/NHD KV symbols are six static instructions shorter, Q is eight/nine shorter, and the short fused symbols are 18/19 shorter. Current inspection artifacts are in `~/tmp/feather_attn/postprod_bwd_campaign/exp5f_d64_kv_q_exp2/`.
 
 The final D128 symbols in the linked gfx1151 image are:
 
@@ -458,8 +460,8 @@ Fresh profiling reopens the campaign only for mechanisms whose assumptions diffe
 | 2 | D64 Q 128-row / 256-thread owner | Accepted: `1.011283x` candidate/control matrix |
 | 3 | D64 KV 128-row / 256-thread owner | Accepted for HND: `1.010580x` candidate/control matrix |
 | 4 | D128 KV 64-row / 256-thread owner | Accepted: `1.101567x` candidate/control matrix |
-| 5 | Current-topology base-2 probability reconstruction | In progress: D128 combined accepted at `1.005163x`; D64 pending |
-| 6 | Precompute log2-scaled LSE with Delta | Blocked on rank 5 winning |
+| 5 | Current-topology base-2 probability reconstruction | Accepted and qualified: D128 `1.005163x`; D64 combined `1.008737x` |
+| 6 | Precompute log2-scaled LSE with Delta | Ready after rank 5 qualification |
 | 7 | gfx1151 ISA/vectorized global-to-LDS staging | Planned after topology and exponential trials |
 
 #### Experiment Contracts
@@ -468,7 +470,21 @@ Fresh profiling reopens the campaign only for mechanisms whose assumptions diffe
 - D64 Q 128-row / 256-thread owner. Use eight waves to own 128 Q rows in the long Q-only image, retaining the 32-row K/V stage. Expected LDS remains 13,312 B and per-thread allocation should remain in the 168-VGPR tier, with workgroup granularity limiting residency to eight waves/SIMD. Require zero private/spill/scratch state, bit-exact owner-boundary and public-contract results, and paired Q-phase wins at both focused shapes before the full D64 matrix. Test 512 threads only if 256 threads wins. **Result:** accepted. HND/NHD Q images link at 166 logical/168 allocated VGPRs and 13,312 B LDS with zero private/spill/scratch state. Fourteen focused long-path cases are bit-exact. H16/N4096 confirms at `1.004365x` with 95% CI `[1.001832, 1.007086]`; H32/N8192 reaches `1.012734x` with CI `[1.010203, 1.015090]`. The complete 18-row candidate/control matrix wins every row and is `1.011283x` geometric. The production AITER screen remains `18/18` at `1.191276x`, and qualification passes backward `44/44` plus forward `188/188`. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/`.
 - D64 KV 128-row / 256-thread owner. Use eight waves to own 128 KV rows in the long KV-only image, halving owner blocks and repeated Q/dO stages. Expected LDS is 23,808 B and VGPR allocation at most the existing 192 tier. Require zero private/spill/scratch state, bit-exact asymmetric/tail results, and focused KV-phase wins despite the larger barrier domain before complete-path qualification. **Result:** accepted for HND only. The universal HND/NHD form linked at 169 logical/192 allocated VGPRs and 23,808 B LDS with zero private/spill/scratch state and passed 14/14 focused cases bit-exactly, but its complete matrix regressed direct NHD at H16/N4096 to `0.990913x` (95% CI `[0.986831, 0.994932]`) and H32/N4096 to `0.994464x` (CI `[0.992459, 0.996184]`). The retained policy emits the wide image only for HND; direct NHD keeps 128 threads, 64 rows, and 15,616 B LDS, while transpose-routed NHD uses HND and benefits. The accepted image remains at 169 logical/192 allocated VGPRs with zero private/spill/scratch state, passes 14/14 focused cases bit-exactly, and reaches `1.010580x` geometric against the frozen rank-2 image across the complete 18-row matrix with no credible row regression. Focused H16/N4096 is neutral at `1.001456x` with CI `[0.998272, 1.004664]`; H32/N8192 wins at `1.015059x` with CI `[1.013473, 1.016958]`. Production qualification wins AITER `18/18` at `1.203970x` geometric (`1.229918x` HND, `1.178570x` NHD) and passes backward `44/44` plus forward `188/188`. Artifacts: rejected universal policy `~/tmp/feather_attn/postprod_bwd_campaign/exp3_d64_kv_owner128_wg256/`; accepted policy `~/tmp/feather_attn/postprod_bwd_campaign/exp3b_d64_kv_hnd_owner128_wg256/`.
 - D128 KV 64-row / 256-thread owner. Assign four waves each to dK and dV with `owner_wave = wave % 4`. Expected LDS is 26,624 B for direct/direct and 30,976 B for cached-dO, with at most the 216-VGPR tier; workgroup granularity is expected to reduce residency from seven to six waves/SIMD. Qualify HND and direct NHD separately. Direct NHD must win complete fallback shapes and may not be promoted from isolated kernel timing. **Result:** accepted universally. HND and direct-NHD direct/direct images link at 214 logical/216 allocated VGPRs and 26,624 B LDS; cached-dO NHD links at 209/216 VGPRs and 30,976 B LDS. Every image has zero private/spill/scratch state, and 16/16 focused owner-boundary cases are bit-exact. Focused HND complete timing wins by `1.088755x` at H16/N4096 with 95% CI `[1.083026, 1.094355]` and `1.110533x` at H32/N8192 with CI `[1.108554, 1.112072]`. Direct-NHD fallback timing also wins complete asymmetric shapes: H16/4096x4097 is `1.062713x`, H32/4096x4097 `1.186132x`, H56/4096x4097 `1.204449x`, and H32/8192x8193 `1.356115x`, with every confidence interval above one. The complete 18-row candidate/control matrix wins every row and all 54 blocks at `1.101567x` geometric. Production qualification wins AITER `18/18` at `3.022769x` geometric (`3.133169x` HND, `2.916258x` NHD) and passes backward `44/44` plus forward `188/188`. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp4_d128_kv_owner64_wg256/`.
-- Base-2 reconstruction. Specialize Q and KV independently to evaluate `exp2(score * scale * log2(e) - lse * log2(e))`, first for D128 and then D64 on the current topology. LDS, occupancy, and allocation tier must not increase, and linked ISA must show a real hot-loop reduction. Require the full backward contract, per-head cosine at least 0.9999, no material error growth, focused phase wins, and a positive complete matrix before promotion per dimension. **D128 KV result:** provisionally accepted. Multiplying scale and each lane LSE by `log2(e)` once before the eight-fragment reconstruction shortens the three linked KV symbols by 5-7 static instructions while preserving the 214/216-VGPR direct/direct and 209/216-VGPR cached-dO tiers, LDS sizes, and zero private/spill/scratch state; SGPRs rise by one. The six-case numerical screen has minimum per-head cosine `0.999999821`, maximum Rel-L2 `0.000297993`, and no increase over the baseline maximum. Focused HND complete timing is `1.004186x` at H16/N4096 with 95% CI `[1.002228, 1.006107]` and `1.003396x` at H32/N8192 with CI `[1.001525, 1.005427]`. The complete 18-row matrix is `1.002768x` geometric; every row ratio is above one, 17 intervals exclude one, and H16/N4096 is `1.004000x` with CI `[0.999684, 1.008395]`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5a_d128_kv_exp2/`. **D128 Q result:** provisionally accepted independently. Its HND/NHD symbols are 5/4 static instructions shorter while preserving 246/256 VGPRs, SGPRs, 13,312 B LDS, and zero private/spill/scratch state. The six-case screen has minimum per-head cosine `0.999999821` and maximum Rel-L2 `0.000297942`, slightly below the control maximum. Focused HND timing is `1.002362x` at H16/N4096 with CI `[1.000681, 1.004045]` and `1.002400x` at H32/N8192 with CI `[1.001525, 1.003268]`. Its complete matrix is `1.002521x`; every row ratio is above one, with H16/N4096 (`1.002282x`, CI `[0.998446, 1.006114]`) and NHD H16/N8192 (`1.001318x`, CI `[0.999685, 1.002873]`) the only intervals crossing one. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5b_d128_q_exp2/`. **Combined D128 result:** accepted and qualified. The combined six-case screen keeps minimum per-head cosine `0.999999821`, lowers the maximum Rel-L2 from the control's `0.000297993` to `0.000297942`, and preserves all independent resource and ISA reductions. The complete candidate/control matrix wins all 18 rows and all 54 timing blocks at `1.005163x` geometric; row speedups span `1.003974x-1.006519x`, and every 95% interval excludes one. Production qualification wins AITER `18/18` at `2.988209x` geometric (`3.103961x` HND, `2.876774x` NHD), backward passes `44/44`, and forward passes `188/188`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5c_d128_kv_q_exp2/`. D64 evaluation remains pending.
+- Base-2 reconstruction. Specialize Q and KV independently to evaluate `exp2(score * scale * log2(e) - lse * log2(e))`, first for D128 and then D64 on the current topology. LDS, occupancy, and allocation tier must not increase, and linked ISA must show a real hot-loop reduction. Require the full backward contract, per-head cosine at least 0.9999, no material error growth, focused phase wins, and a positive complete matrix before promotion per dimension. **D128 KV result:** provisionally accepted. Multiplying scale and each lane LSE by `log2(e)` once before the eight-fragment reconstruction shortens the three linked KV symbols by 5-7 static instructions while preserving the 214/216-VGPR direct/direct and 209/216-VGPR cached-dO tiers, LDS sizes, and zero private/spill/scratch state; SGPRs rise by one. The six-case numerical screen has minimum per-head cosine `0.999999821`, maximum Rel-L2 `0.000297993`, and no increase over the baseline maximum. Focused HND complete timing is `1.004186x` at H16/N4096 with 95% CI `[1.002228, 1.006107]` and `1.003396x` at H32/N8192 with CI `[1.001525, 1.005427]`. The complete 18-row matrix is `1.002768x` geometric; every row ratio is above one, 17 intervals exclude one, and H16/N4096 is `1.004000x` with CI `[0.999684, 1.008395]`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5a_d128_kv_exp2/`.
+
+**D128 Q result:** provisionally accepted independently. Its HND/NHD symbols are 5/4 static instructions shorter while preserving 246/256 VGPRs, SGPRs, 13,312 B LDS, and zero private/spill/scratch state. The six-case screen has minimum per-head cosine `0.999999821` and maximum Rel-L2 `0.000297942`, slightly below the control maximum. Focused HND timing is `1.002362x` at H16/N4096 with CI `[1.000681, 1.004045]` and `1.002400x` at H32/N8192 with CI `[1.001525, 1.003268]`. Its complete matrix is `1.002521x`; every row ratio is above one, with H16/N4096 (`1.002282x`, CI `[0.998446, 1.006114]`) and NHD H16/N8192 (`1.001318x`, CI `[0.999685, 1.002873]`) the only intervals crossing one. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5b_d128_q_exp2/`.
+
+**Combined D128 result:** accepted and qualified. The combined six-case screen keeps minimum per-head cosine `0.999999821`, lowers the maximum Rel-L2 from the control's `0.000297993` to `0.000297942`, and preserves all independent resource and ISA reductions. The complete candidate/control matrix wins all 18 rows and all 54 timing blocks at `1.005163x` geometric; row speedups span `1.003974x-1.006519x`, and every 95% interval excludes one. Production qualification wins AITER `18/18` at `2.988209x` geometric (`3.103961x` HND, `2.876774x` NHD), backward passes `44/44`, and forward passes `188/188`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5c_d128_kv_q_exp2/`.
+
+**D64 KV result:** accepted independently. The isolated KV rewrite preserves 169/192 VGPRs and 23,808 B LDS for HND, 169/192 VGPRs and 15,616 B LDS for direct NHD, zero private/spill/scratch state, and unchanged Q-only symbols. The linked HND and NHD KV phase images each have six fewer static instructions. The six-case screen has minimum per-head cosine `0.999999881` and maximum Rel-L2 `0.000297347`, equal to control. Focused HND complete timing is `1.004646x` at H16/N4096 with CI `[1.000559, 1.008579]` and `1.005166x` at H32/N8192 with CI `[1.003098, 1.006701]`. The complete matrix is `1.004579x`; all 18 paired row estimates are above one, 53/54 timing blocks win, and 17 intervals exclude one. Direct-NHD H16/N4096 is the only interval crossing one at `1.002319x`, CI `[0.999187, 1.005523]`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5d_d64_kv_exp2/`.
+
+**D64 Q result:** accepted independently. The isolated Q rewrite preserves 166/168 VGPRs, 13,312 B LDS, all SGPR counts, and zero private/spill/scratch state in both layouts; the linked HND/NHD Q phase images are eight/nine static instructions shorter, while KV-only symbols are unchanged. The six-case screen has minimum per-head cosine `0.999999762` and maximum Rel-L2 `0.000297250`, below the control maximum `0.000297347`. Focused HND complete timing is `1.006351x` at H16/N4096 with CI `[1.002057, 1.010779]` and `1.005333x` at H32/N8192 with CI `[1.003580, 1.007511]`; all 12 timing blocks win. The complete matrix is `1.004203x`; every row and all 54 timing blocks win, and 16 intervals exclude one. HND H16/N4096 (`1.001679x`, CI `[0.996103, 1.007110]`) and H16/N8192 (`1.002533x`, CI `[0.998884, 1.005483]`) are the only intervals crossing one. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5e_d64_q_exp2/`.
+
+**Combined D64 result:** accepted and qualified. The six-case screen keeps minimum per-head cosine `0.999999762` and maximum Rel-L2 `0.000297250`. Long KV and Q resources remain at their independent allocation/LDS tiers with zero private/spill/scratch state. The HND/NHD KV images retain six fewer static instructions, Q retains eight/nine fewer, and the short fused images are 18/19 instructions shorter.
+
+Focused HND complete timing is `1.007999x` at H16/N4096 with CI `[1.003326, 1.012505]` and `1.008963x` at H32/N8192 with CI `[1.007398, 1.010297]`; all 12 focused blocks win. The complete matrix is `1.008737x`; all 18 row estimates are above one, 53/54 timing blocks win, and 17 intervals exclude one. HND H16/N4096 is the only interval crossing one at `1.004730x`, CI `[0.998075, 1.011884]`.
+
+Production qualification wins AITER `18/18` at `1.210618x` geometric (`1.240937x` HND, `1.181039x` NHD), backward passes `44/44` plus both exact dispatch checks, and forward passes `188/188`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5f_d64_kv_q_exp2/`.
 - Preprocessed log2 LSE. Attempt only if rank 5 wins. Extend the internal preprocessing path to produce log2-scaled LSE without changing the public Delta layout or raw ABI. Include allocation, preprocessing, and all memory traffic in timing. Stop if storage becomes caller-visible or complete latency does not beat the accepted base-2 form.
 - gfx1151 global-to-LDS staging. First establish a supported direct global-to-LDS opcode and constraints in a microfixture, then replace one V-only row-major stage at a time. Do not apply it to transpose scatters or duplicate global reads. Require the intended linked opcode, removal of the old VGPR-mediated pair, unchanged resource tiers, bit-exact output, a focused site win, and the relevant full matrix. Retain a portable non-gfx1151 path.
 
