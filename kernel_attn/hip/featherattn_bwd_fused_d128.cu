@@ -19,6 +19,7 @@ constexpr int kTransposeStride = 20;
 constexpr int kRowStride = 136;
 constexpr int kQOwnerBlock = 256;
 constexpr int kKVOwnerBlock = 64;
+constexpr float kLog2E = 0x1.715476p+0f;
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 using Half4 = _Float16 __attribute__((ext_vector_type(4)));
@@ -236,6 +237,7 @@ __global__ __launch_bounds__(kKVThreads) void D128KVKernel(
     const int kv_offset = HeadOffset<kNhd>(head_linear, n_kv, num_heads);
     const int q_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
     const int kv_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
+    const float scale_log2 = scale * kLog2E;
 
 #pragma unroll
     for(int issue = 0;
@@ -346,7 +348,8 @@ __global__ __launch_bounds__(kKVThreads) void D128KVKernel(
         const float lane_lse = lane_q_valid
                                    ? lse[head_linear * n_q + q_start + lane_row]
                                    : 0.0f;
-        const int lane_lse_bits = __builtin_bit_cast(int, lane_lse);
+        const int lane_lse_bits =
+            __builtin_bit_cast(int, lane_lse * kLog2E);
         const bool kv_valid = kv_start + kv_row < n_kv;
         Float8 probability;
 #pragma unroll
@@ -357,11 +360,14 @@ __global__ __launch_bounds__(kKVThreads) void D128KVKernel(
                 __builtin_amdgcn_readlane(lane_lse_bits, i * 2);
             const int odd_lse_bits =
                 __builtin_amdgcn_readlane(lane_lse_bits, i * 2 + 1);
-            const float column_lse = __builtin_bit_cast(
+            const float column_lse_log2 = __builtin_bit_cast(
                 float, lane_group == 0 ? even_lse_bits : odd_lse_bits);
             const bool valid = kv_valid && q_start + q_column < n_q;
             probability[i] =
-                valid ? __expf(score[i] * scale - column_lse) : 0.0f;
+                valid
+                    ? __builtin_amdgcn_exp2f(
+                          score[i] * scale_log2 - column_lse_log2)
+                    : 0.0f;
         }
 
         if(owns_dk)
@@ -533,10 +539,12 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
     const int kv_offset = HeadOffset<kNhd>(head_linear, n_kv, num_heads);
     const int q_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
     const int kv_row_stride = kNhd ? num_heads * kHeadDim : kHeadDim;
+    const float scale_log2 = scale * kLog2E;
     const bool q_valid = q_start + lane_row < n_q;
-    const float row_lse = q_valid
-                              ? lse[head_linear * n_q + q_start + lane_row]
-                              : 0.0f;
+    const float row_lse_log2 =
+        q_valid
+            ? lse[head_linear * n_q + q_start + lane_row] * kLog2E
+            : 0.0f;
     const float row_delta = q_valid
                                 ? delta[head_linear * n_q + q_start + lane_row]
                                 : 0.0f;
@@ -618,7 +626,10 @@ __global__ __launch_bounds__(kQThreads) void D128QKernel(
             const bool valid = q_valid &&
                                kv_start + kv_column < n_kv;
             const float probability =
-                valid ? __expf(score[i] * scale - row_lse) : 0.0f;
+                valid
+                    ? __builtin_amdgcn_exp2f(
+                          score[i] * scale_log2 - row_lse_log2)
+                    : 0.0f;
             d_score[i] = valid
                              ? probability *
                                    (d_probability[i] - row_delta)
