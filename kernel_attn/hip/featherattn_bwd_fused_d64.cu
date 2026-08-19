@@ -20,6 +20,7 @@ constexpr int kInnerBlock = 16;
 constexpr int kHeadDim = 64;
 constexpr int kPacked = 8;
 constexpr int kTransposeStride = 20;
+constexpr float kLog2E = 0x1.715476p+0f;
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
 using Half4 = _Float16 __attribute__((ext_vector_type(4)));
@@ -281,6 +282,7 @@ SevenGemmD64Kernel(
     if(kPhase != 2 && owner_tile < kv_tiles)
     {
         const int kv_start = owner_tile * kv_owner_block;
+        const float scale_log2 = scale * kLog2E;
 #pragma unroll
         for(int issue = 0;
             issue < kv_owner_block * kHeadDim / kPacked / phase_threads;
@@ -375,7 +377,8 @@ SevenGemmD64Kernel(
             const float lane_lse = lane_q_valid
                                        ? lse[head_linear * n_q + q_start + lane_row]
                                        : 0.0f;
-            const int lane_lse_bits = __builtin_bit_cast(int, lane_lse);
+            const int lane_lse_bits =
+                __builtin_bit_cast(int, lane_lse * kLog2E);
             const int kv_row = wave * kInnerBlock + lane_row;
             const bool kv_valid = kv_start + kv_row < n_kv;
             Float8 probability;
@@ -387,11 +390,14 @@ SevenGemmD64Kernel(
                     __builtin_amdgcn_readlane(lane_lse_bits, i * 2);
                 const int odd_lse_bits =
                     __builtin_amdgcn_readlane(lane_lse_bits, i * 2 + 1);
-                const float column_lse = __builtin_bit_cast(
+                const float column_lse_log2 = __builtin_bit_cast(
                     float, lane_group == 0 ? even_lse_bits : odd_lse_bits);
                 const bool valid = kv_valid && q_start + q_column < n_q;
                 probability[i] =
-                    valid ? __expf(score[i] * scale - column_lse) : 0.0f;
+                    valid
+                        ? __builtin_amdgcn_exp2f(
+                              score[i] * scale_log2 - column_lse_log2)
+                        : 0.0f;
             }
             const Half16 p_fragment = CFragmentToA(probability, lane);
 
@@ -496,6 +502,7 @@ SevenGemmD64Kernel(
     {
         const int q_block_start = owner_tile * q_owner_block;
         const int q_start = q_block_start + wave * kInnerBlock;
+        const float scale_log2 = scale * kLog2E;
         Float8 dq_accum[4] = {};
         Half16 q_rows[kHeadDim / kInnerBlock] = {};
 #pragma unroll
@@ -523,9 +530,10 @@ SevenGemmD64Kernel(
             }
         }
         const bool q_valid = q_start + lane_row < n_q;
-        const float row_lse = q_valid
-                                  ? lse[head_linear * n_q + q_start + lane_row]
-                                  : 0.0f;
+        const float row_lse_log2 =
+            q_valid
+                ? lse[head_linear * n_q + q_start + lane_row] * kLog2E
+                : 0.0f;
         const float row_delta = q_valid
                                     ? delta[head_linear * n_q + q_start + lane_row]
                                     : 0.0f;
@@ -593,7 +601,10 @@ SevenGemmD64Kernel(
                     const bool valid =
                         q_valid && tile_kv_start + kv_column < n_kv;
                     probability[i] =
-                        valid ? __expf(score[i] * scale - row_lse) : 0.0f;
+                        valid
+                            ? __builtin_amdgcn_exp2f(
+                                  score[i] * scale_log2 - row_lse_log2)
+                            : 0.0f;
                 }
                 Float8 d_probability = {};
 #pragma unroll
