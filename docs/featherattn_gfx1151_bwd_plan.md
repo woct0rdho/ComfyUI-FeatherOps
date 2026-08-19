@@ -461,8 +461,10 @@ Fresh profiling reopens the campaign only for mechanisms whose assumptions diffe
 | 3 | D64 KV 128-row / 256-thread owner | Accepted for HND: `1.010580x` candidate/control matrix |
 | 4 | D128 KV 64-row / 256-thread owner | Accepted: `1.101567x` candidate/control matrix |
 | 5 | Current-topology base-2 probability reconstruction | Accepted and qualified: D128 `1.005163x`; D64 combined `1.008737x` |
-| 6 | Precompute log2-scaled LSE with Delta | Ready after rank 5 qualification |
-| 7 | gfx1151 ISA/vectorized global-to-LDS staging | Planned after topology and exponential trials |
+| 6 | Precompute log2-scaled LSE with Delta | Rejected: D128 focused paths regress to `0.796521x`/`0.952446x` |
+| 7 | gfx1151 ISA/vectorized global-to-LDS staging | Rejected at ISA gate: gfx1151 has no legal direct VMEM-to-LDS encoding |
+
+The post-production campaign is complete. Ranks 2-5 produced the retained D64/D128 topology and arithmetic changes; ranks 1, 6, and 7 failed their first decisive resource, timing, or ISA gate. Production remains the qualified rank-5 image.
 
 #### Experiment Contracts
 
@@ -485,8 +487,22 @@ Fresh profiling reopens the campaign only for mechanisms whose assumptions diffe
 Focused HND complete timing is `1.007999x` at H16/N4096 with CI `[1.003326, 1.012505]` and `1.008963x` at H32/N8192 with CI `[1.007398, 1.010297]`; all 12 focused blocks win. The complete matrix is `1.008737x`; all 18 row estimates are above one, 53/54 timing blocks win, and 17 intervals exclude one. HND H16/N4096 is the only interval crossing one at `1.004730x`, CI `[0.998075, 1.011884]`.
 
 Production qualification wins AITER `18/18` at `1.210618x` geometric (`1.240937x` HND, `1.181039x` NHD), backward passes `44/44` plus both exact dispatch checks, and forward passes `188/188`. Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp5f_d64_kv_q_exp2/`.
-- Preprocessed log2 LSE. Attempt only if rank 5 wins. Extend the internal preprocessing path to produce log2-scaled LSE without changing the public Delta layout or raw ABI. Include allocation, preprocessing, and all memory traffic in timing. Stop if storage becomes caller-visible or complete latency does not beat the accepted base-2 form.
-- gfx1151 global-to-LDS staging. First establish a supported direct global-to-LDS opcode and constraints in a microfixture, then replace one V-only row-major stage at a time. Do not apply it to transpose scatters or duplicate global reads. Require the intended linked opcode, removal of the old VGPR-mediated pair, unchanged resource tiers, bit-exact output, a focused site win, and the relevant full matrix. Retain a portable non-gfx1151 path.
+- Preprocessed log2 LSE. **Result:** rejected at D128 focused timing.
+  The isolated candidate allocates a private FP32 log2-LSE array with stream-ordered `hipMallocAsync`, writes it beside public Delta, reads it in KV/Q, and frees it on the same stream without changing the raw ABI or caller-visible Delta layout.
+  All six numerical cases are bit-exact against rank 5.
+  Every KV/Q resource tier remains unchanged and scratch-free; each KV symbol removes one multiply and 2-3 static instructions, each Q symbol removes one multiply and two instructions, and Delta remains in the 96-VGPR allocation tier while adding one load, one multiply, and one store.
+
+  Complete HND timing regresses to `0.796521x` at H16/N4096 with CI `[0.793216, 0.799677]` and `0.952446x` at H32/N8192 with CI `[0.950938, 0.953921]`; all 12 timing blocks lose.
+  The 256 KiB/1 MiB per-call workspace lifecycle adds about 5.7/8.5 ms and overwhelms the removed repeated multiplies.
+  D64 was not attempted because its shorter complete paths cannot amortize the same allocation mechanism.
+  Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp6a_d128_lse_log2/`.
+- gfx1151 global-to-LDS staging. **Result:** rejected at the first ISA gate without a kernel edit.
+  The local LLVM builtin accepts only 1/2/4-byte per-lane transfers and requires target feature `vmem-to-lds-load-insts`.
+  gfx1151 marks that feature read-only and disabled, so clang rejects `__builtin_amdgcn_global_load_lds`; forcing the feature is ignored.
+  The gfx1151 assembler independently rejects both `global_load_lds_dword` and the gfx10-style `global_load_dword ... lds` form.
+  As a control, the same HIP fixture compiles for gfx1030 and its linked device image contains `global_load_dword ... lds`.
+  This establishes that the fixture is valid but gfx1151 has no supported direct global-to-LDS opcode to admit into the attention kernel.
+  Artifact: `~/tmp/feather_attn/postprod_bwd_campaign/exp7_gfx1151_global_to_lds_probe/`.
 
 All candidates use production-equivalent linked gfx1151 images, alternating paired measurements, and artifacts outside the tracked tree. A phase result is triage only. Every retained kernel change must pass the complete D64/D128 backward contract, exact NHD/HND dispatch equivalence, and the 188-case forward contract before integration.
 
@@ -502,7 +518,7 @@ All candidates use production-equivalent linked gfx1151 images, alternating pair
 
 ### Stop Conditions
 
-Stop each candidate at its first failed admission gate and preserve its evidence outside production. If the exact scheduling, padded-layout, barrier, and ISA-qualified address experiments fail to improve complete timing, close the D64 campaign with the current seven-GEMM kernel. Do not continue with generic bandwidth work, forced allocation, direct P/dS compression, or previously rejected K-cache/reload and Q-row-stage variants unless a future topology materially changes their traffic and lifetime assumptions.
+The ranked campaign is closed at the qualified rank-5 seven-GEMM kernels. Do not continue with generic bandwidth work, forced allocation, direct P/dS compression, unsupported VMEM-to-LDS encodings, or previously rejected K-cache/reload and Q-row-stage variants unless a future topology or target architecture materially changes their traffic, lifetime, or ISA assumptions.
 
 D128 remains a separate seven-GEMM design from D64 and is now accepted in production. Preserve its separate Delta/KV/Q topology and do not restore the deleted scalar reference kernel as part of future D64 work.
 
