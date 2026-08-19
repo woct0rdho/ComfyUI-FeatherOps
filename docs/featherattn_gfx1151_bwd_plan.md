@@ -33,13 +33,13 @@ The backward arguments are contiguous HND or NHD tensors selected by `layout`; t
 
 ## Current Production Design
 
-The D64 kernel uses one 128-thread workgroup per head and ownership tile. Short and irregular inputs use one fused kernel with an owner-tile axis sized to the larger of the Q and KV tile counts. When both query and KV lengths are at least 4096, the launcher uses separate compile-time KV-only and Q-only kernels on the current stream so each phase gets its own register allocation.
+The D64 fused and KV-only kernels use one 128-thread workgroup per head and ownership tile. Short and irregular inputs use the fused kernel with an owner-tile axis sized to the larger of the Q and KV tile counts. When both query and KV lengths are at least 4096, the launcher uses separate compile-time phases: KV remains 128 threads/64 rows, while Q uses 256 threads/eight waves to own 128 query rows and halves its owner blocks and K/V staging.
 
 | Parameter | Value |
 | --- | ---: |
 | Head dimension | 64 |
-| Workgroup | 128 threads, four wave32 waves |
-| Ownership tile | 64 rows |
+| Workgroup | 128 threads for fused/KV; 256 threads for long Q |
+| Ownership tile | 64 rows for fused/KV; 128 rows for long Q |
 | Inner WMMA tile | 16 rows/elements |
 | KV storage | FP16, XOR-swizzled LDS rows |
 | K/Q/dO transpose stride | 20 FP16 elements |
@@ -164,7 +164,7 @@ Artifact: `/tmp/feather_bwd_d128_final_matrix_production.json`
 | NHD | 56 | 8192 | 6.822 | 18.659 | 2.742x |
 | NHD | 56 | 16384 | 6.911 | 19.156 | 2.772x |
 
-The D64 regression matrix remains `18/18` at `1.175870x` geometric speedup (`1.200022x` HND, `1.152203x` NHD). Its artifact is `/tmp/feather_bwd_d64_regression_matrix_after_d128.json`.
+The post-D128 regression matrix was `18/18` at `1.175870x` geometric speedup (`1.200022x` HND, `1.152203x` NHD). The later 128-row/256-thread Q owner raises the fresh 10-pair production screen to `18/18` at `1.191276x` (`1.208877x` HND, `1.173930x` NHD). Artifacts are `/tmp/feather_bwd_d64_regression_matrix_after_d128.json` and `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/aiter_matrix.json`.
 
 The public backward contract screen now covers both D64 and D128 over H `{16,32,56}`, batch two, the long-path selector boundary, and arbitrary asymmetric lengths through 16,385: `(4095,4097)`, `(4097,4099)`, `(8191,67)`, `(65,8193)`, `(16383,67)`, and `(65,16385)`. Dedicated H32/N8192 tests also require bit-exact `dQ/dK/dV/Delta` equivalence between the accepted transpose dispatch and the direct NHD image for both head dimensions. The private candidate screen additionally covers `(65,64)`, `(129,65)`, `(256,256)`, `(257,257)`, `(512,513)`, and a cancellation pattern.
 
@@ -176,10 +176,10 @@ The symbol-matched linked production image has the following gfx1151 profile:
 | --- | ---: | ---: | ---: | ---: | ---: |
 | HND D64 fused main, 128 threads | 178 | 192 | 46 | 13,312 B | 0 / 0 |
 | HND D64 KV-only long phase, 128 threads | 169 | 192 | 33 | 15,616 B | 0 / 0 |
-| HND D64 Q-only long phase, 128 threads | 162 | 168 | 33 | 13,312 B | 0 / 0 |
+| HND D64 Q-only long phase, 256 threads | 166 | 168 | 33 | 13,312 B | 0 / 0 |
 | NHD D64 fused main, 128 threads | 178 | 192 | 50 | 13,312 B | 0 / 0 |
 | NHD D64 KV-only long phase, 128 threads | 169 | 192 | 36 | 15,616 B | 0 / 0 |
-| NHD D64 Q-only long phase, 128 threads | 163 | 168 | 38 | 13,312 B | 0 / 0 |
+| NHD D64 Q-only long phase, 256 threads | 166 | 168 | 38 | 13,312 B | 0 / 0 |
 | HND Delta helper | 66 | 72 | 10 | 0 B | 0 / 0 |
 | NHD Delta helper | 66 | 72 | 14 | 0 B | 0 / 0 |
 
@@ -445,6 +445,32 @@ The remaining hypotheses have the following disposition:
 The ranked D64 campaign is complete. The interleave, aligned-stride, barrier, ping-pong, and address-generation ranks failed their complete-path gates; the bounded NHD-to-HND dispatch was accepted after exact-output and full-matrix qualification. No pending kernel-schedule candidate satisfies all promotion gates.
 
 Persistent K/V compression remains deferred because the rejected schedule work did not create a natural resource boundary. Reopen it only after a future topology independently creates an allocation or occupancy transition; direct P/dS compression, software conversion without that transition, and traffic-only improvements remain excluded.
+
+### Post-Production D64/D128 Campaign
+
+Fresh profiling reopens the campaign only for mechanisms whose assumptions differ from the historical trials. D128 H16/N4096 phase timing is about 17.32 ms KV and 6.77 ms Q; D64 is about 5.11 ms KV and 3.39 ms Q. D128 KV has about 63.6% LDS conflicts, 276-cycle LDS latency, and 24.5% barrier wait, while D128 Q has low LDS stalls but 15-22.5% barrier wait. D64 KV has about 23.6% wait-any, 7.5% barrier wait, and 133-135-cycle LDS latency. Direct D128 NHD is a fallback-only path because its strided traffic is pathological; candidate promotion uses the complete selected provider path.
+
+| Rank | Experiment | Status |
+| --- | --- | --- |
+| 1 | D128 Q stage 32 K/V rows per loop | Rejected: focused H32 timing gate failed |
+| 2 | D64 Q 128-row / 256-thread owner | Accepted: `1.011283x` candidate/control matrix |
+| 3 | D64 KV 128-row / 256-thread owner | Planned |
+| 4 | D128 KV 64-row / 256-thread owner | Planned |
+| 5 | Current-topology base-2 probability reconstruction | Planned |
+| 6 | Precompute log2-scaled LSE with Delta | Blocked on rank 5 winning |
+| 7 | gfx1151 ISA/vectorized global-to-LDS staging | Planned after topology and exponential trials |
+
+#### Experiment Contracts
+
+- D128 Q 32-row K/V stage. Advance the Q loop by 32, cooperatively load 32 K/V rows, and process two 16-row WMMA subtiles without duplicating persistent Q/dO or dQ fragments. Expected LDS is 26,624 B; the approximately 246 logical/256 allocated VGPR tier and one-workgroup-per-WGP limit should remain unchanged. Require zero private memory, spills, and scratch; a linked reduction in loop barriers; bit-exact output including K/V lengths 15/16/17/31/32/33; paired Q-phase wins at H16/N4096 and H32/N8192; then a positive complete D128 matrix result with no material row regression and all AITER rows still won. Stop at the first resource, correctness, linked-ISA, or focused-timing failure. **Result:** rejected. Fully unrolling two subtiles produced 32 VGPR spills and 68 B private memory in both layouts. Keeping the loop rolled linked at 233 logical VGPRs, 26,624 B LDS, and zero private/spill/scratch state, and passed 16/16 focused HND/NHD cases bit-exactly. Alternating complete HND timing reached `1.003698x` at H16/N4096 with 95% CI `[1.001384, 1.006057]`, but only `1.000558x` at H32/N8192 with CI `[0.999812, 1.001292]`; separate traces put the H32 Q median at 53.23 ms versus 51.90 ms for production. The source was restored without a full matrix. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp1b_d128_q_stage32_rolled/`.
+- D64 Q 128-row / 256-thread owner. Use eight waves to own 128 Q rows in the long Q-only image, retaining the 32-row K/V stage. Expected LDS remains 13,312 B and per-thread allocation should remain in the 168-VGPR tier, with workgroup granularity limiting residency to eight waves/SIMD. Require zero private/spill/scratch state, bit-exact owner-boundary and public-contract results, and paired Q-phase wins at both focused shapes before the full D64 matrix. Test 512 threads only if 256 threads wins. **Result:** accepted. HND/NHD Q images link at 166 logical/168 allocated VGPRs and 13,312 B LDS with zero private/spill/scratch state. Fourteen focused long-path cases are bit-exact. H16/N4096 confirms at `1.004365x` with 95% CI `[1.001832, 1.007086]`; H32/N8192 reaches `1.012734x` with CI `[1.010203, 1.015090]`. The complete 18-row candidate/control matrix wins every row and is `1.011283x` geometric. The production AITER screen remains `18/18` at `1.191276x`, and qualification passes backward `44/44` plus forward `188/188`. Artifacts: `~/tmp/feather_attn/postprod_bwd_campaign/exp2_d64_q_owner128_wg256/`.
+- D64 KV 128-row / 256-thread owner. Use eight waves to own 128 KV rows in the long KV-only image, halving owner blocks and repeated Q/dO stages. Expected LDS is 23,808 B and VGPR allocation at most the existing 192 tier. Require zero private/spill/scratch state, bit-exact asymmetric/tail results, and focused KV-phase wins despite the larger barrier domain before complete-path qualification.
+- D128 KV 64-row / 256-thread owner. Assign four waves each to dK and dV with `owner_wave = wave % 4`. Expected LDS is 26,624 B for direct/direct and 30,976 B for cached-dO, with at most the 216-VGPR tier; workgroup granularity is expected to reduce residency from seven to six waves/SIMD. Qualify HND and direct NHD separately. Direct NHD must win complete fallback shapes and may not be promoted from isolated kernel timing.
+- Base-2 reconstruction. Specialize Q and KV independently to evaluate `exp2(score * scale * log2(e) - lse * log2(e))`, first for D128 and then D64 on the current topology. LDS, occupancy, and allocation tier must not increase, and linked ISA must show a real hot-loop reduction. Require the full backward contract, per-head cosine at least 0.9999, no material error growth, focused phase wins, and a positive complete matrix before promotion per dimension.
+- Preprocessed log2 LSE. Attempt only if rank 5 wins. Extend the internal preprocessing path to produce log2-scaled LSE without changing the public Delta layout or raw ABI. Include allocation, preprocessing, and all memory traffic in timing. Stop if storage becomes caller-visible or complete latency does not beat the accepted base-2 form.
+- gfx1151 global-to-LDS staging. First establish a supported direct global-to-LDS opcode and constraints in a microfixture, then replace one V-only row-major stage at a time. Do not apply it to transpose scatters or duplicate global reads. Require the intended linked opcode, removal of the old VGPR-mediated pair, unchanged resource tiers, bit-exact output, a focused site win, and the relevant full matrix. Retain a portable non-gfx1151 path.
+
+All candidates use production-equivalent linked gfx1151 images, alternating paired measurements, and artifacts outside the tracked tree. A phase result is triage only. Every retained kernel change must pass the complete D64/D128 backward contract, exact NHD/HND dispatch equivalence, and the 188-case forward contract before integration.
 
 ### Admission Gates
 

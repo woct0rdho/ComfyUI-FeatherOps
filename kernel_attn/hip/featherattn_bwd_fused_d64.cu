@@ -10,8 +10,10 @@ namespace {
 
 constexpr int kRowsBlock = 256;
 constexpr int kThreads = 128;
+constexpr int kQThreads = 256;
 constexpr int kWaveSize = 32;
 constexpr int kOwnerBlock = 64;
+constexpr int kQOwnerBlock = 128;
 constexpr int kInnerBlock = 16;
 constexpr int kHeadDim = 64;
 constexpr int kPacked = 8;
@@ -152,7 +154,8 @@ __global__ void DeltaKernel(
 }
 
 template<int kPhase, bool kNhd>
-__global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
+__global__ __launch_bounds__(kPhase == 2 ? kQThreads : kThreads) void
+SevenGemmD64Kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ k,
     const __half* __restrict__ v,
@@ -169,6 +172,8 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     int nhd_group_count,
     float scale)
 {
+    constexpr int phase_threads = kPhase == 2 ? kQThreads : kThreads;
+    constexpr int owner_block = kPhase == 2 ? kQOwnerBlock : kOwnerBlock;
     constexpr int kv_bytes = kOwnerBlock * kHeadDim * sizeof(_Float16);
     constexpr int transpose_bytes =
         2 * kTransposeStride * kHeadDim * sizeof(_Float16);
@@ -204,7 +209,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
     const int lane = tid % kWaveSize;
     const int lane_row = lane % kInnerBlock;
     const int lane_group = lane / kInnerBlock;
-    const int q_tiles = (n_q + kOwnerBlock - 1) / kOwnerBlock;
+    const int q_tiles = (n_q + owner_block - 1) / owner_block;
     const int kv_tiles = (n_kv + kOwnerBlock - 1) / kOwnerBlock;
     const int owner_tiles =
         kPhase == 1 ? kv_tiles
@@ -470,7 +475,7 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
 
     if(kPhase != 1 && owner_tile < q_tiles)
     {
-        const int q_block_start = owner_tile * kOwnerBlock;
+        const int q_block_start = owner_tile * owner_block;
         const int q_start = q_block_start + wave * kInnerBlock;
         Float8 dq_accum[4] = {};
         Half16 q_rows[kHeadDim / kInnerBlock] = {};
@@ -511,9 +516,11 @@ __global__ __launch_bounds__(kThreads) void SevenGemmD64Kernel(
         {
             __syncthreads();
 #pragma unroll
-            for(int issue = 0; issue < 2; ++issue)
+            for(int issue = 0;
+                issue < 2 * kInnerBlock * kHeadDim / kPacked / phase_threads;
+                ++issue)
             {
-                const int linear_chunk = tid + issue * kThreads;
+                const int linear_chunk = tid + issue * phase_threads;
                 const int stage_row = linear_chunk / (kHeadDim / kPacked);
                 const int stage_chunk = linear_chunk % (kHeadDim / kPacked);
                 Half8 k_stage = {};
@@ -642,6 +649,8 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
     const int32_t q_rows = params.head_count * params.n_q;
     const int32_t q_tiles =
         (params.n_q + kOwnerBlock - 1) / kOwnerBlock;
+    const int32_t q_phase_tiles =
+        (params.n_q + kQOwnerBlock - 1) / kQOwnerBlock;
     const int32_t kv_tiles =
         (params.n_kv + kOwnerBlock - 1) / kOwnerBlock;
     const int32_t owner_tiles = q_tiles > kv_tiles ? q_tiles : kv_tiles;
@@ -692,11 +701,12 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
             params.scale);
 
         const dim3 q_grid(
-            static_cast<uint32_t>(params.head_count * q_tiles));
+            static_cast<uint32_t>(params.head_count * q_phase_tiles));
+        const dim3 q_block(kQThreads);
         hipLaunchKernelGGL(
             (SevenGemmD64Kernel<2, kNhd>),
             q_grid,
-            main_block,
+            q_block,
             0,
             params.stream,
             q,
