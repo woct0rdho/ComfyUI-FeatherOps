@@ -10,9 +10,11 @@ namespace {
 
 constexpr int kRowsBlock = 256;
 constexpr int kThreads = 128;
+constexpr int kKVThreads = 256;
 constexpr int kQThreads = 256;
 constexpr int kWaveSize = 32;
 constexpr int kOwnerBlock = 64;
+constexpr int kKVOwnerBlock = 128;
 constexpr int kQOwnerBlock = 128;
 constexpr int kInnerBlock = 16;
 constexpr int kHeadDim = 64;
@@ -154,7 +156,10 @@ __global__ void DeltaKernel(
 }
 
 template<int kPhase, bool kNhd>
-__global__ __launch_bounds__(kPhase == 2 ? kQThreads : kThreads) void
+__global__ __launch_bounds__(
+    kPhase == 1 && !kNhd
+        ? kKVThreads
+        : (kPhase == 2 ? kQThreads : kThreads)) void
 SevenGemmD64Kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ k,
@@ -172,9 +177,15 @@ SevenGemmD64Kernel(
     int nhd_group_count,
     float scale)
 {
-    constexpr int phase_threads = kPhase == 2 ? kQThreads : kThreads;
-    constexpr int owner_block = kPhase == 2 ? kQOwnerBlock : kOwnerBlock;
-    constexpr int kv_bytes = kOwnerBlock * kHeadDim * sizeof(_Float16);
+    constexpr bool wide_kv = kPhase == 1 && !kNhd;
+    constexpr int phase_threads =
+        wide_kv ? kKVThreads : (kPhase == 2 ? kQThreads : kThreads);
+    constexpr int kv_owner_block =
+        wide_kv ? kKVOwnerBlock : kOwnerBlock;
+    constexpr int q_owner_block =
+        kPhase == 2 ? kQOwnerBlock : kOwnerBlock;
+    constexpr int kv_bytes =
+        kv_owner_block * kHeadDim * sizeof(_Float16);
     constexpr int transpose_bytes =
         2 * kTransposeStride * kHeadDim * sizeof(_Float16);
     constexpr int q_kv_tile_bytes =
@@ -184,11 +195,12 @@ SevenGemmD64Kernel(
         kInnerBlock * do_row_stride * sizeof(_Float16);
     constexpr int lds_bytes =
         kv_bytes + transpose_bytes + (kPhase == 1 ? do_row_bytes : 0);
-    static_assert(kv_bytes == 8192);
+    static_assert(kv_bytes == (wide_kv ? 16384 : 8192));
     static_assert(q_kv_tile_bytes == 4096);
     static_assert(do_row_bytes == 2304);
     static_assert(transpose_bytes == 5120);
-    static_assert(lds_bytes == (kPhase == 1 ? 15616 : 13312));
+    static_assert(
+        lds_bytes == (kPhase == 1 ? (wide_kv ? 23808 : 15616) : 13312));
 
     alignas(16) __shared__ uint8_t lds[lds_bytes];
     auto* kv_v_lds = reinterpret_cast<_Float16*>(lds);
@@ -209,8 +221,8 @@ SevenGemmD64Kernel(
     const int lane = tid % kWaveSize;
     const int lane_row = lane % kInnerBlock;
     const int lane_group = lane / kInnerBlock;
-    const int q_tiles = (n_q + owner_block - 1) / owner_block;
-    const int kv_tiles = (n_kv + kOwnerBlock - 1) / kOwnerBlock;
+    const int q_tiles = (n_q + q_owner_block - 1) / q_owner_block;
+    const int kv_tiles = (n_kv + kv_owner_block - 1) / kv_owner_block;
     const int owner_tiles =
         kPhase == 1 ? kv_tiles
                     : (kPhase == 2 ? q_tiles
@@ -268,11 +280,13 @@ SevenGemmD64Kernel(
 
     if(kPhase != 2 && owner_tile < kv_tiles)
     {
-        const int kv_start = owner_tile * kOwnerBlock;
+        const int kv_start = owner_tile * kv_owner_block;
 #pragma unroll
-        for(int issue = 0; issue < 4; ++issue)
+        for(int issue = 0;
+            issue < kv_owner_block * kHeadDim / kPacked / phase_threads;
+            ++issue)
         {
-            const int linear_chunk = tid + issue * kThreads;
+            const int linear_chunk = tid + issue * phase_threads;
             const int row = linear_chunk / (kHeadDim / kPacked);
             const int chunk = linear_chunk % (kHeadDim / kPacked);
             Half8 v_value = {};
@@ -309,31 +323,36 @@ SevenGemmD64Kernel(
         for(int q_start = 0; q_start < n_q; q_start += kInnerBlock)
         {
             __syncthreads();
-            const int stage_row = tid / (kHeadDim / kPacked);
-            const int stage_chunk = tid % (kHeadDim / kPacked);
-            Half8 q_stage = {};
-            Half8 do_stage = {};
-            if(q_start + stage_row < n_q)
+            if(tid < kInnerBlock * kHeadDim / kPacked)
             {
-                const int global_offset =
-                    q_offset + (q_start + stage_row) * q_row_stride +
-                    stage_chunk * kPacked;
-                q_stage = *reinterpret_cast<const Half8*>(q + global_offset);
-                do_stage = *reinterpret_cast<const Half8*>(dout + global_offset);
-            }
+                const int stage_row = tid / (kHeadDim / kPacked);
+                const int stage_chunk = tid % (kHeadDim / kPacked);
+                Half8 q_stage = {};
+                Half8 do_stage = {};
+                if(q_start + stage_row < n_q)
+                {
+                    const int global_offset =
+                        q_offset + (q_start + stage_row) * q_row_stride +
+                        stage_chunk * kPacked;
+                    q_stage = *reinterpret_cast<const Half8*>(q + global_offset);
+                    do_stage = *reinterpret_cast<const Half8*>(
+                        dout + global_offset);
+                }
 #pragma unroll
-            for(int i = 0; i < kPacked; ++i)
-            {
-                const int d = stage_chunk * kPacked + i;
-                q_transpose_lds[d * kTransposeStride + stage_row] = q_stage[i];
-                do_transpose_lds[d * kTransposeStride + stage_row] =
-                    do_stage[i];
-            }
-            if constexpr(kPhase == 1)
-            {
-                *reinterpret_cast<Half8*>(
-                    do_row_lds + stage_row * do_row_stride +
-                    stage_chunk * kPacked) = do_stage;
+                for(int i = 0; i < kPacked; ++i)
+                {
+                    const int d = stage_chunk * kPacked + i;
+                    q_transpose_lds[d * kTransposeStride + stage_row] =
+                        q_stage[i];
+                    do_transpose_lds[d * kTransposeStride + stage_row] =
+                        do_stage[i];
+                }
+                if constexpr(kPhase == 1)
+                {
+                    *reinterpret_cast<Half8*>(
+                        do_row_lds + stage_row * do_row_stride +
+                        stage_chunk * kPacked) = do_stage;
+                }
             }
             __syncthreads();
 
@@ -475,7 +494,7 @@ SevenGemmD64Kernel(
 
     if(kPhase != 1 && owner_tile < q_tiles)
     {
-        const int q_block_start = owner_tile * owner_block;
+        const int q_block_start = owner_tile * q_owner_block;
         const int q_start = q_block_start + wave * kInnerBlock;
         Float8 dq_accum[4] = {};
         Half16 q_rows[kHeadDim / kInnerBlock] = {};
@@ -653,6 +672,8 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
         (params.n_q + kQOwnerBlock - 1) / kQOwnerBlock;
     const int32_t kv_tiles =
         (params.n_kv + kOwnerBlock - 1) / kOwnerBlock;
+    const int32_t kv_phase_tiles =
+        (params.n_kv + kKVOwnerBlock - 1) / kKVOwnerBlock;
     const int32_t owner_tiles = q_tiles > kv_tiles ? q_tiles : kv_tiles;
 
     (void)hipGetLastError();
@@ -677,11 +698,13 @@ bool LaunchSevenGemmBackward(const BackwardLaunchParams& params)
     if(params.n_q >= 4096 && params.n_kv >= 4096)
     {
         const dim3 kv_grid(
-            static_cast<uint32_t>(params.head_count * kv_tiles));
+            static_cast<uint32_t>(
+                params.head_count * (kNhd ? kv_tiles : kv_phase_tiles)));
+        const dim3 kv_block(kNhd ? kThreads : kKVThreads);
         hipLaunchKernelGGL(
             (SevenGemmD64Kernel<1, kNhd>),
             kv_grid,
-            main_block,
+            kv_block,
             0,
             params.stream,
             q,
