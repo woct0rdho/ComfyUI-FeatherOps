@@ -116,7 +116,6 @@ These patterns were checked but not recorded as stable model `TT` GEMM rows:
 - musubi-tuner Wan also starts from `flatten(2).transpose(1,2)`, but padding and `torch.cat` produce contiguous tensors before transformer Linears.
 - sd-scripts DyLoRA Conv2d fallback can call `F.linear` on an `NCHW -> NHW,C` transposed view, but those shapes are adapter-target and spatial-size dependent rather than stable checkpoint Linear/GEMM rows.
 - H3 video patchification materializes a contiguous row-major matrix. Only the no-reference ComfyUI audio patch projection is recorded as TT; H3 audio-reference assembly and Musubi's training `torch.cat` path are TN.
-- Attention-kernel internal matmuls remain excluded; fused-attention shapes are documented separately in `docs/input_shapes_attn.md`.
 
 ## Planning Notes
 

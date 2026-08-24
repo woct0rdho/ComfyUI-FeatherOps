@@ -70,6 +70,5 @@ Note on FlashAttention: If you correctly install FlashAttention with AITER Trito
 ## TODO
 
 * See what we can do with a fp16 @ fp16 kernel. Tensile is good at tuning parameters, but we still need an HIP kernel to better understand low-level behaviors such as how to utilize the hardware scheduler. We need better profiling or even a simulator to investigate it
-* See what we can do with the attention op
 * Better fp8e5m2 quantization. For now I just directly cast fp16/bf16 weights to fp8e5m2, and we can implement grid search of the scale and blockwise quantization for better quality
 * Support more models in ComfyUI. We need to exclude modules outside the transformer backbone, and mat-vec multiplications

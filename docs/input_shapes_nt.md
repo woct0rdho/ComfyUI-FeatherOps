@@ -429,7 +429,7 @@ H3 geometry and packed rows:
 | `640x480x40` | 56 | `[17,30,40]` | 5100 / 5120 | 186 / 256 | 5302 / 5376 |
 | `1280x720x80` | 90 | `[27,46,80]` | 24840 / 25088 | 300 / 512 | 25156 / 25344 |
 
-Audio rows are `2 * audio_latent_frames` at 40 Hz. Packed rows are `16 text + audio + video`. The saved GEMM rows round video, audio, and packed activation rows independently up to multiples of 256; fused attention uses the exact packed row counts documented in `input_shapes_attn.md`.
+Audio rows are `2 * audio_latent_frames` at 40 Hz. Packed rows are `16 text + audio + video`. The saved GEMM rows round video, audio, and packed activation rows independently up to multiples of 256.
 
 H3 config and checkpoint facts:
 - H3 is a single-stream audio-video transformer with hidden width 5376, 50 main DiT blocks, 2 text-token refiner blocks, 56 attention heads, head dimension 128, attention inner width 7168, FFN width 14336, text input width 5120, video patch width 96, and audio patch width 32.
