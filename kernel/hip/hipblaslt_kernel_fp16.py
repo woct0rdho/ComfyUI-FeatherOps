@@ -4,7 +4,7 @@ import _rocm_sdk_core
 import torch
 from torch.utils.cpp_extension import load
 
-from .utils import get_rocm_lib_dirs
+from .utils import _hip_ninja_depfiles, get_rocm_lib_dirs
 
 
 def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: str) -> None:
@@ -12,12 +12,11 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
     os.makedirs(build_dir, exist_ok=True)
 
     includes = []
-
     rocm_sdk_inc = os.path.join(os.path.dirname(_rocm_sdk_core.__file__), "include")
     if os.path.exists(rocm_sdk_inc):
         includes.append(rocm_sdk_inc)
 
-    extra_cflags = [
+    common_cflags = [
         "-O3",
         "--std=c++20",
         "-Wall",
@@ -29,34 +28,39 @@ def load_hipblaslt_stable_extension(name: str, cur_dir: str, source_filename: st
         "-Wno-unused-parameter",
         "-DPy_LIMITED_API=0x03090000",
     ]
+    if os.name == "nt":
+        # PyTorch's stable headers use deprecated CRT APIs with recent MSVC.
+        common_cflags.append("-D_CRT_SECURE_NO_WARNINGS")
+
+    cuda_cflags = common_cflags + [
+        "-U__HIP_NO_HALF_OPERATORS__",
+        "-U__HIP_NO_HALF_CONVERSIONS__",
+        "-U__HIP_NO_HALF2_OPERATORS__",
+    ]
+    if os.name == "nt":
+        # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
+        cuda_cflags.append("-nohipwrapperinc")
 
     if os.name == "nt":
         extra_ldflags = ["libhipblaslt.dll.a"]
-        extra_ldflags.extend(f"/LIBPATH:{lib_dir}" for lib_dir in get_rocm_lib_dirs())
     else:
         extra_ldflags = ["-lhipblaslt"]
-        for lib_dir in get_rocm_lib_dirs():
-            extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
+    for lib_dir in get_rocm_lib_dirs():
+        extra_ldflags.extend([f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}"])
 
-    load(
-        name=name,
-        sources=[os.path.join(cur_dir, source_filename)],
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cflags
-        + [
-            # ROCm's injected HIP wrapper pulls in MSVC <cmath> too early on Windows.
-            "-nohipwrapperinc",
-            "-U__HIP_NO_HALF_OPERATORS__",
-            "-U__HIP_NO_HALF_CONVERSIONS__",
-            "-U__HIP_NO_HALF2_OPERATORS__",
-        ],
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=includes,
-        build_directory=build_dir,
-        with_cuda=True,
-        verbose=False,
-        is_python_module=False,
-    )
+    with _hip_ninja_depfiles():
+        load(
+            name=name,
+            sources=[os.path.join(cur_dir, source_filename)],
+            extra_cflags=common_cflags,
+            extra_cuda_cflags=cuda_cflags,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=includes,
+            build_directory=build_dir,
+            with_cuda=True,
+            verbose=False,
+            is_python_module=False,
+        )
 
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))

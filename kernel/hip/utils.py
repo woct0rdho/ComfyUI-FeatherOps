@@ -43,10 +43,9 @@ def _hip_ninja_depfiles():
         _add_hip_ninja_depfile_rule(Path(build_directory, "build.ninja"))
         run_ninja_build(build_directory, verbose, error_prefix)
 
-    extension_globals = vars(cpp_extension)
-    extension_globals["_run_ninja_build"] = run_ninja_build_with_depfiles
+    cpp_extension.__dict__["_run_ninja_build"] = run_ninja_build_with_depfiles
     yield
-    extension_globals["_run_ninja_build"] = run_ninja_build
+    cpp_extension.__dict__["_run_ninja_build"] = run_ninja_build
 
 
 def get_rocm_lib_dirs() -> list[str]:
@@ -92,6 +91,10 @@ def load_hip_stable_extension(
         "-Wno-unused-parameter",
         "-DPy_LIMITED_API=0x03090000",
     ]
+    if os.name == "nt":
+        # PyTorch's stable headers use deprecated CRT APIs with recent MSVC.
+        common_cflags.append("-D_CRT_SECURE_NO_WARNINGS")
+
     cflags = common_cflags.copy()
     if extra_cflags:
         cflags.extend(extra_cflags)
