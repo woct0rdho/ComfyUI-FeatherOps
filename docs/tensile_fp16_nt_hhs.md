@@ -163,7 +163,7 @@ The table keeps decision-relevant hot-loop results. Full per-probe details and C
 | TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10, SIA3 | `40968.9` | `40880.1` | SIA3 with store priority on, same resources. ~10% slower sister config |
 | TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10 | `38292.3` | `38375.1` | Best repeat-confirmed SIA2 config in the original NEPBS sweep |
 | TensileLite scale/bias VWB2 forced static-WGM8, NEPBS8 | `40483.9` | `40432.8` | Historical best for `8192^3` with `ForceStaticWGM8=True` |
-| TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10, SIA3, no store priority (single pass peak) | `46341.6` | `46404.0` | Best single 10-sample pass observed; included for reference, not the aggregated claim |
+| TensileLite scale/bias VWB2 guarded static-WGM8, NEPBS10, SIA3, no store priority (single pass peak) | `46341.6` | `46404.0` | Best single 10-sample pass observed. Included for reference, not the aggregated claim |
 | TensileLite scale/bias VWB2 forced static-WGM8, NEPBS4 | `40407.6` | `40395.5` | `8192^3` target validated. Slower than NEPBS8 |
 | TensileLite scale/bias VWB2 forced static-WGM8, NEPBS16 | `40365.0` | `40386.2` | Prior best for `8192^3`. `NumElementsPerBatchStore=16` |
 | TensileLite scale/bias VWB2 forced static-WGM8, NEPBS12 | `40344.4` | `40378.0` | `8192^3` target validated. Slower than NEPBS8/16 |
@@ -222,10 +222,10 @@ Useful client configs and CSVs:
 - Full-Tensile hot-loop CSV: `tmp_tensile_fp16_nt/outputs_full_tensile/rocblas_hhs_bh_solution18_beta0_8192_hot_loop.csv`.
 
 Full-Tensile notes:
-- rocBLAS builds from full Tensile under `~/rocm-libraries/shared/tensile`; hipBLASLt uses TensileLite under `~/rocm-libraries/projects/hipblaslt/tensilelite`.
+- rocBLAS builds from full Tensile under `~/rocm-libraries/shared/tensile`. hipBLASLt uses TensileLite under `~/rocm-libraries/projects/hipblaslt/tensilelite`.
 - Full Tensile here reports `v4.47.0`. Reference configs need `MinimumRequiredVersion: 4.47.0` or lower.
-- Full Tensile uses `GlobalLoadVectorWidthA/B`; TensileLite uses `GlobalReadVectorWidthA/B`.
-- Full Tensile uses `VectorWidth` plus `VectorWidthB`; TensileLite uses `VectorWidthA` plus `VectorWidthB`.
+- Full Tensile uses `GlobalLoadVectorWidthA/B`. TensileLite uses `GlobalReadVectorWidthA/B`.
+- Full Tensile uses `VectorWidth` plus `VectorWidthB`. TensileLite uses `VectorWidthA` plus `VectorWidthB`.
 - Pass the compiler with `--cxx-compiler <path>`. Do not use `--global-parameters CxxCompiler=<path>` because full Tensile parses global parameter values through Python `eval`.
 - Do not pass `--global-parameters CodeObjectVersion=4`. Use full Tensile's `--code-object-version V4` when needed.
 - `TensileCreateLibrary` exact-object output is useful for metadata/assembly, but current full client crashes when benchmarking that YAML library directly: hard-index mode in `AllSolutionsIterator::getSolution`, best-solution mode in `BestSolutionIterator::preProblem`.

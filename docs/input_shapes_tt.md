@@ -2,7 +2,7 @@
 
 This note records confirmed `TT` GEMM shapes found while auditing common inference and training paths in `~/ComfyUI/`, `~/sd-scripts/`, and `~/musubi-tuner/`.
 
-Machine-readable rows are saved in `~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/shape_data/`:
+Machine-readable rows are saved in `~/tmp/feather_ops/tensile_fp16_nt_hhs/shape_data/`:
 - `tt_gemm_shapes.csv`: normalized confirmed `TT` GEMM rows.
 - `tt_gemm_shapes_manifest.json`: assumptions, source paths, counts, and excluded near-misses.
 
@@ -23,17 +23,25 @@ Confirmed normalized `TT` rows:
 | Dataset | Component | Phase | Exact `[M,N,batch,K]` | Count per size | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Krea 2 | `text_fusion_projector` | forward inference / frozen-weight forward | `[1,2560,16,12]` | 1 | `Linear(12,1)` over `16` text tokens and `2560` hidden channels. |
-| LTX 2.3 | `patchify_proj` | forward inference / autograd forward | `[4096,1536,1,128]` | 1 | Normalized row for `640x480x40`; actual token view has `N=1500` before tuning-row rounding. |
-| LTX 2.3 | `patchify_proj` | forward inference / autograd forward | `[4096,8960,1,128]` | 1 | Normalized row for `1280x720x80`; actual token view has `N=8800` before tuning-row rounding. |
+| LTX 2.3 | `patchify_proj` | forward inference / autograd forward | `[4096,1536,1,128]` | 1 | Normalized row for `640x480x40`. Actual token view has `N=1500` before tuning-row rounding. |
+| LTX 2.3 | `patchify_proj` | forward inference / autograd forward | `[4096,8960,1,128]` | 1 | Normalized row for `1280x720x80`. Actual token view has `N=8800` before tuning-row rounding. |
 | LTX 2.3 | `patchify_proj` rank-16 `lora_down` | unmerged LoRA inference / training forward | `[16,1536,1,128]` | 1 | The trainable down factor consumes the same column-major-like small-video patch view. |
 | LTX 2.3 | `patchify_proj` rank-16 `lora_down` | unmerged LoRA inference / training forward | `[16,8960,1,128]` | 1 | The trainable down factor consumes the same column-major-like large-video patch view. |
-| H3 | `audio_patch_proj` | forward inference / no-reference T2VA | `[5376,256,1,32]` | 1 | Normalized row for `640x480x40`; actual channel-major audio view has `N=186` before tuning-row rounding. |
-| H3 | `audio_patch_proj` | forward inference / no-reference T2VA | `[5376,512,1,32]` | 1 | Normalized row for `1280x720x80`; actual channel-major audio view has `N=300` before tuning-row rounding. |
+| Qwen-Image 2.1 | `img_in` | forward inference / autograd forward | `[4096,4096,1,64]` | 1 | `1024x1024` target rows. `img.flatten(2).transpose(1,2)` keeps a column-major-like `[rows,64]` token view. |
+| Qwen-Image 2.1 | `img_in` | forward inference / autograd forward | `[4096,9216,1,64]` | 1 | `1536x1536` target rows. Same token view, larger extent. |
+| Qwen-Image 2.1 | `img_in` rank-16 `lora_down` | unmerged LoRA inference / training forward | `[16,4096,1,64]` | 1 | The trainable down factor consumes the same column-major-like `1024x1024` token view. |
+| Qwen-Image 2.1 | `img_in` rank-16 `lora_down` | unmerged LoRA inference / training forward | `[16,9216,1,64]` | 1 | The trainable down factor consumes the same column-major-like `1536x1536` token view. |
+| H3 | `audio_patch_proj` | forward inference / no-reference T2VA | `[5376,256,1,32]` | 1 | Normalized row for `640x480x40`. Actual channel-major audio view has `N=186` before tuning-row rounding. |
+| H3 | `audio_patch_proj` | forward inference / no-reference T2VA | `[5376,512,1,32]` | 1 | Normalized row for `1280x720x80`. Actual channel-major audio view has `N=300` before tuning-row rounding. |
+| MOSS-Image | `video_embedder` | forward inference (ComfyUI) | `[3072,4096,1,128]` | 1 | `1024x1024` image rows. `x.flatten(2).transpose(1,2)` is passed to the projection without `.contiguous()`, so the `[rows,128]` token view is column-major-like. |
+| MOSS-Image | `video_embedder` | forward inference (ComfyUI) | `[3072,9216,1,128]` | 1 | `1536x1536` image rows. Same token view, larger extent. |
+| MOSS-Image | `video_embedder` rank-16 `lora_down` | unmerged LoRA inference (ComfyUI) | `[16,4096,1,128]` | 1 | The trainable down factor consumes the same column-major-like `1024x1024` token view. |
+| MOSS-Image | `video_embedder` rank-16 `lora_down` | unmerged LoRA inference (ComfyUI) | `[16,9216,1,128]` | 1 | The trainable down factor consumes the same column-major-like `1536x1536` token view. |
 
 Counts:
-- Normalized `TT` rows: 8.
-- Unique exact `TT` shapes: 7.
-- Weighted `TT` occurrences: 8.
+- Normalized `TT` rows: 16.
+- Unique exact `TT` shapes: 15.
+- Weighted `TT` occurrences: 16.
 
 ## Krea 2 TextFusion Projector
 
@@ -81,7 +89,7 @@ Documented normalized video rows follow the existing LTX tuning convention and r
 | `640x480x40` | 1500 | 1536 | `[4096,1536,1,128]` |
 | `1280x720x80` | 8800 | 8960 | `[4096,8960,1,128]` |
 
-The exact pre-rounding GEMMs are `[4096,1500,1,128]` and `[4096,8800,1,128]`; the CSV keeps the rounded normalized rows used by the rest of the LTX 2.3 shape dataset.
+The exact pre-rounding GEMMs are `[4096,1500,1,128]` and `[4096,8800,1,128]`. The CSV keeps the rounded normalized rows used by the rest of the LTX 2.3 shape dataset.
 
 The ordinary LoRA implementation in `~/musubi-tuner/src/musubi_tuner/networks/lora.py` passes the original activation directly to `lora_down`. For an unmerged rank-16 adapter on `patchify_proj`, `Linear(128,16)` therefore consumes the same 2D column-major-like patch view and remains TT:
 
@@ -92,6 +100,30 @@ The ordinary LoRA implementation in `~/musubi-tuner/src/musubi_tuner/networks/lo
 
 The corresponding `lora_up = Linear(16,4096)` consumes the contiguous output of `lora_down` and uses TN. Its TN rows are recorded in `input_shapes_tn.md`.
 
+## Qwen-Image 2.1 Image Projection
+
+Sources checked:
+- `~/ComfyUI/comfy/ldm/qwen_image21/model.py`.
+- `~/musubi-tuner/src/musubi_tuner/networks/lora.py` for the LoRA side.
+
+`QwenImage21Transformer2DModel.build_sequence` embeds every image part without materializing a contiguous token matrix:
+- Token view: `self.img_in(img.flatten(2).transpose(1, 2))` on a `[B,64,H,W]` latent.
+- For `B=1` and a `64x64` latent, that is a `[4096,64]` view with strides `(1,4096)`, so the lhs is column-major-like.
+- The visible rhs is `weight.t()` with strides `(1,64)`, also column-major-like.
+- The emitted call is a 2D `aten.mm`, so the layout is `TT` and not a batched case.
+
+A `torch` dispatch probe over all four `requires_grad` combinations shows the same operand strides for frozen, trainable, and input-gradient configurations, so both the base projection and an unmerged rank-16 `lora_down` stay `TT` in inference and training. This is different from Krea 2, where a trainable projector weight clones and flattens the batched input.
+
+| Size | Latent | Image rows | Base exact `[M,N,batch,K]` | Rank-16 `lora_down` |
+| --- | --- | ---: | --- | --- |
+| `1024x1024` | `64x64` | 4096 | `[4096,4096,1,64]` | `[16,4096,1,64]` |
+| `1536x1536` | `96x96` | 9216 | `[4096,9216,1,64]` | `[16,9216,1,64]` |
+| `2048x2048` (native 2K) | `128x128` | 16384 | `[4096,16384,1,64]` | `[16,16384,1,64]` |
+
+The `2048x2048` row is a size extension of the same call and is not one of the normalized CSV rows.
+
+Reference images use the same `img_in` call, so each reference adds its own `TT` rows at that reference's latent extent. Reference latents are excluded from the documented no-reference workload.
+
 ## H3 Audio Patch Projection
 
 Sources checked:
@@ -101,22 +133,55 @@ Sources checked:
 H3 packs audio latents with `pack_audio` from `[B,32,2,T]` to `[2*T,32]` using a channel-major view. For the no-reference ComfyUI T2VA path, that view is passed directly to `audio_patch_proj = Linear(32,5376)`:
 - The input stride is `(1,2*T)`, so the lhs is column-major-like.
 - The visible rhs is `weight.t()` with the same column-major-like layout as the other confirmed TT cases.
-- The exact pre-rounding GEMMs are `[5376,186,1,32]` and `[5376,300,1,32]`; normalized rows are `[5376,256,1,32]` and `[5376,512,1,32]`.
+- The exact pre-rounding GEMMs are `[5376,186,1,32]` and `[5376,300,1,32]`. Normalized rows are `[5376,256,1,32]` and `[5376,512,1,32]`.
 - First/last keyframe paths still use this TT audio projection when there are no audio references. Ref2VA audio-condition assembly uses `torch.empty` and changes the input to contiguous TN.
 - The Musubi training implementation concatenates packed audio rows before the projection, so its trainable forward projection is TN. This does not change the NT shape of its theoretical parameter gradients.
 
 The H3 checkpoint is the supplied pruned INT8 ConvRot artifact, but these rows describe the logical dequantized BF16 Linear shape. The exact H3 GEMM workload rows, including full-weight and rank-16 LoRA gradients, are in `h3_gemm_shapes.csv`.
 
+## MOSS-Image Image Projection
+
+Sources checked:
+- `~/ComfyUI/comfy/ldm/moss_image/model.py`.
+- `~/sd-scripts/library/moss_image_models.py` for the training side.
+
+`MOSSImage._forward` embeds the latent without materializing a contiguous token matrix:
+- Token view: `self.video_embedder(x.flatten(2).transpose(1, 2))` on a `[B,128,H,W]` Flux2 latent.
+- For `B=1` and a `64x64` latent, that is a `[4096,128]` view with strides `(1,4096)`, so the lhs is column-major-like.
+- The visible rhs is `weight.t()` with strides `(1,128)`, also column-major-like.
+- A `torch` dispatch probe on the real ComfyUI module shows the emitted `aten.mm` receives lhs `(64,128)` strides `(1,64)` and rhs `(128,256)` strides `(1,128)` in a small-dimension probe, i.e. the same column-major operand pair, so the layout is `TT` and not a batched case.
+
+The mode split matters here, unlike Qwen-Image 2.1:
+
+| Path | Code | Layout |
+| --- | --- | --- |
+| ComfyUI inference | `self.video_embedder(x.flatten(2).transpose(1, 2))`, no `.contiguous()` | `TT` |
+| sd-scripts training | `x.flatten(2).transpose(1, 2).to(dtype).contiguous()` | `TN` |
+
+The sd-scripts training model therefore records a `TN` row for the training forward, while the ComfyUI inference rows in the confirmed table above stay `TT`. Both are recorded in the model CSV.
+
+| Size | Latent | Image rows | Base exact `[M,N,batch,K]` | Rank-16 `lora_down` |
+| --- | --- | ---: | --- | --- |
+| `1024x1024` | `64x64` | 4096 | `[3072,4096,1,128]` | `[16,4096,1,128]` |
+| `1536x1536` | `96x96` | 9216 | `[3072,9216,1,128]` | `[16,9216,1,128]` |
+| `2048x2048` (native 2K) | `128x128` | 16384 | `[3072,16384,1,128]` | `[16,16384,1,128]` |
+
+The `2048x2048` row is a size extension of the same call and is not one of the normalized CSV rows.
+
+The released color/depth control adapter replaces `video_embedder` with a widened `[3072,384]` weight (`128` latent plus `128` color plus `128` depth channels) and keeps the same strided input, so a control run adds `TT` rows at `K=384`. Control maps are excluded from the documented no-control workload.
+
 ## Excluded Near-Misses
 
 These patterns were checked but not recorded as stable model `TT` GEMM rows:
 - SDXL `SpatialTransformer` in ComfyUI uses `movedim(...).flatten(...).contiguous()` before `proj_in`, so its Linears remain default `TN` forward rows.
-- Qwen, Z-Image, Krea image patchify, Ideogram 4, and Flux/Klein patchify rearranges materialize contiguous token tensors before their first `Linear`; LTX 2.3 is included because both its base `patchify_proj` and unmerged rank-16 `lora_down` preserve the channel-last patch view.
-- ComfyUI Wan uses `flatten(2).transpose(1,2)` after 3D convolution, but the transformer block calls `x.contiguous()` before Linears; reference/context concatenation also materializes contiguous tensors.
+- Qwen-Image 1, Z-Image, Krea image patchify, Ideogram 4, and Flux/Klein patchify rearranges materialize contiguous token tensors before their first `Linear`. LTX 2.3 and Qwen-Image 2.1 are included because they preserve a channel-last view into their first projection.
+- ComfyUI Wan uses `flatten(2).transpose(1,2)` after 3D convolution, but the transformer block calls `x.contiguous()` before Linears. Reference/context concatenation also materializes contiguous tensors.
 - musubi-tuner Wan also starts from `flatten(2).transpose(1,2)`, but padding and `torch.cat` produce contiguous tensors before transformer Linears.
 - sd-scripts DyLoRA Conv2d fallback can call `F.linear` on an `NCHW -> NHW,C` transposed view, but those shapes are adapter-target and spatial-size dependent rather than stable checkpoint Linear/GEMM rows.
-- H3 video patchification materializes a contiguous row-major matrix. Only the no-reference ComfyUI audio patch projection is recorded as TT; H3 audio-reference assembly and Musubi's training `torch.cat` path are TN.
+- H3 video patchification materializes a contiguous row-major matrix. Only the no-reference ComfyUI audio patch projection is recorded as TT. H3 audio-reference assembly and Musubi's training `torch.cat` path are TN.
+- The sd-scripts MOSS-Image training model calls `.contiguous()` on the `flatten(2).transpose(1,2)` token view before `video_embedder`, so its training forward is `TN`. Only the ComfyUI inference forward (and an unmerged LoRA-down factor on it) stays `TT`.
+- Qwen-Image 2.1 reference-image spans and the Fun-Control copied-block stream are input-dependent and are not recorded. The `to_q`/`to_k`/`to_v`/`to_out` and MLP Linears all receive the packed contiguous sequence, so they stay `TN`.
 
 ## Planning Notes
 
-Treat the confirmed rows as explicit `TT` targets rather than evidence for a broad `TT` workload grid. The Krea 2 projector is a small strided-batched `K=12` case; LTX 2.3 contributes batch-1 `K=128` patch rows with base `M=4096` and LoRA-down `M=16`; H3 is a batch-1 audio-token case with `K=32` and large `M=5376`.
+Treat the confirmed rows as explicit `TT` targets rather than evidence for a broad `TT` workload grid. The Krea 2 projector is a small strided-batched `K=12` case. LTX 2.3 contributes batch-1 `K=128` patch rows with base `M=4096` and LoRA-down `M=16`. Qwen-Image 2.1 contributes batch-1 `K=64` rows whose `N` is the image token count and whose base `M` is `4096`. H3 is a batch-1 audio-token case with `K=32` and large `M=5376`. MOSS-Image contributes batch-1 `K=128` rows whose `N` is the image token count and whose base `M` is `3072`.

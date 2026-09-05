@@ -6,7 +6,7 @@
   - Triton fp8->fp16 cast (`triton_poi_fused__to_copy_0`)
   - GEMM (`extern_kernels.mm` -> ATen -> rocBLAS/Tensile asm kernel)
   - Triton fused epilogue (`mul(scale)+add(bias)`)
-- CK backend is not used for this run on gfx1151; GEMM is rocBLAS/Tensile, not inductor CK.
+- CK backend is not used for this run on gfx1151. GEMM is rocBLAS/Tensile, not inductor CK.
 - Selected GEMM symbol:
   - `Cijk_Ailk_Bljk_HHS_BH_MT128x128x32_MI16x16x16x1_SN_1LDSB1_..._PGR1_PLR0_SIA3_SU32_SUS256_..._WSGRA1_WSGRB1_WS32_WG32_4_1_...`
 - Kernel launch/resources (steady run):
@@ -29,7 +29,7 @@
   - SIA3 scheduling and GR/LW per-MFMA shaping: `~/rocm-libraries/shared/tensile/Tensile/KernelWriter.py`
   - stagger-U SRD offset/wrap logic: `~/rocm-libraries/shared/tensile/Tensile/KernelWriterAssembly.py`
 - Main optimization implication for our HIP kernel:
-  - matching tile/workgroup alone is insufficient; the remaining gap is mostly from fine-grained pipeline scheduling/dataflow, not occupancy.
+  - matching tile/workgroup alone is insufficient. The remaining gap is mostly from fine-grained pipeline scheduling/dataflow, not occupancy.
 
 ## Scope and artifacts
 
@@ -74,7 +74,7 @@ Launch/resources (from `kernels` table):
 - min/avg/max duration: `37.657 ms / 40.186 ms / 41.316 ms`
 
 Occupancy implication (using `gfx1151_reference.md` limits):
-- Wave size is 32; `workgroup_x=128` => 4 waves/workgroup.
+- Wave size is 32. `workgroup_x=128` => 4 waves/workgroup.
 - VGPR-limited waves/SIMD: `floor(1536 / 256) = 6`.
 - LDS-limited workgroups/WGP: `floor(128KB / 17408) = 7` => `floor(7 * 4 / 4) = 7` waves/SIMD from LDS.
 - Therefore occupancy is VGPR-limited at `min(6, 7, 16) / 16 = 37.5%`, i.e. 6 resident waves per SIMD.
@@ -151,7 +151,7 @@ Torch side non-GEMM kernels remain:
 - fp8->fp16 pre-cast: `0.952 ms`
 - post-GEMM fused epilogue: `1.039 ms`
 
-So, launch-shape matching alone did not close the gap; it regressed HIP fused-kernel time in this run.
+So, launch-shape matching alone did not close the gap. It regressed HIP fused-kernel time in this run.
 
 ### Additional torch kernel metadata confirmed
 

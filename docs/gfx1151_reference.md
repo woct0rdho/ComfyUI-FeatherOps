@@ -123,13 +123,14 @@ $ROCM_PATH/bin/rocprofv3 \
 ```
 
 - GFX11.5 hardware stochastic sampling only supports `cycles` (not `time`), and the interval must be a power of 2 (e.g., `1048576` cycles). Using `time` or non-power-of-2 intervals will result in a "configuration is not supported" error.
-- Default output is SQLite (rocpd format). Current rocpd schema version remains `4` for internal PC-sampling output.
-- `rocpd_pc_sampling` contains common sample columns plus `method`: `method`, `timestamp`, `exec_mask`, `dispatch_id`, `instruction`, `instruction_comment`, `correlation_id`.
+- Default output is SQLite (rocpd format). The DB reports it in `rocpd_metadata` as `schema_version` plus `schema_version_major`/`schema_version_minor`/`schema_version_patch` rows.
+- `rocpd_pc_sampling` contains common sample columns plus `method`: `method`, `timestamp`, `exec_mask`, `dispatch_id`, `instruction`, `instruction_comment`, `correlation_id`. Samples are attributed to a dispatch, so `dispatch_id`/`correlation_id` (JSON `dispatch_id`/`corr_id.internal`) join a sample to its dispatch and kernel records. No foreign key is declared, so join on the raw values.
 - `method` is either `host_trap` or `stochastic`, so mixed-method databases are unambiguous.
-- Stochastic rocpd rows also include the same decoded fields exposed by stochastic CSV: `wave_issued_instruction`, `instruction_type`, `stall_reason`, and `wave_count`. These columns are null for host-trap rows.
+- Stochastic rocpd rows also include the same decoded fields exposed by stochastic CSV: `wave_issued_instruction`, `instruction_type`, `stall_reason`, and `wave_count`. These columns are null for host-trap rows, and `wave_count` is always `0` on gfx1151 (see the snapshot-layout note below).
 - Add `-f csv` for CSV output when a flat text artifact is easier to inspect.
 - rocprofv3 decodes PCs to instruction text directly (no manual PC-to-disassembly mapping needed).
-- gfx1151 stochastic metadata uses the local KFD IOCTL v1.5/gc12-style layout: raw instruction type comes from `SQ_PERF_SNAPSHOT_DATA[5:2]`, stall reason from `[8:6]`, sampling-lock error from bit 14, wave count from `SQ_PERF_SNAPSHOT_DATA1[5:0]`, and arbiter issue/stall state from `DATA1[24:9]`.
+- gfx1151 stochastic metadata uses the local KFD IOCTL v1.5/gc12-style layout: raw instruction type comes from `SQ_PERF_SNAPSHOT_DATA[5:2]`, stall reason from `[8:6]`, and sampling-lock error from bit 14.
+- RDNA3.5 has no `SQ_PERF_SNAPSHOT_DATA1`/`DATA2` register: the ISA's `OPR_HWREG` id table lists only `perf_snapshot_pc_lo`/`perf_snapshot_pc_hi` (18/19) and `perf_snapshot_data` (27), and id 28 is `SQ_WAVE_IB_STS2`. `SQ_PERF_SNAPSHOT_DATA1` carries the wave count (`[5:0]`) and arbiter issue/stall state (`[24:9]`) on gfx12 only, so on gfx1151 those fields do not exist in hardware. `wave_count` and the arbiter bits are therefore always `0` in CSV, JSON, and rocpd output. Do not treat `wave_count == 0` as invalid, and do not build analysis on the arbiter issue/stall bits.
 - Conditional branch samples preserve the raw hardware branch taken/not-taken outcome. Decoded `s_cbranch*` text alone should not be treated as proof that the branch was taken.
 
 ### Interpreting PC Sampling Data

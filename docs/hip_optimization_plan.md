@@ -109,7 +109,7 @@ Compiler hides these waits by interleaving conversion VALU. E.8 proved eliminati
 
 Beats `torch_compiled` (31.494 TFLOPS) at N=8192 by +14.7%.
 
-Note: benchmarks affected by thermal throttling; gains <2% should be interpreted with caution.
+Note: benchmarks affected by thermal throttling. Gains <2% should be interpreted with caution.
 
 We've updated the benchmark scripts to use longer repetition time for more steady results. The above benchmark results are now invalid and we need to benchmark the baseline again.
 
@@ -145,13 +145,13 @@ Operates within wave32 only. Cannot distribute data between the 8 waves in our w
 
 ### Tile shape changes cannot improve LDS throughput alone
 
-Direction H (`kRepeatM=8, kRepeatN=2`) proved that reducing total LDS instruction count by 43% yields zero speedup. The reason: in the (4,4) config, B reads' WAW waits are filled by conversion VALU (effectively free work). Replacing B reads with A reads trades "B read + free VALU filling stalls" for "A reads + idle stall slots". The LDS+VALU+WMMA interleaving is a tightly coupled system; reducing any one component doesn't help because it removes the latency-hiding work for the others. Any approach that merely reshuffles LDS reads between A and B will be neutral or negative.
+Direction H (`kRepeatM=8, kRepeatN=2`) proved that reducing total LDS instruction count by 43% yields zero speedup. The reason: in the (4,4) config, B reads' WAW waits are filled by conversion VALU (effectively free work). Replacing B reads with A reads trades "B read + free VALU filling stalls" for "A reads + idle stall slots". The LDS+VALU+WMMA interleaving is a tightly coupled system. Reducing any one component doesn't help because it removes the latency-hiding work for the others. Any approach that merely reshuffles LDS reads between A and B will be neutral or negative.
 
 ## Rejected Experiments (Do Not Repeat)
 
 ### Direction A: Reduce conversion VALU - REJECTED
 
-Kernel is LDS-bound; reducing VALU removes latency-hiding work (insight #1).
+Kernel is LDS-bound. Reducing VALU removes latency-hiding work (insight #1).
 
 ### Direction C: kUnrollK=4 - REJECTED
 

@@ -32,8 +32,8 @@
   - direct B conversion call in-loop (`fp8e4m3fn_to_fp16(b)`)
 - Latest compiler-path status:
   - Step11 non-k B vec2 shared-layout change is currently kept in local Triton (`~/triton` `feather`).
-  - Step12 vec4 follow-up was rejected (no stable metric gain; backend output effectively unchanged vs Step11).
-  - Step13 perPhase/maxPhase follow-up was rejected (no spill, but clear regression); local Triton is reverted to Step11 vec2.
+  - Step12 vec4 follow-up was rejected (no stable metric gain. Backend output effectively unchanged vs Step11).
+  - Step13 perPhase/maxPhase follow-up was rejected (no spill, but clear regression). Local Triton is reverted to Step11 vec2.
   - Previous failed compiler-path attempts (Step08/Step09) remain reverted.
 - Best current fixed-config metric (`N=8192`):
   - Triton: `45.028 ms` (`24.418 TFLOPS`) from repeat run
@@ -91,16 +91,16 @@ Conclusion:
 
 ### Step03 (kept) - interior/edge split
 
-- Change: interior no modulo; edge masked correctness path.
+- Change: interior no modulo. Edge masked correctness path.
 - metric: improved to Triton `47.234 ms`.
 - Why kept: measurable win with stable counters.
 - Artifacts: `triton_hip_compare_fixed_step03/*`.
 
 ### Step04 (kept) - interior-only policy + constrained tests
 
-- Change: removed edge path; enforced constrained inputs; pruned incompatible configs.
+- Change: removed edge path. Enforced constrained inputs. Pruned incompatible configs.
 - metric: near-neutral vs Step03 (`47.266 ms`), still better than Step01.
-- Notes: early runs hit intermittent KFD/rocprof instability; later runs recovered.
+- Notes: early runs hit intermittent KFD/rocprof instability. Later runs recovered.
 - Artifacts: `triton_hip_compare_fixed_step05/*`.
 
 ### Step05 (rejected, reverted) - manual K-loop prefetch
@@ -119,9 +119,9 @@ Conclusion:
 
 ### Step07 (kept) - minimal B conversion rewrite
 
-- Change: use direct `fp8e4m3fn_to_fp16(b)` call in loop; keep control structure.
+- Change: use direct `fp8e4m3fn_to_fp16(b)` call in loop. Keep control structure.
 - metric: Triton `47.171 ms` (repeat `47.071 ms`).
-- Profiling: Triton median `48.164 ms`; static counters unchanged from Step04.
+- Profiling: Triton median `48.164 ms`. Static counters unchanged from Step04.
 - Why kept: small positive fixed-config gain, no counter regression.
 - Artifacts: `triton_hip_compare_fixed_step08/*`.
 
@@ -144,7 +144,7 @@ Conclusion:
 - metric (fixed `N=8192`): Triton `93.505 ms` (repeat `93.640 ms`) vs HIP `30.675/30.836 ms`.
 - Profiling/codegen deltas vs Step07 baseline:
   - Triton profile median `48.164 -> 94.143 ms`.
-  - `VGPR: 216 -> 256`; scratch/private segment still present (`scratch_size=128`, private segment fixed size `128`).
+  - `VGPR: 216 -> 256`. Scratch/private segment still present (`scratch_size=128`, private segment fixed size `128`).
   - Static `v_perm_b32` stayed high at `320` (vs Step07 `128`), scratch ops reduced vs Step08 but not eliminated.
   - TTGIR B shared layout became `#shared1 vec=1 order=[0,1]`.
 - Reject reason: despite improving over Step08, it remains `2.0x` slower than Step07 and violates no-spill guardrails.
@@ -159,7 +159,7 @@ Conclusion:
   - Triton profile median `48.164 -> 107.994 ms`.
   - `VGPR: 216 -> 256` (rocprof metadata), scratch/private segment enabled (`scratch_size=580`, private segment fixed size `580`).
   - Static ISA shifted to global memory ops (`buffer_load/store -> 0`, `global_load/global_store` increased), but `v_perm_b32` and waits worsened (`128 -> 188`, `108 -> 169`).
-- Reject reason: opcode-style proximity to HIP did not translate to performance; register pressure and spill overhead dominate.
+- Reject reason: opcode-style proximity to HIP did not translate to performance. Register pressure and spill overhead dominate.
 - Action taken: keep default `AMDGCN_USE_BUFFER_OPS=1` as required baseline behavior.
 - Artifacts: `triton_hip_compare_fixed_step11/*`.
 
@@ -193,10 +193,10 @@ Conclusion:
 - metric (fixed `N=8192`): Triton `48.767 ms` (repeat `48.895 ms`) vs HIP `30.872/30.679 ms`.
 - Profiling/codegen deltas vs Step11 baseline:
   - Triton profile median `46.532 -> 50.457 ms`.
-  - No spill regression: private segment fixed size `0`, scratch disabled; but rocprof `VGPR` increased `216 -> 224`.
+  - No spill regression: private segment fixed size `0`, scratch disabled. But rocprof `VGPR` increased `216 -> 224`.
   - TTGIR B shared layout changed `#shared1 vec=2, perPhase=1, maxPhase=1 -> vec=2, perPhase=2, maxPhase=8`.
   - Static counters worsened (`s_waitcnt 117 -> 144`, `.amdhsa_next_free_vgpr 210 -> 220`) while `v_perm_b32` stayed `188`.
-- Reject reason: clear runtime regression despite meeting no-spill guardrails; added scheduling/wait pressure outweighs any layout benefit.
+- Reject reason: clear runtime regression despite meeting no-spill guardrails. Added scheduling/wait pressure outweighs any layout benefit.
 - Action taken: reverted local Triton back to Step11 vec2 (`perPhase=1`, `maxPhase=1`), rebuilt wheel, reinstalled local Triton.
 - Artifacts: `triton_hip_compare_fixed_step14/*`.
 
@@ -224,7 +224,7 @@ Conclusion:
   - `pip install --force-reinstall dist/triton-3.6.0+git917dbde5-cp313-cp313-linux_x86_64.whl`
 - Verify active install:
   - `pip show triton`
-- Important: wheel filename/version may stay unchanged across local rebuilds; treat each rebuild as new binary content even when name is identical.
+- Important: wheel filename/version may stay unchanged across local rebuilds. Treat each rebuild as new binary content even when name is identical.
 
 ## Non-Negotiable Run Protocol
 
@@ -262,7 +262,7 @@ Conclusion:
 - Scope next compiler experiments to HIP-parity-oriented changes that preserve no-spill guardrails:
   - `.amdhsa_next_free_vgpr < 256`
   - `.amdhsa_private_segment_fixed_size == 0`
-- Keep default `AMDGCN_USE_BUFFER_OPS=1`; no more env-level buffer-op toggles without a new precondition.
+- Keep default `AMDGCN_USE_BUFFER_OPS=1`. No more env-level buffer-op toggles without a new precondition.
 - New baseline for compiler-path gating is Step11 fixed repeat (`45.028 ms`).
 - Candidate directions:
   - target B conversion/permute lowering in compiler passes (e.g., `OptimizeDotOperands`) while preserving Step11 shared-order behavior,
