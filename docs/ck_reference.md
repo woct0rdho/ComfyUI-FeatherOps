@@ -122,4 +122,4 @@ If needed later, next step is to extract/disassemble the AMDGPU code object from
   - vectorized global read,
   - vectorized LDS write,
   - `M+1` LDS padding.
-- Matching only one of these in HIP is usually insufficient; parity work should treat them as one bundle.
+- Matching only one of these in HIP is usually insufficient. Parity work should treat them as one bundle.

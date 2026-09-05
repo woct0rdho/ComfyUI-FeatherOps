@@ -64,7 +64,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - Implemented fix: change FP16 prepack to keep logical N order while preserving `(K/8, N, 8)` vec8 chunks, and change compute-side B LDS reads to identity mapping.
 - Final validation (`rocprof_fp16_bank_identity_final/`, forced `(1,8,2,8,2)`): `LDSBankConflict = 0.0%`, average profiled kernel time `37.9 ms`.
 - Full benchmark result (`python benchmark_mm_hip_fp16.py`): `N=8192` 27.4 TFLOPS (up from 26.7), with the winner config still `(1,8,2,8,2)`.
-- Key takeaway: B prepack is useful for 128-bit transport, but it does not need the old swizzled-N order; identity-order prepack keeps the same LDS footprint and removes bank conflicts.
+- Key takeaway: B prepack is useful for 128-bit transport, but it does not need the old swizzled-N order. Identity-order prepack keeps the same LDS footprint and removes bank conflicts.
 
 ### P2: Bottleneck Profiling For `(1,8,2,8,2)` - KEEP analysis
 
@@ -81,7 +81,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - `s_waitcnt vmcnt(1) 223,978 cycles`
   - `s_waitcnt vmcnt(0) 102,154 cycles`
   - aggregated trace latency is dominated by `Sync` (`9.45M cycles`) while `WMMA` contributes only `0.95M cycles`
-- No-detail ATT at `N=8192` (`thread_trace_fp16_8192_nodetail/`) succeeds without GPU reset and is qualitatively wait-dominated, but still reports `Thread trace buffer full!`; it is useful for occupancy/wave-state analysis, not detailed per-instruction timing.
+- No-detail ATT at `N=8192` (`thread_trace_fp16_8192_nodetail/`) succeeds without GPU reset and is qualitatively wait-dominated, but still reports `Thread trace buffer full!`. It is useful for occupancy/wave-state analysis, not detailed per-instruction timing.
 - PMC check (`rocprof_fp16_bottleneck_pmcs_try/`) shows:
   - `LDSBankConflict = 0.0`
   - `L2CacheHit 32.5`
@@ -89,7 +89,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - Main conclusion: after fixing B bank conflicts, the `(1,8,2,8,2)` kernel is bottlenecked by serialized chunk-boundary refill + synchronization. The current loop computes the whole current chunk, then hits a barrier, then fetches the next chunk, then hits another barrier. There is effectively no overlap between next-chunk global refill and current-chunk WMMA.
 - Controlled C++ ablation benchmark (`tmp_fp16_analysis/mm_fp16_vram_lds_ablation.cu`, `tmp_fp16_analysis/benchmark_mm_fp16_vram_lds_ablation.cpp`) now isolates the chunk-refill path without Python/Torch overhead and without zero-input bias:
   - Forced config only: `(1,8,2,8,2)`
-  - Kept method: load the first chunk from real random fp16 inputs, then for later chunks selectively reuse the already-random LDS contents instead of refilling from global memory; this avoids the known `WMMA-with-zeros` speedup while also avoiding synthetic-PRNG overhead in the timed loop.
+  - Kept method: load the first chunk from real random fp16 inputs, then for later chunks selectively reuse the already-random LDS contents instead of refilling from global memory. This avoids the known `WMMA-with-zeros` speedup while also avoiding synthetic-PRNG overhead in the timed loop.
   - Repeated `N=8192` runs (2 passes, 100 timed iters each) give mean kernel times:
     - `full`: `40.16 ms` (`27.38 TFLOPS`)
     - `reuse_a`: `34.76 ms` (`delta 5.41 ms`, `13.5%` of full time)
@@ -97,12 +97,12 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - `reuse_ab`: `24.96 ms` (`delta 15.21 ms`, `37.9%` of full time, `44.06 TFLOPS`)
   - Interpretation:
     - `15.21 ms` of the `40.16 ms` end-to-end kernel time is tied to the repeated global/L2->LDS refill path for this config.
-    - The B-side refill dominates the exposed cost; that matches the larger per-chunk B payload (`16 KB`) versus A (`8 KB`) for `(1,8,2,8,2)`.
+    - The B-side refill dominates the exposed cost. That matches the larger per-chunk B payload (`16 KB`) versus A (`8 KB`) for `(1,8,2,8,2)`.
     - The A-only and B-only deltas are not additive (`5.4 + 13.7 > 15.2 ms`), so the refill costs share fixed sync/issue overhead and interact with each other.
     - With both refills removed, the kernel rises to `44.06 TFLOPS`, which is strong evidence that the math/LDS-read body is already capable of near-FP8-class throughput once chunk refills are taken out of the critical path.
 - Controlled C++ ablation benchmark for the compute-side LDS->VGPR path (`tmp_fp16_analysis/mm_fp16_lds_vgpr_ablation.cu`, `tmp_fp16_analysis/benchmark_mm_fp16_lds_vgpr_ablation.cpp`) now measures the *exposed* cost of the inner `ds_read -> VGPR` fragment loads while keeping global refill intact:
   - Forced config only: `(1,8,2,8,2)`
-  - Kept method: always use real random fp16 A/B input tensors; inside the compute stage, selectively reuse already-loaded random fragments to remove part of the LDS->VGPR traffic without introducing zero operands.
+  - Kept method: always use real random fp16 A/B input tensors. Inside the compute stage, selectively reuse already-loaded random fragments to remove part of the LDS->VGPR traffic without introducing zero operands.
   - To avoid changing occupancy with long-lived fragment caches, the A-side study uses a *pairwise* reuse mode (`reuse_a_p2`): the kernel loads A from LDS on even `rm` and reuses that fragment for the next odd `rm`, so 50% of A LDS->VGPR loads are removed. The B-side study (`reuse_b`) loads only one of the two `rn` fragments and reuses it for the second tile, so 50% of B LDS->VGPR loads are removed.
   - Repeated `N=8192` runs (2 passes, 100 timed iters each) give mean kernel times:
     - `full`: `40.37 ms` (`27.23 TFLOPS`)
@@ -111,9 +111,9 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - `reuse_ab_p2` (50% A + 50% B removed): `37.71 ms` (`delta 2.67 ms`, `6.61%`)
   - Interpretation:
     - The exposed LDS->VGPR cost is heavily B-side dominated on this config.
-    - A-side LDS->VGPR reads are close to noise-floor in this experiment; either their direct cost is very small, or they are largely hidden by the existing schedule.
+    - A-side LDS->VGPR reads are close to noise-floor in this experiment. Either their direct cost is very small, or they are largely hidden by the existing schedule.
     - The `reuse_b` delta implies that the full B LDS->VGPR fragment load cost is on the order of `6-7 ms` if the effect scaled linearly, but treat that as an upper estimate rather than a strict decomposition.
-    - The combined half-ablation is not additive, which means these inner LDS reads interact with the surrounding instruction schedule; simple per-side deltas should be read as *exposed* cost, not exact standalone service time.
+    - The combined half-ablation is not additive, which means these inner LDS reads interact with the surrounding instruction schedule. Simple per-side deltas should be read as *exposed* cost, not exact standalone service time.
 
 ### P3: B-Only Full-Chunk Prefetch Under WMMA - KEEP
 
@@ -141,7 +141,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - regression reason: the intended register-prefetch state was effectively lowered into compiler-managed LDS, destroying occupancy.
   - `REJECT`: scalarized rolling one-stage B prefetch with per-stage commit
     - correctness passed and metadata returned to `LDS=24576 B`, but the added mid-chunk barrier/control cost limited `N=8192` to 26.9 TFLOPS.
-    - regression reason: preserving the current LDS footprint was not enough; the extra synchronization erased the overlap gain.
+    - regression reason: preserving the current LDS footprint was not enough. The extra synchronization erased the overlap gain.
 - Why the small/medium-N autotune guard is kept:
   - On `N=2048`, the runtime `old_autotune` short probe window incorrectly preferred `(1,8,2,8,2)` even though the benchmark harness (`triton.testing.do_bench`) measured that config slower than `(4,2,2,2,4)` / `(4,2,4,2,4)`.
   - Restricting `(1,8,2,8,2)` to `N >= 4096` matches the observed crossover after P3 and removes the end-to-end `2048` regression.
@@ -218,7 +218,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - shapes:
     - target / crossover set: `(32,12288,2048)`, `(32,2048,12288)`, `(128,12288,2048)`, `(128,2048,12288)`, `(512,12288,2048)`, `(512,2048,12288)`, `(2048,12288,2048)`, `(2048,2048,12288)`, `(8192,12288,2048)`, `(8192,2048,12288)`
 - Main sweep result:
-  - the old A-side rule was effectively just `repeat_m <= 4`; with B-prefetch left on auto, that is too broad.
+  - the old A-side rule was effectively just `repeat_m <= 4`. With B-prefetch left on auto, that is too broad.
   - A-WSGR is clearly negative on the wide `128x256` family `(1,8,*,8,2)`:
     - focused sweep confirms `(1,8,2,8,2)` is negative on every tested point, both short-K and long-K.
   - A-WSGR is clearly positive on the balanced square `128x128` / `u=2` family `(2,2,2,4,4)`:
@@ -257,17 +257,17 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 ### Durable Findings
 
 - Zero-conflict B LDS access is achievable without padding or larger LDS allocation.
-- For this FP16 kernel family, B swizzle was the source of LDS bank conflicts; identity-order B prepack is better.
+- For this FP16 kernel family, B swizzle was the source of LDS bank conflicts. Identity-order B prepack is better.
 - A-side swizzle is a bad direction on the current winner path (`46.5%` conflict rate in the isolation build).
 - The purpose of FP16 B prepack is to preserve vec8 / 128-bit transport, not specifically to preserve the old swizzled order.
 - After removing LDS bank conflicts, the dominant large-`N` bottleneck is global-refill latency amplified by workgroup-wide synchronization, not WMMA throughput.
-- A direct refill ablation on `(1,8,2,8,2)` attributes `38%` of `N=8192` wall time to repeated global/L2->LDS chunk refill; B-side refill is the larger exposed component.
-- A direct compute-side LDS->VGPR ablation shows the exposed inner-fragment load cost is much smaller than the global-refill cost and is mostly on the B side; A-side LDS->VGPR reads are near the noise floor in this schedule.
+- A direct refill ablation on `(1,8,2,8,2)` attributes `38%` of `N=8192` wall time to repeated global/L2->LDS chunk refill. B-side refill is the larger exposed component.
+- A direct compute-side LDS->VGPR ablation shows the exposed inner-fragment load cost is much smaller than the global-refill cost and is mostly on the B side. A-side LDS->VGPR reads are near the noise floor in this schedule.
 - `FP Convert` and general `VALU` are not important bottlenecks on the FP16 kernel (`PC sampling: FP Convert 0.1%, VALU Other 1.3%`).
 - `LDS Read` remains a secondary issue-pressure hotspot, but the first thing to attack is the serialized refill/barrier structure around `s_waitcnt vmcnt(*)` and `s_barrier`.
-- For unstable large-`N` ATT on gfx1151, use no-detail ATT first; detailed `N=8192` ATT is still unsafe on the current tooling stack.
+- For unstable large-`N` ATT on gfx1151, use no-detail ATT first. Detailed `N=8192` ATT is still unsafe on the current tooling stack.
 - On gfx1151, practical latency hiding for this kernel should be treated as a software-pipelining / occupancy problem, not a search for a magical async global->LDS primitive.
-- gfx10+ HIP compute defaults to WGP mode; CU mode is not the default path. That matters because some LDS-direct mechanisms are CU-mode-specific, so any CU-mode experiment should be treated as a separate, toolchain-dependent branch rather than the default optimization direction.
+- gfx10+ HIP compute defaults to WGP mode. CU mode is not the default path. That matters because some LDS-direct mechanisms are CU-mode-specific, so any CU-mode experiment should be treated as a separate, toolchain-dependent branch rather than the default optimization direction.
 - Direct global->LDS is not a primary near-term path for this kernel on gfx1151:
   - the older async-to-LDS intrinsics are documented for gfx9/gfx10,
   - the newer `global.load.async.to.lds.b{8,32,64,128}` path is gfx1250+,
@@ -363,7 +363,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 
 ### G4: Layout Branch If The New Kernel Family Needs It
 
-- Rationale: single-config performance is the priority; a better layout is acceptable if it unlocks the hipBLASLt-class schedule.
+- Rationale: single-config performance is the priority. A better layout is acceptable if it unlocks the hipBLASLt-class schedule.
 - Candidate directions:
   - kernel-specific B prepack tuned for `128x96x64`,
   - optional A-side layout/prepack if it simplifies vectorized global->LDS scheduling,
@@ -372,7 +372,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - benchmark layout variants only in the native C++ harness,
   - keep prepack out of the timed region,
   - compare only within the same harness and layout contract.
-- Decision: keep only if the layout change enables a faster kernel; do not keep layout churn by itself.
+- Decision: keep only if the layout change enables a faster kernel. Do not keep layout churn by itself.
 
 ### G5: Reconnect Python And Autotune Only After The Single-Config Gap Is Mostly Closed
 

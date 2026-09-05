@@ -4,7 +4,7 @@
 
 - Target kernel family: prepacked B (fp8 bytes), winner track centered on `1,8,2,2,8,2`.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Primary metric: benchmark TFLOPS (kernel runtime); profile kernel-time is diagnostic only.
+- Primary metric: benchmark TFLOPS (kernel runtime). Profile kernel-time is diagnostic only.
 - Keep rule:
   - correctness passes,
   - `N=8192` does not regress,
@@ -27,7 +27,7 @@ From target-kernel-only profiling (`P11-B6a`, forced `1,8,2,2,8,2`, `N=8192`):
 - Bandwidth sanity:
   - bytes floor (A fp16 + B fp8 + C fp16): `335.5 MB`,
   - bandwidth floor @ 200 GB/s: `1.678 ms`,
-  - arithmetic intensity very high; this path is not DRAM-bandwidth-limited.
+  - arithmetic intensity very high. This path is not DRAM-bandwidth-limited.
 - Instruction mix (target kernel):
   - VALU 58.2%, LDS 13.6%, OTHER 28.3% (`SQ_WAVE32_INSTS` basis).
 
@@ -81,14 +81,14 @@ Interpretation:
 
 ## Durable Findings
 
-- fp8-byte transport is mandatory; fp16-prepack paths were large regressions.
+- fp8-byte transport is mandatory. fp16-prepack paths were large regressions.
 - `1,8,2,2,8,2` no-swizzle is the strongest robust winner at large N.
 - Stage4 overlap direction is non-viable on this hardware/kernel family.
 - Epilogue is a minor contributor (no-scale/no-bias gave only `+0.35%`).
 - Conversion approximation slack is small (aggressive approximations fail gate).
-- Removing `v_perm` alone does not guarantee speedup; replacement ops can cancel gains.
+- Removing `v_perm` alone does not guarantee speedup. Replacement ops can cancel gains.
 - Forced-config cache pitfall is real (`_get_forced_config` cache must be cleared in same-process A/B scripts).
-- Benchmark wins are the decision metric; profile-time and counters are supporting evidence.
+- Benchmark wins are the decision metric. Profile-time and counters are supporting evidence.
 
 ## Do-Not-Repeat (Unless New Preconditions)
 

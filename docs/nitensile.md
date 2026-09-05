@@ -11,9 +11,9 @@ Public contract:
 - Epilogue: scalar fp32 scale plus fp16 output-vector bias over public `N`.
 
 Current status:
-- Average-speed recommendation is `SU32/SUS128`. Longer same-input direct comparison, `--warmup 12 --iters 64`: baseline `SU32/SUS256` TensileLite avg `23.811 ms / 46.177 TFLOP/s`, best `46.635`; `SU32/SUS128` TensileLite avg `23.780 ms / 46.237 TFLOP/s`, best `46.663`. Both are correct with no NaNs, `mismatches(abs>0.25)=0`, and max abs diff `0.25`.
+- Average-speed recommendation is `SU32/SUS128`. Longer same-input direct comparison, `--warmup 12 --iters 64`: baseline `SU32/SUS256` TensileLite avg `23.811 ms / 46.177 TFLOP/s`, best `46.635`. `SU32/SUS128` TensileLite avg `23.780 ms / 46.237 TFLOP/s`, best `46.663`. Both are correct with no NaNs, `mismatches(abs>0.25)=0`, and max abs diff `0.25`.
 - `SU32/SUS128` generated TensileLite client config was not hot-loop by default (`num-enqueues-per-sync=1`, `num-warmups=3`, `sleep-percent=300`). Hot-loop retime of the same generated code object with `num-warmups=20`, `num-enqueues-per-sync=10`, and `sleep-percent=0` passed all 10 samples: median `46.121 TFLOP/s`, mean `46.109 TFLOP/s`, best `46.330 TFLOP/s`, derived median time `23.840 ms`.
-- Prior `SU32/SUS256` reference run, `--warmup 10 --iters 32`: HIP avg `24.410 ms / 45.043 TFLOP/s`; TensileLite avg `23.759 ms / 46.277 TFLOP/s`, best `46.715`. No NaNs, `mismatches(abs>0.25)=0`, max abs diff `0.25`.
+- Prior `SU32/SUS256` reference run, `--warmup 10 --iters 32`: HIP avg `24.410 ms / 45.043 TFLOP/s`. TensileLite avg `23.759 ms / 46.277 TFLOP/s`, best `46.715`. No NaNs, `mismatches(abs>0.25)=0`, max abs diff `0.25`.
 
 Direct TensileLite launch and the TensileLite client agree in the same performance regime. For routine tuning, compare TensileLite client benchmark results against the HIP C++ benchmark. Use the direct same-input runner for semantic changes, ABI/kernarg changes, or final claims.
 
@@ -101,12 +101,12 @@ Retained resource state:
 
 Core matmul finite-input performance:
 - TensileLite client exact-HIP `A16/B8`: best `46.702 TFLOP/s`, median `46.375 TFLOP/s`, mean `46.125 TFLOP/s`.
-- Direct same-input core finite run: TensileLite avg `46.244 TFLOP/s`, best `46.707 TFLOP/s`; HIP core avg `45.103 TFLOP/s`.
+- Direct same-input core finite run: TensileLite avg `46.244 TFLOP/s`, best `46.707 TFLOP/s`. HIP core avg `45.103 TFLOP/s`.
 
 Scale+bias performance:
 - Current `SU32/SUS128` direct same-input, `alpha=2.34`, `--warmup 12 --iters 64`: TensileLite avg `46.237 TFLOP/s`, best `46.663 TFLOP/s`. Matched baseline correctness. This has the best measured direct average so far.
 - Current `SU32/SUS128` TensileLite client hot-loop, `alpha=Two`: median `46.121 TFLOP/s`, mean `46.109 TFLOP/s`, best `46.330 TFLOP/s`. All 10 validation runs passed. This uses the generated client/reference path, not the direct same-input runner.
-- Prior `SU32/SUS256` direct same-input, `--warmup 10 --iters 32`: TensileLite avg `46.277 TFLOP/s`, best `46.715 TFLOP/s`; HIP avg `45.043 TFLOP/s`. Keep it as a conservative reference because timing noise is non-trivial.
+- Prior `SU32/SUS256` direct same-input, `--warmup 10 --iters 32`: TensileLite avg `46.277 TFLOP/s`, best `46.715 TFLOP/s`. HIP avg `45.043 TFLOP/s`. Keep it as a conservative reference because timing noise is non-trivial.
 - Prior `SU32/SUS256` TensileLite client with `alpha=Two`: passed validation, best `46.294 TFLOP/s`, mean `45.633 TFLOP/s`.
 
 Current code/config paths:
@@ -250,7 +250,7 @@ Speed sweep tooling:
 - Updated `tmp_nitensile/scripts/same_input_hip_tensile.cu` with `--stagger-u` and `--stagger-u-stride`. Rebuilt with `-DNO_PYTORCH`. Direct launch still assumes `WorkGroupMapping=4` in `kernel_info1`.
 
 Speed sweep results around `DepthU=64`:
-- `StaggerU x StaggerUStride`: all full-client candidates passed. Direct validation favored `SU32/SUS128` for average speed. Longer `--warmup 12 --iters 64` direct comparison: baseline `SU32/SUS256` TensileLite avg `46.177 TFLOP/s`, best `46.635`; candidate `SU32/SUS128` avg `46.237`, best `46.663`. Both correct with no NaNs and `mismatches(abs>0.25)=0`.
+- `StaggerU x StaggerUStride`: all full-client candidates passed. Direct validation favored `SU32/SUS128` for average speed. Longer `--warmup 12 --iters 64` direct comparison: baseline `SU32/SUS256` TensileLite avg `46.177 TFLOP/s`, best `46.635`. Candidate `SU32/SUS128` avg `46.237`, best `46.663`. Both correct with no NaNs and `mismatches(abs>0.25)=0`.
 - `SU64/SUS256` passed client timing with mean `46.205`, but direct validation was slower than baseline: TensileLite avg `45.999`, best `46.597`. Do not promote.
 - Schedule/global-read batch anchored on `SU32/SUS128`: only `WaveSeparateGlobalReadB=0, ScheduleGlobalRead=1, ScheduleLocalWrite=1` passed, and it was slower (`best 46.472`, mean `45.819`). `ScheduleLocalWrite=0` hit `_makeSubIterSchedule` `IndexError: pop from empty list`. `ScheduleGlobalRead=0, ScheduleLocalWrite=1` generated wrong results.
 - Store-path batch anchored on `SU32/SUS128`: client noise favored `SPO=False/GLS=True/NEPBS=8/16`, but direct validation was slower (`NEPBS=16` avg `45.537`, `NEPBS=8` avg `45.611`). Keep `StorePriorityOpt=True`, `GroupLoadStore=False`, `NEPBS=0`.
@@ -260,11 +260,11 @@ Speed sweep results around `DepthU=64`:
 - `ScheduleIterAlg` batch anchored on `SU32/SUS128`: `SIA=0/1` were rejected and `SIA=2` produced no valid solution. Keep `ScheduleIterAlg=3`.
 
 Resource and occupancy experiments:
-- Retained DU64 assembly high-water: `ValuC v0-v127`; address temps `v128-v139`; `vgprBase=140`; `ValuA/B` and conversion temp `v140-v222`; `vgprSerial=223`; A G2L `v224-v239`; B G2L `v240-v255`.
+- Retained DU64 assembly high-water: `ValuC v0-v127`, address temps `v128-v139`, `vgprBase=140`, `ValuA/B` and conversion temp `v140-v222`, `vgprSerial=223`, A G2L `v224-v239`, B G2L `v240-v255`.
 - `PGR=0 + NEPBS=16` reduced resources to `226` VGPR / `36864` LDS but lost too much speed at full size: best `45.449`, mean `45.203`. Losing global prefetch costs more than the occupancy gain.
 - Balanced wave/store-cap variant `MatrixInstruction=[16,16,16,1,1,4,4,4,2]`, `PGR=2`, `NEPBS=16` reached `240` VGPR / `36864` LDS but was slower: best `45.559`, mean `44.765`.
 - `PGR=2` G2L/ValuB aliasing is unsafe: second prefetched G2LB data must survive until late local-write while ValuB is overwritten by local reads during compute.
-- `DepthU=32 + PGR=2 + NEPBS=16` is the best resource point so far at `236` VGPR / `18432` LDS. Full client best `46.331`, mean `45.281`; direct `SU32` avg `46.034`; direct `SU64` avg `46.190`. It is useful if resource footprint matters, but it is not the speed winner.
+- `DepthU=32 + PGR=2 + NEPBS=16` is the best resource point so far at `236` VGPR / `18432` LDS. Full client best `46.331`, mean `45.281`, direct `SU32` avg `46.034`, direct `SU64` avg `46.190`. It is useful if resource footprint matters, but it is not the speed winner.
 - DU32 store-cap retune did not improve speed: `NEPBS=20` full client best `46.126`, mean `45.391`. `NEPBS=0/24/32` exceeded the clean VGPR target or slowed down.
 - DU32 WGM/stagger retune did not beat DU64: `WGM=1/8` were slower, `SU16` was neutral/slower, and `SU64` improved mean but still did not beat DU64.
 - DU64 `GRVWB=4` and `GRVWA=8` both failed generation with the same AK16 `260`-VGPR overflow layout. Do not pursue lower DU64 global-read vector widths without allocator changes.

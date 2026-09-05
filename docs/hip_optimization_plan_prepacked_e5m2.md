@@ -78,28 +78,28 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 | P7 | REJECT | `s_setprio 2` | profile tiny up, benchmark down | non-robust |
 | P8 | REJECT config / KEEP infra | stage4 candidate + stage-index fix | correctness fixed, no speedup | keep fix, drop stage4 cfg |
 | P9 | KEEP baseline refinement | prepack output kept fp8 + wrapper dtype inference | correctness pass, `N=8192 43.77 TFLOPS` | cleaner API, no perf regression |
-| P10 | REJECT | stage2 split-phase software pipeline (winner path, A/B global->VGPR prefetch + wait + commit) | first version broke swizzle correctness; non-swizzle-restricted retry passed correctness but benchmark regressed (`N=8192 42.04 TFLOPS`) | overlap attempt cost exceeded gain; reverted |
-| P11 | REJECT | stage2 interleaved refill (`compute stage0 -> refill0 -> compute stage1 -> refill1`) | correctness failed | unsafe stage reuse hazard in 2-stage path; reverted |
-| P12 | REJECT | stage2 B-only split-phase prefetch (`prefetch B -> compute -> wait -> load A + commit B`) | correctness failed | hazard-prone on current schedule; reverted |
-| P13 | REJECT | stage2 B-only split-phase retry with `volatile uint4` prefetch buffer | compile failed | invalid implementation direction; reverted |
-| P14 | KEEP baseline simplification | remove swizzle toggle and overlap profiling modes; enforce stages=2 only | correctness pass; baseline maintained | matches winner path and scope |
+| P10 | REJECT | stage2 split-phase software pipeline (winner path, A/B global->VGPR prefetch + wait + commit) | first version broke swizzle correctness. Non-swizzle-restricted retry passed correctness but benchmark regressed (`N=8192 42.04 TFLOPS`) | overlap attempt cost exceeded gain. Reverted |
+| P11 | REJECT | stage2 interleaved refill (`compute stage0 -> refill0 -> compute stage1 -> refill1`) | correctness failed | unsafe stage reuse hazard in 2-stage path. Reverted |
+| P12 | REJECT | stage2 B-only split-phase prefetch (`prefetch B -> compute -> wait -> load A + commit B`) | correctness failed | hazard-prone on current schedule. Reverted |
+| P13 | REJECT | stage2 B-only split-phase retry with `volatile uint4` prefetch buffer | compile failed | invalid implementation direction. Reverted |
+| P14 | KEEP baseline simplification | remove swizzle toggle and overlap profiling modes, enforce stages=2 only | correctness pass, baseline maintained | matches winner path and scope |
 | PCS-1/2/3 | KEEP analysis | PC sampling (SQ_IND, Host-Trap, Stochastic) | Consistent 45% LDS, 23% Sync stall distribution | Uncovered `SQ_WAVE_INST` drift issue, confirmed accurate stall breakdown |
 | TT-1 | KEEP analysis | thread tracing timeline | Found 3,500-cycle gap between chunks | Proved wave is global-memory bound on `vmcnt`, plus instruction fetch bottleneck on `v_perm_b32` |
 | P15 | REJECT | hoist `v_perm_b32` literals to VGPRs | `N=8192` regressed 42.62 TFLOPS | did not fix VOP3 issue latency (VGPR read ports), compiler barrier worsened global memory scheduling (`vmcnt` stalls up 18%) |
-| P16 | KEEP | chunk size expansion (`unroll_k`=4,8) + `stages` cleanup | `N=8192` flat (43.1 TFLOPS), but HUGE gains on `N=1024..4096` (+15-35%) | verified code has no A/B double buffering (synchronous wait); increasing chunk size drastically reduces frequency of hitting the 3,500-cycle `vmcnt` stall |
+| P16 | KEEP | chunk size expansion (`unroll_k`=4,8) + `stages` cleanup | `N=8192` flat (43.1 TFLOPS), but HUGE gains on `N=1024..4096` (+15-35%) | verified code has no A/B double buffering (synchronous wait). Increasing chunk size drastically reduces frequency of hitting the 3,500-cycle `vmcnt` stall |
 | P17 | KEEP | remove `kBPad` and `kCPad` LDS padding | `N=8192` flat (44.6 TFLOPS) | `LDSBankConflict` PMC profiling proved bank conflicts are virtually zero (0.3%), padding was wasting LDS capacity without providing performance benefits |
-| P18 | KEEP | mixed-precision A WSGR auto heuristic refresh | current-nightly replays: square `6/7` exact, broad `12/14` exact, residual loss `<=0.329 TFLOPS` | refreshed sweeps moved the surviving `repeat_m=1` win region to `u=4 && K<=1024`; keep tall `repeat_m=2` and square `repeat_m=4` rules conservative |
-| P19 | KEEP analysis | mixed-precision VRAM->LDS refill ablation | exposed refill share is config-sensitive; current `8192^3` winner only gains `2%` from `reuse_ab` | unlike the older FP16 wide-tile path, current mixed winners are not uniformly refill-dominated |
-| P20 | KEEP analysis | mixed-precision fp8->fp16 decode ablation | current `8192^3` winner only gains `1.7%` from skipping decode while keeping the LDS->VGPR B load intact | on the new nightly, exposed decode cost is real but still smaller than the earlier suspected front-end bound; the square winner remains only weakly sensitive to this decode path in isolation |
+| P18 | KEEP | mixed-precision A WSGR auto heuristic refresh | current-nightly replays: square `6/7` exact, broad `12/14` exact, residual loss `<=0.329 TFLOPS` | refreshed sweeps moved the surviving `repeat_m=1` win region to `u=4 && K<=1024`. Keep tall `repeat_m=2` and square `repeat_m=4` rules conservative |
+| P19 | KEEP analysis | mixed-precision VRAM->LDS refill ablation | exposed refill share is config-sensitive. Current `8192^3` winner only gains `2%` from `reuse_ab` | unlike the older FP16 wide-tile path, current mixed winners are not uniformly refill-dominated |
+| P20 | KEEP analysis | mixed-precision fp8->fp16 decode ablation | current `8192^3` winner only gains `1.7%` from skipping decode while keeping the LDS->VGPR B load intact | on the new nightly, exposed decode cost is real but still smaller than the earlier suspected front-end bound. The square winner remains only weakly sensitive to this decode path in isolation |
 | P21 | KEEP analysis | mixed-precision LDS->VGPR fragment-load ablation | current `8192^3` winner gains `3.3%` from removing half of A LDS loads, `1.5%` from removing half of B LDS loads, and `6.1%` from removing half of both | compute-side fragment-load cost is measurable on the square winner, and the exposed A-side cost is larger than the exposed B-side cost on current nightly |
-| P22 | REJECT | mixed-precision A-only global->VGPR prefetch sweep | giant wins only on weak fixed configs (up to `1.99x`), but autotuned target-shape delta was only `+0.20%`, `-14.73%`, `+1.56%`, `-0.59%` | not robust on the winner path; reverted |
-| P23 | REJECT | mixed-precision B-only global->VGPR prefetch sweep | forced-`on` beat the new forced-`off` variants, but still lost to the last clean baseline on all four Qwen target shapes (`-1.15%`, `-20.91%`, `-3.23%`, `-4.26%` autotuned) | not a real keeper; reverted |
+| P22 | REJECT | mixed-precision A-only global->VGPR prefetch sweep | giant wins only on weak fixed configs (up to `1.99x`), but autotuned target-shape delta was only `+0.20%`, `-14.73%`, `+1.56%`, `-0.59%` | not robust on the winner path. Reverted |
+| P23 | REJECT | mixed-precision B-only global->VGPR prefetch sweep | forced-`on` beat the new forced-`off` variants, but still lost to the last clean baseline on all four Qwen target shapes (`-1.15%`, `-20.91%`, `-3.23%`, `-4.26%` autotuned) | not a real keeper. Reverted |
 
 ### P22: Mixed-Precision A-Only Prefetch Sweep - REJECT
 
 - Goal: test the FP16-style split schedule on the mixed-precision kernel by prefetching only A (`global -> VGPR`) before WMMA, then committing A to LDS after compute while leaving B on the old synchronous refill path.
 - Validation:
-  - correctness passed with the forced-on experiment across all 28 configs;
+  - correctness passed with the forced-on experiment across all 28 configs.
   - analysis artifacts live under `tmp_mixed_precision_analysis/`, especially:
     - `qwen_shape_sweep_prefetch_off.csv` / `qwen_shape_sweep_prefetch_on.csv`
     - `orientation_region_prefetch_off.csv` / `orientation_region_prefetch_on.csv`
@@ -112,22 +112,22 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
   - max relative win: `(8192, 2048, 12288)` with `(2,1,2,2,2)` improved `7.910 -> 15.762 TFLOPS` (`+99.25%`)
   - max absolute win: `(8192, 12288, 2048)` with `(2,1,2,2,2)` improved `16.583 -> 30.384 TFLOPS` (`+83.23%`)
 - Interpretation:
-  - the large gains are limited to weak, non-winning configs and do not translate into a meaningful end-to-end autotuned gain;
-  - in the short-K / wide-N orientation, some tall/wide configs such as `(1,8,4,8,2)` improved by `3-5%` once `M >= 1024`, but the strongest square winner `(2,4,4,4,4)` regressed by `2-4%`;
+  - the large gains are limited to weak, non-winning configs and do not translate into a meaningful end-to-end autotuned gain.
+  - in the short-K / wide-N orientation, some tall/wide configs such as `(1,8,4,8,2)` improved by `3-5%` once `M >= 1024`, but the strongest square winner `(2,4,4,4,4)` regressed by `2-4%`.
   - in the long-K / narrow-N orientation, the prefetch path was usually negative on good configs, with several double-digit regressions.
 - Decision:
-  - do not keep A prefetch in the mixed-precision kernel on the current nightly;
+  - do not keep A prefetch in the mixed-precision kernel on the current nightly.
   - the shape/config dependence is too strong, and the actual autotuned winner path does not improve enough to justify a runtime heuristic.
 
 ### P23: Mixed-Precision B-Only Prefetch Sweep - REJECT
 
 - Goal: port the kept FP16 split schedule to the mixed-precision kernel by prefetching only B (`global -> VGPR`) before WMMA, then committing B into LDS after compute while refilling A on the old path.
 - Validation:
-  - correctness passed both with the default path and with forced `FEATHER_SCALED_MM_B_PREFETCH=on`;
+  - correctness passed both with the default path and with forced `FEATHER_SCALED_MM_B_PREFETCH=on`.
   - analysis artifacts live under `tmp_mixed_precision_analysis/`, especially:
     - `qwen_shape_bprefetch_off.csv` / `qwen_shape_bprefetch_on.csv`
 - Important measurement note:
-  - within the patched kernel, forced `on` looked much faster than forced `off` on many shapes, but that comparison was misleading because the non-prefetch instantiations were materially slower than the last clean pre-change baseline;
+  - within the patched kernel, forced `on` looked much faster than forced `off` on many shapes, but that comparison was misleading because the non-prefetch instantiations were materially slower than the last clean pre-change baseline.
   - keeper decisions therefore used the last clean baseline (`qwen_shape_baseline_sweep_before.csv`) rather than the patched forced-`off` variants.
 - Target Qwen-Image shapes, autotuned comparison versus the clean pre-change baseline:
   - `(32, 12288, 2048)`: `6.790 -> 6.712 TFLOPS` (`-1.15%`)
@@ -135,30 +135,30 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
   - `(8192, 12288, 2048)`: `41.300 -> 39.965 TFLOPS` (`-3.23%`)
   - `(8192, 2048, 12288)`: `36.804 -> 35.238 TFLOPS` (`-4.26%`)
 - Interpretation:
-  - despite large apparent `on` vs patched-`off` gains, the prefetch path did not beat the last clean winner path on any of the target Qwen shapes;
+  - despite large apparent `on` vs patched-`off` gains, the prefetch path did not beat the last clean winner path on any of the target Qwen shapes.
   - the strongest pre-change winners were still better than the prefetched winners on all four target shapes, so there is no heuristic worth shipping from this experiment.
 - Decision:
-  - do not keep B prefetch in the mixed-precision kernel on the current nightly;
+  - do not keep B prefetch in the mixed-precision kernel on the current nightly.
   - revert the experiment and treat any future revisit as requiring a new precondition plus a cleaner non-prefetch control for benchmarking.
 
 ## Durable Findings
 
 - The `v_perm_b32` e5m2 unpacking acts as a severe fetch/decode bottleneck due to 96-bit bloated instructions.
-- The winner path is not DRAM-bandwidth-limited; remaining headroom is dominated by on-chip issue/decode/scheduling and math-pipeline constraints.
+- The winner path is not DRAM-bandwidth-limited. Remaining headroom is dominated by on-chip issue/decode/scheduling and math-pipeline constraints.
 - Epilogue (scale/bias) is not the bottleneck (`0.13%` delta).
 - Overlap decomposition showed limited headroom because the internal loop is already perfectly overlapping WMMA and LDS.
-- Removing `v_perm_b32` textually is not sufficient; replacement decode sequences can consume similar or worse front-end / VALU budget and fail to improve benchmark performance.
+- Removing `v_perm_b32` textually is not sufficient. Replacement decode sequences can consume similar or worse front-end / VALU budget and fail to improve benchmark performance.
 - Moving fp8 decode into the load phase is a poor direction because it shifts work into a less-overlapped region and tends to increase payload / pressure.
-- Finer chunking tends to lose to control overhead on this kernel family; smaller chunks or more frequent refill schedules need a clearly new precondition to be viable.
-- Hot-loop address generation is a low-probability target; prior non-prepacked ASM analysis showed most address work was already hoisted into precomputed bases plus compile-time offsets.
+- Finer chunking tends to lose to control overhead on this kernel family. Smaller chunks or more frequent refill schedules need a clearly new precondition to be viable.
+- Hot-loop address generation is a low-probability target. Prior non-prepacked ASM analysis showed most address work was already hoisted into precomputed bases plus compile-time offsets.
 - `V_PK_*` / VOP3P packed-half instructions are not VOPD-eligible, so conversion rewrites that depend on packed 16-bit ops gaining dual-issue are unlikely to help.
-- `ds_permute_b32` only permutes within a wave32; it cannot be used for cross-wave fragment sharing or broadcast across the 8-wave workgroup.
-- Rigid inline ASM / manual instruction ordering can block compiler interleaving and worsen `vmcnt` hiding or register scheduling; use ASM only when it unlocks an otherwise impossible instruction form.
+- `ds_permute_b32` only permutes within a wave32. It cannot be used for cross-wave fragment sharing or broadcast across the 8-wave workgroup.
+- Rigid inline ASM / manual instruction ordering can block compiler interleaving and worsen `vmcnt` hiding or register scheduling. Use ASM only when it unlocks an otherwise impossible instruction form.
 - Mixed-precision A WSGR should stay conservative and region-based on current ROCm nightly:
   - `repeat_m == 1`: enable only for `unroll_k == 4 && K <= 1024`
   - `repeat_m == 2`: enable only for tall tiles (`block_warps_m > block_warps_n`) with `unroll_k == 2`
   - `repeat_m == 4`: enable only for square tiles (`block_warps_m == block_warps_n`) with `unroll_k == 2`
-  - Otherwise keep it off; the remaining misses in refreshed sweeps were small enough to ignore.
+  - Otherwise keep it off. The remaining misses in refreshed sweeps were small enough to ignore.
 - Mixed-precision global->LDS refill cost is strongly config-dependent on the current nightly:
   - wide `repeat_m=1` path `(1,8,4,1,2)` at `2048^3` is clearly B-dominated: `reuse_a 4%`, `reuse_b 14%`, `reuse_ab 15%`
   - balanced mid-size path `(1,4,4,4,2)` at `4096^3` is roughly even between A and B: both are `6%`
@@ -177,7 +177,7 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
   - the short-K / wide-N orientation has a small positive region for some tall/wide configs, but the strongest square winner still regresses there
   - the long-K / narrow-N orientation is broadly negative on strong configs, so there is no robust runtime heuristic worth shipping from the current data
 - Mixed-precision B-only prefetch is also not a keeper on the current nightly:
-  - comparing only forced `on` vs forced `off` inside the patched kernel can overstate the benefit because the non-prefetch instantiations themselves can move;
+  - comparing only forced `on` vs forced `off` inside the patched kernel can overstate the benefit because the non-prefetch instantiations themselves can move.
   - against the last clean baseline, the prefetched autotuned winner regressed on all four target Qwen-Image shapes, including the two large target shapes.
 
 ## Do-Not-Repeat (Unless New Preconditions)
