@@ -87,6 +87,44 @@ python -m pytest -q \
 
 This verifies that VGPR overflow warns and reaches `checkResources()` instead of failing during `_initKernel`, while AGPR overflow remains fatal. That distinction allows `ForceGenerateKernel=1` to preserve rejected kernel source for debugging.
 
+For upstream resource, cluster, StreamK, and validation additions, run:
+
+```bash
+python -m pytest -q \
+  Tensile/Tests/unit/test_cluster_load_component.py \
+  Tensile/Tests/unit/test_CustomKernels_preload.py \
+  Tensile/Tests/unit/test_CustomKernels_resources.py \
+  Tensile/Tests/unit/test_custom_kernel_staggeru_metadata.py \
+  Tensile/Tests/unit/test_fused_gemm_a2a_rejects.py \
+  Tensile/Tests/unit/test_MatrixInstructionNaming.py \
+  Tensile/Tests/unit/test_preloop_local_read_drain.py \
+  Tensile/Tests/unit/test_resources.py \
+  Tensile/Tests/unit/test_streamk_cluster_sk45_reject.py \
+  Tensile/Tests/unit/test_streamk_multicast.py \
+  Tensile/Tests/unit/test_valid_corpus_consistency.py \
+  Tensile/Tests/unit/test_segment_interleave.py \
+  Tensile/Tests/unit/test_storeD_roundtrip.py \
+  Tensile/Tests/unit/test_streamk5_hybrid.py \
+  Tensile/Tests/unit/test_streamk_dponly_sgpr_reduction.py \
+  Tensile/Tests/unit/test_streamk_queue_index.py \
+  Tensile/Tests/unit/test_streamk_work_stealing.py \
+  Tensile/Tests/unit/test_subtile_cluster_barrier.py \
+  Tensile/Tests/unit/test_subtile_gfx1250_codegen.py
+```
+
+The new characterization codegen modules can be run together when the installed toolchain supports their target architecture:
+
+```bash
+python -m pytest -q \
+  Tensile/Tests/unit/characterization/_codegen/test_cms_fusi_preloop_wait.py \
+  Tensile/Tests/unit/characterization/_codegen/test_fused_a2a_gfx950_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_no_library_src_dependency_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_streamk_cluster_coop_load_gfx1250_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_streamk_cluster_multicast_gfx1250_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_streamk_pap_cluster_multicast_gfx1250_char.py \
+  Tensile/Tests/unit/characterization/_codegen/test_streamk_group_load_store_char.py
+```
+
 `Tensile/Tests/unit/test_MatrixInstructionConversion.py` may be slow (~2 minutes) at collecting tests.
 
 Architecture and GPU markers apply at different scopes:
@@ -114,8 +152,9 @@ Coverage and hardware requirements for this set:
 - `test_gl2_prefetch_offset.py` is the direct production address-generation verifier. It covers TLU and non-TLU tensors, address increments, strided batches, MX scales, FP4/FP8 byte widths, sparse metadata, whole-cluster fan-out, and edge/non-power-of-two cases. It runs only on a real gfx1250 GPU.
 - `test_prefetchgl2_streamk_guard.py` validates the DP-first StreamK (`StreamK==3`) PrefetchGL2 guard with both `StreamKForceDPOnly` modes. It uses gfx1250 assembler/capability data but does not require a gfx1250 GPU. It skips if the installed `amdclang++` cannot describe gfx1250.
 - `test_subtile_gl2_prefetch.py` is a Python-only scheduler test and does not require a GPU.
-- `test_cluster_padding_gfx1250_char.py` and `test_streamk_cluster_gfx1250_char.py` validate cluster decoding, padded boundary clusters, and StreamK cluster handling through generated assembly.
+- `test_cluster_padding_gfx1250_char.py`, `test_streamk_cluster_gfx1250_char.py`, and the newer cooperative-load/multicast characterization modules validate cluster decoding, padded boundary clusters, and StreamK cluster handling through generated assembly.
 - `test_r3_streamk_tdm_sgpr_budget_gfx1250_char.py` covers the newer StreamK/TDM/PrefetchGL2 SGPR-budget path. The `_codegen` tests require a toolchain that can emit gfx1250 code, but do not launch a GPU kernel.
+- `swizzle_gfx11.yaml` covers swizzled A/B generation for gfx1151 fp16, bf16, and int8. It is separate from the local AK16 `TensorALayoutA` byte-record layout.
 
 On gfx1151, the direct address verifier is expected to skip all of its gfx1250 cases. The guard, scheduler, and codegen tests can still pass when the ROCm toolchain supports gfx1250.
 
@@ -145,6 +184,16 @@ python -m pytest \
   --global-parameters CheckASMCodeSize=True \
   --gpu-targets gfx1151 \
   'Tensile/Tests/common/test_config.py::test_config[Tensile/Tests/common/gemm/gfx11/fp16_tn_gfx11.yaml]'
+```
+
+To exercise the upstream gfx11 pre-swizzle implementation from PR `#10733`, run its dedicated common test on a gfx1151 device:
+
+```bash
+python -m pytest \
+  --prebuilt-client ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
+  --global-parameters CheckASMCodeSize=True \
+  --gpu-targets gfx1151 \
+  'Tensile/Tests/common/test_config.py::test_config[Tensile/Tests/common/gemm/swizzle_gfx11.yaml]'
 ```
 
 For the generalized/sparse GL2 path, use the split-CI build-only entry point when gfx1250 hardware is unavailable:
