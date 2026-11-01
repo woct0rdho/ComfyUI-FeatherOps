@@ -1,7 +1,1 @@
-.rocprofv3/
 __pycache__/
-build/
-*.hip
-*_hip.cpp
-!/cpp_benchmarks/*_hip.cpp
-*_hip.cuh

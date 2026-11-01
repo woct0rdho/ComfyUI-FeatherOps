@@ -86,7 +86,7 @@ The transpose layout must be derived from the PyTorch tensor strides after this 
 | `N` column-major/view-transposed | `T` row-major | `NT` |
 | `N` column-major/view-transposed | `N` column-major/view-transposed | `TT` |
 
-This is the same convention encoded in `benchmark_mm_hipblaslt_fp16.py`: the benchmark remaps PyTorch providers with `TT -> NN`, `TN -> TN`, `NT -> NT`, and `NN -> TT` before applying `.T` views to the Python tensors.
+This is the same convention encoded in `~/feather-ops/bench/benchmark_mm_hipblaslt_fp16.py`: the benchmark remaps PyTorch providers with `TT -> NN`, `TN -> TN`, `NT -> NT`, and `NN -> TT` before applying `.T` views to the Python tensors.
 
 TensileLite layout filenames map as follows:
 - `NN`: `Cijk_Ailk_Bljk`, `TransposeA=False`, `TransposeB=False`.

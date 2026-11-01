@@ -1,6 +1,6 @@
 [tool.ruff]
 line-length = 180
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["I"]
@@ -8,11 +8,8 @@ extend-select = ["I"]
 [tool.ruff.lint.per-file-ignores]
 # The repository name contains a hyphen, so Ruff derives an invalid module
 # name for package initializers even though the package layout is intentional.
-"**/__init__.py" = ["F401", "N999"]
-
-[tool.ty.analysis]
-replace-imports-with-any = ["triton", "triton.**"]
+"__init__.py" = ["N999"]
 
 [tool.ty.environment]
 extra-paths = ["typings"]
-python-version = "3.10"
+python-version = "3.11"

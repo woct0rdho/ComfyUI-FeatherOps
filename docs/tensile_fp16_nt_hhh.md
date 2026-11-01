@@ -10,8 +10,8 @@
 ## Operating Notes
 
 - Use `~/rocm_wmma_gemm/build/` as the `rocm_wmma_gemm` build directory.
-- Keep temporary TensileLite fp16 NT files under `~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/`.
-- Invoke the runner with `bash`. `tmp_tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh` is not executable.
+- Keep temporary TensileLite fp16 NT files under `~/tmp/feather_ops/tensile_fp16_nt_hhh/`.
+- Invoke the runner with `bash`. `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh` is not executable.
 - Use `~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/llvm/bin/llvm-objdump` for code-object disassembly. This build does not accept `--show-raw-insn`.
 - When in doubt on WMMA/register semantics, read `~/rdna35-isa-markdown/`.
 - After meaningful tuning steps, update this file before continuing.
@@ -25,7 +25,7 @@ Public benchmark `NT` maps to TensileLite as follows:
 - TensileLite problem type uses `TransposeA: False`, `TransposeB: True`.
 
 Useful references:
-- FeatherOps layout detection: `kernel/hip/hipblaslt_kernel_fp16.cu:124-151`.
+- FeatherOps layout detection: `~/feather-ops/csrc/hipblaslt_kernel_fp16.cu:124-151`.
 - hipBLASLt op forwarding to TensileLite: `~/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/tensile_host.cpp:726-729`.
 - TensileLite GEMM index assignment: `~/rocm-libraries/projects/hipblaslt/tensilelite/Tensile/SolutionStructs/Problem.py:1046-1063`.
 - Existing gfx1151 NT logic: `~/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx1151/GridBased/gfx1151_Cijk_Ailk_Bjlk_HHS_BH_Bias_HAS_SAV_UserArgs.yaml`.
@@ -42,8 +42,8 @@ Useful references:
 - WMMA builtin: `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32`, so the comparable target is HHH/half accumulation, not HHS/fp32 accumulation.
 - Profiled resources: `192` VGPR, `128` SGPR, `24576` LDS bytes, `workgroup_x=256`.
 - Profiled LDS conflict: near zero, `LDSBankConflict=0.177778` in the PMC run.
-- Resource DB: `tmp_tensile_fp16_nt_hhh/logs/rocm_wmma_nt_resources/rocm_wmma_nt_resources_results.db`.
-- PMC DB: `tmp_tensile_fp16_nt_hhh/logs/rocm_wmma_nt_pmc/rocm_wmma_nt_pmc_results.db`.
+- Resource DB: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/rocm_wmma_nt_resources/rocm_wmma_nt_resources_results.db`.
+- PMC DB: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/rocm_wmma_nt_pmc/rocm_wmma_nt_pmc_results.db`.
 - Full disassembly from `llvm-objdump -d --demangle`: `~/.local/share/opencode/tool-output/tool_ea556e1840015VC0v2SIcTFSeF`.
 
 ### rocm_wmma LDS Behavior
@@ -64,9 +64,9 @@ Useful references:
 - Hot-loop run 1: median `42221.1 GFLOP/s`, mean `41811.1 GFLOP/s`, min `39148.7`, max `42418.2`.
 - Hot-loop run 2: median `42038.2 GFLOP/s`. Combined two-run median `42132.9 GFLOP/s`, mean `41943.7 GFLOP/s`, min `39148.7`, max `42418.2`, coefficient of variation `1.64%`.
 - This candidate now reaches the `rocm_wmma_gemm` baseline regime under the same hot-loop-style repeated-enqueue timing, unlike the corrected TLDS0 `skipvp` candidate.
-- Logs: `tmp_tensile_fp16_nt_hhh/logs/retime_hhh_tlds2_mt128x128_pad128x8_hot_loop.log`, `tmp_tensile_fp16_nt_hhh/logs/retime2_hhh_tlds2_mt128x128_pad128x8_hot_loop.log`.
-- CSVs: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192_hot_loop.csv`, `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192_hot_loop_rerun2.csv`.
-- Client config: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/717036c284d6/source/ClientParameters.ini`.
+- Logs: `tmp_tensile_fp16_nt_hhh/logs/retime_hhh_tlds2_mt128x128_pad128x8_hot_loop.log`, `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/retime2_hhh_tlds2_mt128x128_pad128x8_hot_loop.log`.
+- CSVs: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192_hot_loop.csv`, `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192_hot_loop_rerun2.csv`.
+- Client config: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/717036c284d6/source/ClientParameters.ini`.
 
 ### Fresh Hot-Loop Rerun Shortlist
 
@@ -97,9 +97,9 @@ All rows below passed generated-client validation in both hot-loop retime passes
 - Assembly metadata: `.amdhsa_next_free_vgpr 256`, `.amdhsa_group_segment_fixed_size 12288`.
 - Local reads: direct `ds_load_u16` and `ds_load_u16_d16_hi` into `vgprValuA/B_X0_I0+*`.
 - Sanity greps on generated assembly found no `ds_load_b128`, `v_perm_b32`, `vgprValu*_D*`, or `vgprValuPack` use in the local-read path.
-- Log: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds0_pgr0_skipvp_8192.log`.
-- Assembly: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_exact_hhh_tlds0_pgr0_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/f92f30d7d093/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bjlk_H_UserArgs_MT256x128x16_MI16x16x1geogNEJ-QzTEBmGCouqDfKm0QneJhTRUMQApagtUvMM=.s`.
-- Client config: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_exact_hhh_tlds0_pgr0_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/f92f30d7d093/source/ClientParameters.ini`.
+- Log: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds0_pgr0_skipvp_8192.log`.
+- Assembly: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_exact_hhh_tlds0_pgr0_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/f92f30d7d093/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bjlk_H_UserArgs_MT256x128x16_MI16x16x1geogNEJ-QzTEBmGCouqDfKm0QneJhTRUMQApagtUvMM=.s`.
+- Client config: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_exact_hhh_tlds0_pgr0_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/f92f30d7d093/source/ClientParameters.ini`.
 
 ### Reproduced HHH Results
 
@@ -112,10 +112,10 @@ All rows below passed generated-client validation in both hot-loop retime passes
 | `exact_hhh_tlds0_skipvp` | pass, default-config repro | `25183.3` | `25167.8` | `28672` | PGR2 exact tile |
 
 Other artifact paths:
-- `exact_hhh_tlds0_skipvp` log: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds0_skipvp_8192.log`.
-- `exact_hhh_tlds0_skipvp` assembly: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_exact_hhh_tlds0_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/68b33b7d3327/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bjlk_H_UserArgs_MT256x128x16_MI16x16x17ej4fNtPRUIShlPj4CHg6h8XnlLS6TC9znNaH0ocoEo=.s`.
-- `hhh_tlds0_mt128x128_skipvp` log: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds0_mt128x128_skipvp_8192.log`.
-- `hhh_tlds0_mt128x128_skipvp` assembly: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds0_mt128x128_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/a7ddf71623b6/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bjlk_H_UserArgs_MT128x128x16_MI16x16x1kymoy7yfjCgrEwa2sNyCHUngJ_a7HZT0cbdVNS1ZeCI=.s`.
+- `exact_hhh_tlds0_skipvp` log: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds0_skipvp_8192.log`.
+- `exact_hhh_tlds0_skipvp` assembly: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_exact_hhh_tlds0_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/68b33b7d3327/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bjlk_H_UserArgs_MT256x128x16_MI16x16x17ej4fNtPRUIShlPj4CHg6h8XnlLS6TC9znNaH0ocoEo=.s`.
+- `hhh_tlds0_mt128x128_skipvp` log: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds0_mt128x128_skipvp_8192.log`.
+- `hhh_tlds0_mt128x128_skipvp` assembly: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhh_tlds0_mt128x128_skipvp_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/a7ddf71623b6/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bjlk_H_UserArgs_MT128x128x16_MI16x16x1kymoy7yfjCgrEwa2sNyCHUngJ_a7HZT0cbdVNS1ZeCI=.s`.
 
 ## Active Source Changes
 
@@ -127,8 +127,8 @@ Durable HHH correctness fixes:
 Structural performance/codegen change currently present:
 - `~/rocm-libraries/projects/hipblaslt/tensilelite/Tensile/KernelWriter.py`: adds shared `localReadNeedsPack` and `localReadNeedsValuPack` helpers. A/B `ValuPack` allocation and pack scheduling now use the derived local-read pack decision instead of a gfx1151-specific skip predicate.
 - `~/rocm-libraries/projects/hipblaslt/tensilelite/Tensile/KernelWriterAssembly.py`: matching macro and tail-loop A/B `ValuPack` allocation use the shared derived helper.
-- `tmp_tensile_fp16_nt_hhh/scripts/make_fp16_nt_speed_sweep.py`: named variants, including `skipvp` variants.
-- `tmp_tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh`: stale `TENSILE_GFX1151_HHH_*` env-var plumbing was removed.
+- `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/make_fp16_nt_speed_sweep.py`: named variants, including `skipvp` variants.
+- `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh`: stale `TENSILE_GFX1151_HHH_*` env-var plumbing was removed.
 
 Important cleanup status:
 - Temporary `DIAG HHH` markers and forced-output diagnostics should remain removed.
@@ -224,10 +224,10 @@ Previously profiled TLDS2 candidates. These profiles predate the fresh hot-loop 
 | `rocm_wmma_gemm` NT baseline | `26709.3` | `192` | `128` | `24576` | `256x1x1` | `0.177778` |
 
 Profile DBs:
-- `tmp_tensile_fp16_nt_hhh/logs/hhh_mt128x128_nepbs16_resources/hhh_mt128x128_nepbs16_resources_results.db`.
-- `tmp_tensile_fp16_nt_hhh/logs/hhh_mt128x128_nepbs16_pmc/hhh_mt128x128_nepbs16_pmc_results.db`.
-- `tmp_tensile_fp16_nt_hhh/logs/hhh_mt128x128_pad128x8_resources/hhh_mt128x128_pad128x8_resources_results.db`.
-- `tmp_tensile_fp16_nt_hhh/logs/hhh_mt128x128_pad128x8_pmc/hhh_mt128x128_pad128x8_pmc_results.db`.
+- `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhh_mt128x128_nepbs16_resources/hhh_mt128x128_nepbs16_resources_results.db`.
+- `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhh_mt128x128_nepbs16_pmc/hhh_mt128x128_nepbs16_pmc_results.db`.
+- `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhh_mt128x128_pad128x8_resources/hhh_mt128x128_pad128x8_resources_results.db`.
+- `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhh_mt128x128_pad128x8_pmc/hhh_mt128x128_pad128x8_pmc_results.db`.
 
 Interpretation kept for future work:
 - TLDS2 padding reduced LDS conflict materially. The old profile still showed much higher `LDSBankConflict` than `rocm_wmma_gemm`, but fresh hot-loop timing now reaches the baseline throughput regime, so the current winner needs a refreshed profile before drawing promotion or bottleneck conclusions.
@@ -239,15 +239,15 @@ Interpretation kept for future work:
 Benchmark one or more named variants:
 
 ```bash
-bash ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh <variant> [<variant> ...]
+bash ~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh <variant> [<variant> ...]
 ```
 
 Retiming an already generated TensileLite candidate with hot-loop pacing:
 
 ```bash
 ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
-  --config-file ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/<cache>/source/ClientParameters.ini \
-  --config-file ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/configs/<variant>_hot_loop_override.ini
+  --config-file ~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/<cache>/source/ClientParameters.ini \
+  --config-file ~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/<variant>_hot_loop_override.ini
 ```
 
 The filenames above are examples of the folder layout. Prefer keeping this layout and only changing `<variant>`, `<cache>`, and the override `results-file` when retiming a new candidate.
@@ -320,16 +320,16 @@ Direct same-input benchmark runner:
   -I~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/include \
   -L~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/lib \
   -D__HIP_PLATFORM_AMD__ -DNO_PYTORCH -O3 -std=c++17 \
-  ~/ComfyUI-FeatherOps/kernel/hip/hip_kernel_fp16.cu \
-  ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt.cu \
+  ~/feather-ops/csrc/hip_kernel_fp16.cu \
+  ~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt.cu \
   -lamdhip64 \
-  -o ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt
+  -o ~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt
 ```
 
 Run a small same-input validation first:
 
 ```bash
-~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt \
+~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt \
   --m 256 --n 256 --k 256 \
   --validate-elems 65536 --tolerance 512 --hip-ext-launch
 ```
@@ -337,7 +337,7 @@ Run a small same-input validation first:
 Run the current best direct benchmark with the same hot-loop shape as the TensileLite client retime:
 
 ```bash
-~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt \
+~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/same_input_hip_tensile_hhh_nt \
   --m 8192 --n 8192 --k 8192 \
   --bench --warmup 20 --iters 10 --enqueues-per-sync 10 \
   --tensile-first --hip-ext-launch
@@ -345,7 +345,7 @@ Run the current best direct benchmark with the same hot-loop shape as the Tensil
 
 Direct runner notes:
 - The default code object and kernel name are the current best `hhh_tlds2_mt128x128_pad128x8` artifacts under cache `717036c284d6`.
-- The runner launches the generated `.co` directly and compares against `kernel/hip/hip_kernel_fp16.cu` for validation. It does not use a CPU reference.
+- The runner launches the generated `.co` directly and compares against `~/feather-ops/csrc/hip_kernel_fp16.cu` for validation. It does not use a CPU reference.
 - The runner defaults to TensileLite-style `Half` random inputs: integer values in `[-3, 3]`, matching generated-client `init-a=Random` and `init-b=Random`. Use `--small-random-inputs` only for diagnostic comparisons against the older direct-runner distribution `[-0.25, 0.25]`. That distribution measured about `39.4 TFLOP/s` and does not reproduce the TensileLite client result.
 - Runtime metadata must match the generated solution: `StaggerU=32`, `staggerStrideShift=3`, `GSU=1`, `WorkGroupMapping=16`, `WorkGroupMappingXCC=1`, and `cu_count` in `internalArgs1`.
 - The direct kernarg buffer includes the promoted f32 `alpha` at offset `96` and the TensileLite `alpha_2` half payload at offsets `100..101`.
@@ -363,24 +363,24 @@ Input-value speed sensitivity:
 ## Important Artifacts
 
 Core scripts:
-- Variant generator: `tmp_tensile_fp16_nt_hhh/scripts/make_fp16_nt_speed_sweep.py`.
-- Variant runner: `tmp_tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh`.
+- Variant generator: `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/make_fp16_nt_speed_sweep.py`.
+- Variant runner: `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh`.
 - TensileLite client: `~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client`.
-- Hot-loop override example: `tmp_tensile_fp16_nt_hhh/configs/<variant>_hot_loop_override.ini`.
-- Hot-loop rerun override example: `tmp_tensile_fp16_nt_hhh/configs/<variant>_hot_loop_rerun2_override.ini`.
-- No-sleep single-enqueue and cooldown override examples can follow the same `tmp_tensile_fp16_nt_hhh/configs/<variant>_<mode>_override.ini` pattern.
+- Hot-loop override example: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/<variant>_hot_loop_override.ini`.
+- Hot-loop rerun override example: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/<variant>_hot_loop_rerun2_override.ini`.
+- No-sleep single-enqueue and cooldown override examples can follow the same `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/<variant>_<mode>_override.ini` pattern.
 
 Key logs:
-- Current best generated-client log example: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_<variant>_8192.log`.
-- Current best hot-loop retime log examples: `tmp_tensile_fp16_nt_hhh/logs/retime_<variant>_hot_loop.log`, `tmp_tensile_fp16_nt_hhh/logs/retime2_<variant>_hot_loop.log`.
-- Current best hot-loop CSV examples: `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_hot_loop.csv`, `tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_hot_loop_rerun2.csv`.
-- Valid TLDS0 PGR2 exact: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds0_skipvp_8192.log`.
-- Valid TLDS0 `MT128x128`: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds0_mt128x128_skipvp_8192.log`.
-- Best TLDS2 YAML generation baseline: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192.log`.
-- TLDS2 scalar-fragment negative control: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_fraglr_8192.log`.
-- Compact LDS negative control: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds2_compactlds_8192.log`.
-- Fixed HHH full-K base: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds2_8192.log`.
-- Fixed HHH K=16 base: `tmp_tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds2_k16_8192.log`.
+- Current best generated-client log example: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_<variant>_8192.log`.
+- Current best hot-loop retime log examples: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/retime_<variant>_hot_loop.log`, `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/retime2_<variant>_hot_loop.log`.
+- Current best hot-loop CSV examples: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_hot_loop.csv`, `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_hot_loop_rerun2.csv`.
+- Valid TLDS0 PGR2 exact: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds0_skipvp_8192.log`.
+- Valid TLDS0 `MT128x128`: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds0_mt128x128_skipvp_8192.log`.
+- Best TLDS2 YAML generation baseline: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_8192.log`.
+- TLDS2 scalar-fragment negative control: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhh_tlds2_mt128x128_pad128x8_fraglr_8192.log`.
+- Compact LDS negative control: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds2_compactlds_8192.log`.
+- Fixed HHH full-K base: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds2_8192.log`.
+- Fixed HHH K=16 base: `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_exact_hhh_tlds2_k16_8192.log`.
 
 Source files touched or repeatedly inspected:
 - `~/rocm-libraries/projects/hipblaslt/tensilelite/Tensile/KernelWriterConversion.py`.
@@ -408,11 +408,11 @@ Useful profile command template:
 ```bash
 rocprofv3 --kernel-trace --stats \
   --pmc L2CacheHit VALUInsts LDSBankConflict \
-  -d ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/logs/<out_dir> \
+  -d ~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/<out_dir> \
   -o <prefix> -- \
   ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
-  --config-file ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/<cache>/source/ClientParameters.ini \
-  --config-file ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhh/configs/<variant>_hot_loop_override.ini
+  --config-file ~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_<variant>_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_H_UserArgs_00/00_Final/caches/<cache>/source/ClientParameters.ini \
+  --config-file ~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/<variant>_hot_loop_override.ini
 ```
 
 The profile command uses example filenames. Keep the existing output/config folder layout and substitute the variant/cache names for the candidate under test.

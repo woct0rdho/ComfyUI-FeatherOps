@@ -230,8 +230,8 @@ Conclusion:
 
 - Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
 - Per-step order:
-  - `python test_scaled_mm.py`
-  - `python benchmark_scaled_mm.py`
+  - `python -m pytest ~/feather-ops/tests/test_scaled_mm_triton.py -q`
+  - `python ~/feather-ops/bench/benchmark_scaled_mm_triton.py`
   - If it regresses, explain the reason by inspecting the generated code and profiling.
 - Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 - If a new baseline is kept, commit the kernel immediately.

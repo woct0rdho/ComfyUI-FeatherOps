@@ -110,19 +110,19 @@ Scale+bias performance:
 - Prior `SU32/SUS256` TensileLite client with `alpha=Two`: passed validation, best `46.294 TFLOP/s`, mean `45.633 TFLOP/s`.
 
 Current code/config paths:
-- Core matmul reference config: `tmp_nitensile/configs/b8h_ak16_hiptile_exact_ldspad_a16_b8_thermal_8192.yaml`
-- Core matmul reference output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_a16_b8_thermal_8192_out`
-- Scale+bias validation config: `tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_small.yaml`
-- Scale+bias validation output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_small_out`
-- Prior `SUS256` scale+bias benchmark config: `tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_thermal_8192.yaml`
-- Prior `SUS256` scale+bias benchmark output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_thermal_8192_out`
-- Current average-speed candidate config: `tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192.yaml`
-- Current average-speed candidate output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out`
-- Current average-speed candidate hot-loop override: `tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop_override.ini`
-- Current average-speed candidate hot-loop CSV: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop.csv`
-- Same-input direct runner: `tmp_nitensile/scripts/same_input_hip_tensile.cu`
-- Same-input direct runner binary: `tmp_nitensile/scripts/same_input_hip_tensile`
-- Same-input log: `tmp_nitensile/logs/same_input_hip_tensile_8192.log`
+- Core matmul reference config: `~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_ldspad_a16_b8_thermal_8192.yaml`
+- Core matmul reference output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_a16_b8_thermal_8192_out`
+- Scale+bias validation config: `~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_small.yaml`
+- Scale+bias validation output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_small_out`
+- Prior `SUS256` scale+bias benchmark config: `~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_thermal_8192.yaml`
+- Prior `SUS256` scale+bias benchmark output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_thermal_8192_out`
+- Current average-speed candidate config: `~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192.yaml`
+- Current average-speed candidate output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out`
+- Current average-speed candidate hot-loop override: `~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop_override.ini`
+- Current average-speed candidate hot-loop CSV: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop.csv`
+- Same-input direct runner: `~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile.cu`
+- Same-input direct runner binary: `~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile`
+- Same-input log: `~/tmp/feather_ops/nitensile/logs/same_input_hip_tensile_8192.log`
 
 ## Build And Run
 
@@ -138,8 +138,8 @@ export TENSILE_CLIENT=~/rocm-libraries/build/tensilelite-client/tensilelite/clie
 Run a TensileLite client benchmark from a YAML config:
 
 ```bash
-CONFIG=~/ComfyUI-FeatherOps/tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192.yaml
-OUT=~/ComfyUI-FeatherOps/tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out
+CONFIG=~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192.yaml
+OUT=~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out
 $TENSILE "$CONFIG" "$OUT" --prebuilt-client "$TENSILE_CLIENT" --global-parameters CodeObjectVersion=4
 ```
 
@@ -147,8 +147,8 @@ The generated `ClientParameters.ini` uses default cool-loop timing, not hot-loop
 
 ```bash
 ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
-  --config-file ~/ComfyUI-FeatherOps/tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/ClientParameters.ini \
-  --config-file ~/ComfyUI-FeatherOps/tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop_override.ini
+  --config-file ~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/ClientParameters.ini \
+  --config-file ~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop_override.ini
 ```
 
 Always use a Python CSV reader for TensileLite result CSVs. The first `GFlops` column can be zero. The actual GFLOP/s values are in the long per-solution kernel-name column after `TotalFlops`.
@@ -186,17 +186,17 @@ Build the direct same-input HIP/TensileLite runner:
 
 ```bash
 $ROCM_PATH/lib/llvm/bin/clang++ -O3 --offload-arch=gfx1151 -x hip -DNO_PYTORCH \
-  ~/ComfyUI-FeatherOps/tmp_nitensile/scripts/same_input_hip_tensile.cu \
-  ~/ComfyUI-FeatherOps/kernel/hip/hip_kernel.cu \
-  -o ~/ComfyUI-FeatherOps/tmp_nitensile/scripts/same_input_hip_tensile
+  ~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile.cu \
+  ~/feather-ops/csrc/hip_kernel.cu \
+  -o ~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile
 ```
 
 Run the direct same-input scale+bias benchmark against a generated code object. Extract the exact exported symbol instead of manually reconstructing the long kernel name:
 
 ```bash
-CO=~/ComfyUI-FeatherOps/tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/library/gfx1151/TensileLibrary_gfx1151.co
+CO=~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/library/gfx1151/TensileLibrary_gfx1151.co
 KERNEL_NAME=$($ROCM_PATH/lib/llvm/bin/llvm-readelf --wide -s "$CO" | awk '/FUNC/ && /Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs/ {print $NF; exit}')
-~/ComfyUI-FeatherOps/tmp_nitensile/scripts/same_input_hip_tensile \
+~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile \
   --m 8192 --n 8192 --k 8192 \
   --warmup 12 --iters 64 --bench \
   --validate-elems 1048576 \
@@ -245,9 +245,9 @@ Do not assume higher occupancy alone wins. Validate with multiple timed rows bec
 ## Tuning History
 
 Speed sweep tooling:
-- Added `tmp_nitensile/scripts/make_du64_speed_sweep.py` to generate one-solution full-size YAMLs. Use one solution per YAML. Previous broad multi-solution sweeps hit generator/library failures.
-- Added `tmp_nitensile/scripts/run_du64_speed_sweep.sh` and `tmp_nitensile/scripts/summarize_tensile_logs.py` to run and summarize sweep batches.
-- Updated `tmp_nitensile/scripts/same_input_hip_tensile.cu` with `--stagger-u` and `--stagger-u-stride`. Rebuilt with `-DNO_PYTORCH`. Direct launch still assumes `WorkGroupMapping=4` in `kernel_info1`.
+- Added `~/tmp/feather_ops/nitensile/scripts/make_du64_speed_sweep.py` to generate one-solution full-size YAMLs. Use one solution per YAML. Previous broad multi-solution sweeps hit generator/library failures.
+- Added `~/tmp/feather_ops/nitensile/scripts/run_du64_speed_sweep.sh` and `~/tmp/feather_ops/nitensile/scripts/summarize_tensile_logs.py` to run and summarize sweep batches.
+- Updated `~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile.cu` with `--stagger-u` and `--stagger-u-stride`. Rebuilt with `-DNO_PYTORCH`. Direct launch still assumes `WorkGroupMapping=4` in `kernel_info1`.
 
 Speed sweep results around `DepthU=64`:
 - `StaggerU x StaggerUStride`: all full-client candidates passed. Direct validation favored `SU32/SUS128` for average speed. Longer `--warmup 12 --iters 64` direct comparison: baseline `SU32/SUS256` TensileLite avg `46.177 TFLOP/s`, best `46.635`. Candidate `SU32/SUS128` avg `46.237`, best `46.663`. Both correct with no NaNs and `mismatches(abs>0.25)=0`.
@@ -372,46 +372,46 @@ Client/runtime/reference:
 - `client/include/TypedId.hpp`, `client/src/Reference.cpp`: minimal runtime reference dispatch for H/B8 storage variants.
 
 Repository benchmark/control patches:
-- `cpp_benchmarks/benchmark_scaled_mm_hip.cpp`: finite fp8 initializer.
-- `cpp_benchmarks/benchmark_scaled_mm_hip_libtorch.cpp`: finite fp8 initializer.
-- `tmp_mixed_precision_analysis/benchmark_scaled_mm_fp8_convert_ablation.cpp`: finite fp8 initializer.
-- `tmp_mixed_precision_analysis/benchmark_scaled_mm_lds_vgpr_ablation.cpp`: finite fp8 initializer.
-- `tmp_mixed_precision_analysis/benchmark_scaled_mm_vram_lds_ablation.cpp`: finite fp8 initializer.
-- `tmp_nitensile/scripts/same_input_hip_tensile.cu`: direct-launch runner with core and `--scale-bias` modes, NaN-aware validation, `hipExtModuleLaunchKernel` control, finite B8 input control, and `--stagger-u`/`--stagger-u-stride` metadata controls.
+- `~/feather-ops/cpp_benchmarks/benchmark_scaled_mm_hip.cpp`: finite fp8 initializer.
+- `~/feather-ops/cpp_benchmarks/benchmark_scaled_mm_hip_libtorch.cpp`: finite fp8 initializer.
+- `~/tmp/feather_ops/mixed_precision_analysis/benchmark_scaled_mm_fp8_convert_ablation.cpp`: finite fp8 initializer.
+- `~/tmp/feather_ops/mixed_precision_analysis/benchmark_scaled_mm_lds_vgpr_ablation.cpp`: finite fp8 initializer.
+- `~/tmp/feather_ops/mixed_precision_analysis/benchmark_scaled_mm_vram_lds_ablation.cpp`: finite fp8 initializer.
+- `~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile.cu`: direct-launch runner with core and `--scale-bias` modes, NaN-aware validation, `hipExtModuleLaunchKernel` control, finite B8 input control, and `--stagger-u`/`--stagger-u-stride` metadata controls.
 
 ## Key Logs And Paths
 
 Important current artifacts:
 - Plan: `doc/nitensile.md`
 - Hardware/occupancy reference: `doc/gfx1151_reference.md`
-- HIP source: `kernel/hip/hip_kernel.cu`
-- HIP finite benchmark binary: `cpp_benchmarks/build/benchmark_scaled_mm_hip`
-- Same-input runner: `tmp_nitensile/scripts/same_input_hip_tensile.cu`
-- Same-input runner binary: `tmp_nitensile/scripts/same_input_hip_tensile`
-- Core matmul reference output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_a16_b8_thermal_8192_out`
-- Current scale+bias output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out`
-- Current scale+bias hot-loop override: `tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop_override.ini`
-- Current scale+bias hot-loop CSV: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop.csv`
-- Prior `SUS256` scale+bias output: `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_thermal_8192_out`
+- HIP source: `~/feather-ops/csrc/hip_kernel.cu`
+- HIP finite benchmark binary: `~/feather-ops/cpp_benchmarks/build/benchmark_scaled_mm_hip`
+- Same-input runner: `~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile.cu`
+- Same-input runner binary: `~/tmp/feather_ops/nitensile/scripts/same_input_hip_tensile`
+- Core matmul reference output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_a16_b8_thermal_8192_out`
+- Current scale+bias output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out`
+- Current scale+bias hot-loop override: `~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop_override.ini`
+- Current scale+bias hot-loop CSV: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_hot_loop.csv`
+- Prior `SUS256` scale+bias output: `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_thermal_8192_out`
 
 Useful historical outputs:
-- `tmp_nitensile/outputs/b8h_ak16_grvwa16_tlds2_best_confirm_thermal_8192_out`: prior non-exact thermal/noise confirmation.
-- `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_serialpad_buildonly_out`: exact HIP shape unblocked by serial-padding allocator.
-- `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_compactlds_thermal_8192_out`: compact LDS correctness but severe bank-conflict slowdown.
-- `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_3x3_8192_out`: LDS pad sweep identifying `A16/B8`.
-- `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_refine_8192_out`: refinement around `A16/B8`. No better variant.
-- `tmp_nitensile/logs/same_input_hip_tensile_8192.log`: raw-byte/finite/direct-launch controls.
-- `tmp_nitensile/logs/client_exact_a16b8_directlike.csv`: directlike TensileLite client control.
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_grvwa16_tlds2_best_confirm_thermal_8192_out`: prior non-exact thermal/noise confirmation.
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_serialpad_buildonly_out`: exact HIP shape unblocked by serial-padding allocator.
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_compactlds_thermal_8192_out`: compact LDS correctness but severe bank-conflict slowdown.
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_3x3_8192_out`: LDS pad sweep identifying `A16/B8`.
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_ldspad_refine_8192_out`: refinement around `A16/B8`. No better variant.
+- `~/tmp/feather_ops/nitensile/logs/same_input_hip_tensile_8192.log`: raw-byte/finite/direct-launch controls.
+- `~/tmp/feather_ops/nitensile/logs/client_exact_a16b8_directlike.csv`: directlike TensileLite client control.
 
 Generated code object used by current direct scale+bias runner:
-- `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/library/gfx1151/TensileLibrary_gfx1151.co`
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/library/gfx1151/TensileLibrary_gfx1151.co`
 
 Retained scale+bias assembly:
-- `tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_MT0sQspodbWToMkZuGKDqgdqWFcxv8p410l0lU6JeRV74=.s`
+- `~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_00/00_Final/caches/bf7d336000e4/source/build_tmp/SOURCE/assembly/Cijk_Ailk_Bljk_B8H_HHS_AK16_H_Bias_H_UserArgs_MT0sQspodbWToMkZuGKDqgdqWFcxv8p410l0lU6JeRV74=.s`
 
 ## TensileLite Usage Notes
 
-- Persistent work area: `tmp_nitensile/` with `configs/`, `outputs/`, `logs/`, `scripts/`.
+- Persistent work area: `~/tmp/feather_ops/nitensile/` with `configs/`, `outputs/`, `logs/`, `scripts/`.
 - Run TensileLite through `~/rocm-libraries/projects/hipblaslt/tensilelite/Tensile/bin/Tensile`.
 - Put source checkout first in `PYTHONPATH`: `PYTHONPATH=~/rocm-libraries/projects/hipblaslt/tensilelite:$ROCM_PATH/share/hipblaslt/tensilelite`.
 - Use the centralized prebuilt client: `~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client`.
@@ -426,8 +426,8 @@ Example command:
 ROCM_PATH=~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel \
 PYTHONPATH=~/rocm-libraries/projects/hipblaslt/tensilelite:$ROCM_PATH/share/hipblaslt/tensilelite \
 ~/rocm-libraries/projects/hipblaslt/tensilelite/Tensile/bin/Tensile \
-  ~/ComfyUI-FeatherOps/tmp_nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192.yaml \
-  ~/ComfyUI-FeatherOps/tmp_nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out \
+  ~/tmp/feather_ops/nitensile/configs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192.yaml \
+  ~/tmp/feather_ops/nitensile/outputs/b8h_ak16_hiptile_exact_a16b8_bias_alpha_su32_sus128_thermal_8192_out \
   --prebuilt-client ~/rocm-libraries/build/tensilelite-client/tensilelite/client/tensilelite-client \
   --global-parameters CodeObjectVersion=4
 ```

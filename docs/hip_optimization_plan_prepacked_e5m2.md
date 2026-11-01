@@ -8,7 +8,7 @@
 - Python wrapper contract:
   - infer `b_dtype` from fp8 prepacked tensor dtype.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Performance metric: `benchmark_scaled_mm_hip.py` TFLOPS (prepack excluded from timed region).
+- Performance metric: `~/feather-ops/bench/benchmark_scaled_mm_hip.py` TFLOPS (prepack excluded from timed region).
 - Keep rule:
   - correctness passes,
   - `N=8192` does not regress,
@@ -16,7 +16,7 @@
 
 ## Current Baseline
 
-- Latest full benchmark (`python benchmark_scaled_mm_hip.py`):
+- Latest full benchmark (`python ~/feather-ops/bench/benchmark_scaled_mm_hip.py`):
   - `N=8192`: 44.0 TFLOPS
   - May be 42-44 TFLOPS due to thermal throttling
 
@@ -53,8 +53,8 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 
 - Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
 - Per-step order:
-  - `python test_scaled_mm_hip.py`
-  - `python benchmark_scaled_mm_hip.py`
+  - `python -m pytest ~/feather-ops/tests/test_scaled_mm_hip.py -q`
+  - `python ~/feather-ops/bench/benchmark_scaled_mm_hip.py`
   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
 - Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 - If a new baseline is kept, commit the kernel immediately.
@@ -100,7 +100,7 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 - Goal: test the FP16-style split schedule on the mixed-precision kernel by prefetching only A (`global -> VGPR`) before WMMA, then committing A to LDS after compute while leaving B on the old synchronous refill path.
 - Validation:
   - correctness passed with the forced-on experiment across all 28 configs.
-  - analysis artifacts live under `tmp_mixed_precision_analysis/`, especially:
+  - analysis artifacts live under `~/tmp/feather_ops/mixed_precision_analysis/`, especially:
     - `qwen_shape_sweep_prefetch_off.csv` / `qwen_shape_sweep_prefetch_on.csv`
     - `orientation_region_prefetch_off.csv` / `orientation_region_prefetch_on.csv`
 - Target Qwen-Image shapes:
@@ -124,7 +124,7 @@ Through thread tracing and hardware occupancy analysis of the chosen autotune co
 - Goal: port the kept FP16 split schedule to the mixed-precision kernel by prefetching only B (`global -> VGPR`) before WMMA, then committing B into LDS after compute while refilling A on the old path.
 - Validation:
   - correctness passed both with the default path and with forced `FEATHER_SCALED_MM_B_PREFETCH=on`.
-  - analysis artifacts live under `tmp_mixed_precision_analysis/`, especially:
+  - analysis artifacts live under `~/tmp/feather_ops/mixed_precision_analysis/`, especially:
     - `qwen_shape_bprefetch_off.csv` / `qwen_shape_bprefetch_on.csv`
 - Important measurement note:
   - within the patched kernel, forced `on` looked much faster than forced `off` on many shapes, but that comparison was misleading because the non-prefetch instantiations were materially slower than the last clean pre-change baseline.

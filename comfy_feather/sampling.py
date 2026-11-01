@@ -1,8 +1,10 @@
 # Keep the active Feather diffusion model loaded for the duration of sampling.
-# Preview decoders such as TAESD can ask ComfyUI's model manager for VRAM mid-sample;
-# without pinning, that request can unload/unpatch the currently sampling model and
-# leave later denoise steps running with stale weights. This wrapper adds active
-# Feather patchers to model_management.free_memory(..., keep_loaded=...) while the
+# ComfyUI can load other models mid-sample (for example video TAEHV/VAE previews
+# and nested model loads) through model_management.load_models_gpu(), which calls
+# free_memory() without the active sampler patcher in keep_loaded. On static
+# patchers that can unload/unpatch the currently sampling model and leave later
+# denoise steps running with stale weights. This wrapper adds active Feather
+# patchers to model_management.free_memory(..., keep_loaded=...) while the
 # sampler is running, so ComfyUI can still free other models but not the active one.
 
 import comfy.model_management

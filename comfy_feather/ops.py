@@ -1,14 +1,8 @@
-from typing import TYPE_CHECKING
-
 import torch
 import torch.nn.functional as F
 from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_weight
+from feather_ops import scaled_mm_hip
 from torch import nn
-
-if TYPE_CHECKING:
-    from kernel.hip.hip_kernel import scaled_mm_hip
-else:
-    from ..kernel.hip.hip_kernel import scaled_mm_hip
 
 from .lora import apply_lora_patches
 from .quant import get_feather_plain_tensors, is_feather_quantized_weight, make_feather_quantized_weight, quantize_feather_weight
@@ -21,7 +15,7 @@ def feather_ops(out_dtype=torch.bfloat16, excluded_names=()):
         _excluded_names = excluded_names
         _out_dtype = out_dtype
 
-        class Linear(manual_cast.Linear):
+        class Linear(manual_cast.Linear):  # ty: ignore[invalid-attribute-override]
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.excluded_names = FeatherOps._excluded_names

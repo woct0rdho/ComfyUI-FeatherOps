@@ -86,13 +86,13 @@ Build or rebuild the full Tensile client:
 List HHS scale/bias variants:
 
 ```bash
-python3 ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/scripts/make_fp16_nt_hhs_scale_bias_sweep.py --list
+python3 ~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/make_fp16_nt_hhs_scale_bias_sweep.py --list
 ```
 
 Generate and benchmark one or more HHS scale/bias variants with default generated timing:
 
 ```bash
-bash ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/scripts/run_fp16_nt_hhs_variant.sh <variant> [<variant> ...]
+bash ~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/run_fp16_nt_hhs_variant.sh <variant> [<variant> ...]
 ```
 
 Use the default runner to screen candidates. Before making a performance claim, retime shortlisted generated candidates with the hot-loop override above.
@@ -115,16 +115,16 @@ Direct same-input benchmark runner:
   -I~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/include \
   -L~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_devel/lib \
   -D__HIP_PLATFORM_AMD__ -DNO_PYTORCH -O3 -std=c++17 \
-  ~/ComfyUI-FeatherOps/kernel/hip/hip_kernel_fp16.cu \
-  ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt.cu \
+  ~/feather-ops/csrc/hip_kernel_fp16.cu \
+  ~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt.cu \
   -lamdhip64 \
-  -o ~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt
+  -o ~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt
 ```
 
 Validation command:
 
 ```bash
-~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt \
+~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt \
   --m 1024 --n 1024 --k 1024 \
   --validate-elems 1048576 --hip-ext-launch
 ```
@@ -132,7 +132,7 @@ Validation command:
 Direct benchmark command with the same hot-loop shape as the TensileLite client retime:
 
 ```bash
-~/ComfyUI-FeatherOps/tmp_tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt \
+~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/same_input_hip_tensile_hhs_nt \
   --m 8192 --n 8192 --k 8192 \
   --bench --warmup 20 --iters 10 --enqueues-per-sync 10 \
   --tensile-first --hip-ext-launch
@@ -144,7 +144,7 @@ Direct runner notes:
 - Default bias initialization mirrors `cpp_benchmarks`: `std::mt19937 gen(42)`, `std::uniform_real_distribution<float>(-1.0f, 1.0f)`, converted to `half`. Use `--tensile-random-bias` only to reproduce the TensileLite benchmark-style `Random` half integer distribution in `[-3, 3]`.
 - A/B input generation defaults to TensileLite-style half `Random` integer values in `[-3, 3]`. Use `--small-random-inputs` only for diagnostic `[-0.25, 0.25]` input sensitivity checks. The performance dependency on inputs is explained by transistor switching power, see https://www.thonking.ai/p/strangely-matrix-multiplications
 - Runtime metadata matches the generated solution: `StaggerU=32`, `staggerStrideShift=3`, `GSU=1`, `WorkGroupMapping=8`, and `WorkGroupMappingXCC=1`.
-- Validation compares against `kernel/hip/hip_kernel_fp16.cu` with the same A, B, and bias buffers by transposing the HIP reference problem. HIP receives `A_hip = B^T` as row-major `N x K` and `B_hip = A^T` prepacked as `K x M`, computes `(B^T @ A^T) + bias[column]`, and the validator compares `HIP[j, i]` to TensileLite `D[i, j]`. This maps HIP's column-bias epilogue to TensileLite's factor-dim `I/M` bias epilogue.
+- Validation compares against `~/feather-ops/csrc/hip_kernel_fp16.cu` with the same A, B, and bias buffers by transposing the HIP reference problem. HIP receives `A_hip = B^T` as row-major `N x K` and `B_hip = A^T` prepacked as `K x M`, computes `(B^T @ A^T) + bias[column]`, and the validator compares `HIP[j, i]` to TensileLite `D[i, j]`. This maps HIP's column-bias epilogue to TensileLite's factor-dim `I/M` bias epilogue.
 - Small/non-WGM8-divisible shapes are not reliable for this forced static-WGM8 generated kernel. Use shapes where `ceil(N / 128) % 8 == 0` for direct correctness sanity checks. For square aligned shapes this means `N % 1024 == 0`.
 - `1024^3` full-output validation with default `cpp_benchmarks` bias passed: `mismatches(abs>4)=0`, `max abs diff=0.125`.
 - `1536^3` full-output validation failed because `ceil(1536 / 128)=12` is not divisible by `8`. This confirms the limitation is WGM8 divisibility, not a simple lower-size threshold.
@@ -192,8 +192,8 @@ PyTorch/rocBLAS call and kernel identity:
 - PyTorch entry point: `~/pytorch/aten/src/ATen/native/cuda/Blas.cpp`.
 - `cublasCommonArgs` in `~/pytorch/aten/src/ATen/native/cuda/cuBlasCommonArgs.h` reformulates row-major output as a column-major BLAS problem with operand swap and transpose-flag flip.
 - ROCm fp16 GEMM fallback in `~/pytorch/aten/src/ATen/cuda/CUDABlas.cpp` calls `rocblas_gemm_ex` with fp16 A/B/C/D and fp32 compute.
-- rocBLAS log: `tmp_tensile_fp16_nt_hhs/logs/pytorch_rocblas_nt_8192`.
-- rocprof DB: `tmp_tensile_fp16_nt_hhs/rocprof_pytorch_rocblas_nt_8192/pytorch_rocblas_nt_8192_results.db`.
+- rocBLAS log: `~/tmp/feather_ops/tensile_fp16_nt_hhs/logs/pytorch_rocblas_nt_8192`.
+- rocprof DB: `~/tmp/feather_ops/tensile_fp16_nt_hhs/rocprof_pytorch_rocblas_nt_8192/pytorch_rocblas_nt_8192_results.db`.
 - rocBLAS call: `transA=N`, `transB=T`, `M=N=K=8192`, fp16 A/B/C/D, fp32 compute, `alpha=1.0`, `beta=0.0`, `solution_index=0`.
 - Selected kernel: `Cijk_Ailk_Bjlk_HHS_BH_MT128x128x16_MI16x16x16x1_SN_1LDSB1_AMAS0_BL1_BS1_EPS1_GLVWA8_GLVWB8_GRVW8_GSU1_GSUASB_ISA1151_IU1_K1_KLA_LBSPPA0_LBSPPB0_LPA0_LPB0_LRVW16_MIAV1_MMFGLC_NLCA1_NLCB1_PGR1_PLR1_SIA2_SS1_SU32_SUS256_SVW1_TT4_64_TLDS0_UMLDSA0_UMLDSB0_USFGROn1_VAW2_VSn1_VW1_VWB2_WSGRA0_WSGRB0_WS32_WG32_4_1_WGM8`.
 - rocprof resources: grid `(8192, 64, 1)`, workgroup `(128, 1, 1)`, LDS `8192`, VGPR `256`, SGPR `128`, no scratch.
@@ -208,18 +208,18 @@ Packaged rocBLAS loading and extraction:
 - Packaged compressed object: `~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_libraries/lib/rocblas/library/gfx1151/TensileLibrary_Type_HH_HPA_Contraction_l_Ailk_Bjlk_Cijk_Dijk_gfx1151.co`.
 - Helper HSACO: `~/venv_torch/lib/python3.14/site-packages/_rocm_sdk_libraries/lib/rocblas/library/gfx1151/Kernels.so-000-gfx1151.hsaco`.
 - The packaged `.co` is a compressed Clang offload bundle (`CCOB`). `clang-offload-bundler --list --type=o` reports `host-x86_64-unknown-linux-gnu-` and `hipv4-amdgcn-amd-amdhsa--gfx1151`.
-- Raw unbundled HSACO: `tmp_tensile_fp16_nt/outputs_full_tensile/packaged_rocblas_unbundled/TensileLibrary_Type_HH_HPA_Contraction_l_Ailk_Bjlk_Cijk_Dijk_gfx1151.raw.hsaco`.
+- Raw unbundled HSACO: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs_full_tensile/packaged_rocblas_unbundled/TensileLibrary_Type_HH_HPA_Contraction_l_Ailk_Bjlk_Cijk_Dijk_gfx1151.raw.hsaco`.
 
 Useful client configs and CSVs:
-- Packaged CCOB client config: `tmp_tensile_fp16_nt/configs/packaged_rocblas_hhs_bh_8192_client.ini`.
-- Packaged hot-loop override: `tmp_tensile_fp16_nt/configs/packaged_rocblas_hot_loop_override.ini`.
-- Packaged hot-loop CSV: `tmp_tensile_fp16_nt/outputs_full_tensile/packaged_rocblas_hhs_bh_8192_hot_loop.csv`.
-- Raw HSACO client config: `tmp_tensile_fp16_nt/configs/raw_rocblas_hhs_bh_8192_client.ini`.
-- Raw hot-loop override: `tmp_tensile_fp16_nt/configs/raw_rocblas_hot_loop_override.ini`.
-- Raw hot-loop CSV: `tmp_tensile_fp16_nt/outputs_full_tensile/raw_rocblas_hhs_bh_8192_hot_loop.csv`.
-- Full-Tensile beta-zero generated config: `tmp_tensile_fp16_nt/outputs_full_tensile/rocblas_hhs_bh_solution18_beta0_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_00/00_Final/source/ClientParameters.ini`.
-- Full-Tensile hot-loop override: `tmp_tensile_fp16_nt/configs/full_tensile_solution18_hot_loop_override.ini`.
-- Full-Tensile hot-loop CSV: `tmp_tensile_fp16_nt/outputs_full_tensile/rocblas_hhs_bh_solution18_beta0_8192_hot_loop.csv`.
+- Packaged CCOB client config: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/packaged_rocblas_hhs_bh_8192_client.ini`.
+- Packaged hot-loop override: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/packaged_rocblas_hot_loop_override.ini`.
+- Packaged hot-loop CSV: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs_full_tensile/packaged_rocblas_hhs_bh_8192_hot_loop.csv`.
+- Raw HSACO client config: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/raw_rocblas_hhs_bh_8192_client.ini`.
+- Raw hot-loop override: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/raw_rocblas_hot_loop_override.ini`.
+- Raw hot-loop CSV: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs_full_tensile/raw_rocblas_hhs_bh_8192_hot_loop.csv`.
+- Full-Tensile beta-zero generated config: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs_full_tensile/rocblas_hhs_bh_solution18_beta0_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_00/00_Final/source/ClientParameters.ini`.
+- Full-Tensile hot-loop override: `~/tmp/feather_ops/tensile_fp16_nt_hhh/configs/full_tensile_solution18_hot_loop_override.ini`.
+- Full-Tensile hot-loop CSV: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs_full_tensile/rocblas_hhs_bh_solution18_beta0_8192_hot_loop.csv`.
 
 Full-Tensile notes:
 - rocBLAS builds from full Tensile under `~/rocm-libraries/shared/tensile`. hipBLASLt uses TensileLite under `~/rocm-libraries/projects/hipblaslt/tensilelite`.
@@ -234,12 +234,12 @@ Full-Tensile notes:
 
 ### Key TensileLite Artifacts
 
-- Current guarded winner `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_nepbs10_sia3_nostoreprio_probe`: generated source root `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_nepbs10_sia3_nostoreprio_probe_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_Bias_H_HA_S_SAV_UserArgs_00/00_Final/caches/1d7647921045/source/`, final h2h CSVs `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_nepbs10_sia3_nostoreprio_probe_8192_final_h2h{1,4,5}.csv`, aggregated result median `45252.9 GFLOP/s`, mean `45491.6`.
-- Historical forced-WGM8 best `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe`: generated source root `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_Bias_H_HA_S_SAV_UserArgs_00/00_Final/caches/70928ca179f0/source/`, hot-loop override `tmp_tensile_fp16_nt_hhs/configs/tensilelite_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe_hot_loop_override.ini`, CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe_8192_hot_loop.csv`, result median `40483.9 GFLOP/s`, mean `40432.8`, best `40556.7`, derived median `27.159 ms`.
-- Static-WGM history: guarded static-WGM hot-loop CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_probe_8192_hot_loop.csv`, post-tightening CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_probe_8192_rebaseline_hot_loop.csv`, forced-WGM8 baseline CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_probe_8192_hot_loop.csv`.
-- Store scheduling CSVs: no-store-priority `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nostoreprio_probe_8192_hot_loop.csv`, NEPBS16 `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs16_probe_8192_hot_loop.csv`, NEPBS16+no-store-priority `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs16_nostoreprio_probe_8192_hot_loop.csv`.
-- Later config-only probe CSVs: NEPBS4/12/24/32, no-activation, `StoreSyncOpt=1`, `StoreSyncOpt=4`, and `GroupLoadStore=True` all use the same output naming pattern `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_<variant>_8192_hot_loop.csv`. Exact variant names and outcomes are in the experiment log and summary table.
-- Older anchor `mt128x128_tlds0_pgr1`: generated config `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_pgr1_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_Bias_H_HA_S_SAV_UserArgs_00/00_Final/caches/d49d8309b3e0/source/ClientParameters.ini`, hot-loop override `tmp_tensile_fp16_nt_hhs/configs/tensilelite_mt128x128_tlds0_pgr1_hot_loop_override.ini`, CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_pgr1_8192_hot_loop.csv`, result median `33942.5 GFLOP/s`, mean `33947.3`.
+- Current guarded winner `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_nepbs10_sia3_nostoreprio_probe`: generated source root `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_nepbs10_sia3_nostoreprio_probe_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_Bias_H_HA_S_SAV_UserArgs_00/00_Final/caches/1d7647921045/source/`, final h2h CSVs `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_nepbs10_sia3_nostoreprio_probe_8192_final_h2h{1,4,5}.csv`, aggregated result median `45252.9 GFLOP/s`, mean `45491.6`.
+- Historical forced-WGM8 best `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe`: generated source root `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_Bias_H_HA_S_SAV_UserArgs_00/00_Final/caches/70928ca179f0/source/`, hot-loop override `~/tmp/feather_ops/tensile_fp16_nt_hhs/configs/tensilelite_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe_hot_loop_override.ini`, CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe_8192_hot_loop.csv`, result median `40483.9 GFLOP/s`, mean `40432.8`, best `40556.7`, derived median `27.159 ms`.
+- Static-WGM history: guarded static-WGM hot-loop CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_probe_8192_hot_loop.csv`, post-tightening CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_probe_8192_rebaseline_hot_loop.csv`, forced-WGM8 baseline CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_probe_8192_hot_loop.csv`.
+- Store scheduling CSVs: no-store-priority `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nostoreprio_probe_8192_hot_loop.csv`, NEPBS16 `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs16_probe_8192_hot_loop.csv`, NEPBS16+no-store-priority `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs16_nostoreprio_probe_8192_hot_loop.csv`.
+- Later config-only probe CSVs: NEPBS4/12/24/32, no-activation, `StoreSyncOpt=1`, `StoreSyncOpt=4`, and `GroupLoadStore=True` all use the same output naming pattern `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_<variant>_8192_hot_loop.csv`. Exact variant names and outcomes are in the experiment log and summary table.
+- Older anchor `mt128x128_tlds0_pgr1`: generated config `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_pgr1_8192_out/1_BenchmarkProblems/Cijk_Ailk_Bjlk_HHS_BH_Bias_H_HA_S_SAV_UserArgs_00/00_Final/caches/d49d8309b3e0/source/ClientParameters.ini`, hot-loop override `~/tmp/feather_ops/tensile_fp16_nt_hhs/configs/tensilelite_mt128x128_tlds0_pgr1_hot_loop_override.ini`, CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_pgr1_8192_hot_loop.csv`, result median `33942.5 GFLOP/s`, mean `33947.3`.
 
 ### Experiment Log
 
@@ -253,7 +253,7 @@ Full-Tensile notes:
 - `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs16_probe` generated, validated, and hot-loop retimed at median `40365.0 GFLOP/s`, mean `40386.2`, best `40666.0`. This became the best at that point, then was superseded by NEPBS8.
 - `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs16_nostoreprio_probe` generated, validated, and hot-loop retimed at median `40272.6 GFLOP/s`, mean `40240.6`, best `40417.1`. Reject because it is slightly slower than NEPBS16 alone.
 - NEPBS16 assembly inspection: it changes the non-edge OptNLL store path from `4` global-write batches of about `32` elements to `8` batches of `16`, while dropping resources from `.vgpr_count: 256` to `.vgpr_count: 238` and keeping `.sgpr_count: 74`. The keeper still uses `StorePriorityOpt=True`. Removing it with NEPBS16 regressed slightly. This motivated the later `NumElementsPerBatchStore` sweep that promoted NEPBS8.
-- Added forced-WGM8 config-only batch-size probes `NEPBS8`, `NEPBS12`, `NEPBS24`, and `NEPBS32` in `tmp_tensile_fp16_nt_hhs/scripts/make_fp16_nt_hhs_scale_bias_sweep.py`, leaving `StorePriorityOpt=True`.
+- Added forced-WGM8 config-only batch-size probes `NEPBS8`, `NEPBS12`, `NEPBS24`, and `NEPBS32` in `~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/make_fp16_nt_hhs_scale_bias_sweep.py`, leaving `StorePriorityOpt=True`.
 - `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs8_probe` generated, validated, and hot-loop retimed at median `40483.9 GFLOP/s`, mean `40432.8`, best `40556.7`. This remained the best within the forced-WGM8 subgroup after NEPBS12/24/32, NEPBS4, no-activation, StoreSyncOpt, and GroupLoadStore probes, but was later superseded by the guarded SIA3/no-store-priority config.
 - `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs12_probe` generated, validated, and hot-loop retimed at median `40344.4 GFLOP/s`, mean `40378.0`, best `40601.3`. Reject because it is slower than both NEPBS8 and NEPBS16.
 - `mt128x128_tlds0_rocblas_1ldsb_vwb2_static_wgm_forced_nepbs24_probe` generated, validated, and hot-loop retimed at median `37142.7 GFLOP/s`, mean `37204.6`, best `37649.8`. Reject because it regresses to the old forced-WGM8 baseline band.
@@ -292,23 +292,23 @@ Full-Tensile notes:
 
 ### VWB2 Performance Findings
 
-- Correctness-only patched pure-HHS VWB2 hot-loop CSV: `tmp_tensile_fp16_nt/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_hot_loop.csv`. Median moved around `31.1 TFLOP/s` before allocation compaction.
-- Correctness-only patched scale/bias VWB2 hot-loop CSV: `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_probe_8192_hot_loop.csv`. Median moved around `30.5-30.6 TFLOP/s` before allocation compaction.
+- Correctness-only patched pure-HHS VWB2 hot-loop CSV: `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_hot_loop.csv`. Median moved around `31.1 TFLOP/s` before allocation compaction.
+- Correctness-only patched scale/bias VWB2 hot-loop CSV: `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_probe_8192_hot_loop.csv`. Median moved around `30.5-30.6 TFLOP/s` before allocation compaction.
 - `KernelWriter.py` PLR buffer compaction: for one-iteration WMMA_V1 half/BF16 loops where `PrefetchLocalRead >= LoopIters` and PLR modulo already collapses to zero, cap `numVgprBuffer` to `1`. Pure-HHS VWB2 improved to median `33158.2 GFLOP/s`, scale/bias VWB2 improved to median `32850.0 GFLOP/s`.
 - `KernelWriter.py` allocation-order experiment: for the same one-iteration WMMA_V1 half/BF16 non-converting `PGR1/PLR1` path, re-place A/B operands immediately after C and assign local-write/global-read-offset/G2L/local-read address VGPRs after A/B, matching full Tensile's main-loop VGPR layout.
-- Patched allocation-order pure-HHS VWB2 result: `.sgpr_count: 74`, `.vgpr_count: 255`, `vgprValuA=130`, `vgprValuB=163`, `vgprG2LA=200`, `vgprG2LB=208`, `vgprSerial=218`, CSV `tmp_tensile_fp16_nt/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_hot_loop.csv`, median `33551.2 GFLOP/s`, mean `33502.5 GFLOP/s`, best `33775.1 GFLOP/s`, derived median `32.771 ms`.
-- Patched allocation-order scale/bias VWB2 result: `.sgpr_count: 74`, `.vgpr_count: 256`, same main-loop VGPR placement, CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_probe_8192_hot_loop.csv`, median `33157.6 GFLOP/s`, mean `33192.9 GFLOP/s`, best `33656.4 GFLOP/s`, derived median `33.160 ms`.
-- Same-session re-baseline kept existing generated artifacts and added separate override CSVs so prior results remain intact. Pure-HHS VWB2 CSV `tmp_tensile_fp16_nt/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_rebaseline_hot_loop.csv`: `10` rows, median `33444.6 GFLOP/s`, mean `33389.4 GFLOP/s`, best `33824.3 GFLOP/s`, derived median `32.876 ms`. Scale/bias VWB2 CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_probe_8192_rebaseline_hot_loop.csv`: `10` rows, median `32016.2 GFLOP/s`, mean `32013.5 GFLOP/s`, best `32344.2 GFLOP/s`, derived median `34.342 ms`. Then-current-best `mt128x128_tlds0_pgr1` scale/bias CSV `tmp_tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_pgr1_8192_rebaseline_hot_loop.csv`: `10` rows, median `33652.1 GFLOP/s`, mean `33542.5 GFLOP/s`, best `33798.8 GFLOP/s`, derived median `32.673 ms`.
+- Patched allocation-order pure-HHS VWB2 result: `.sgpr_count: 74`, `.vgpr_count: 255`, `vgprValuA=130`, `vgprValuB=163`, `vgprG2LA=200`, `vgprG2LB=208`, `vgprSerial=218`, CSV `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_hot_loop.csv`, median `33551.2 GFLOP/s`, mean `33502.5 GFLOP/s`, best `33775.1 GFLOP/s`, derived median `32.771 ms`.
+- Patched allocation-order scale/bias VWB2 result: `.sgpr_count: 74`, `.vgpr_count: 256`, same main-loop VGPR placement, CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_probe_8192_hot_loop.csv`, median `33157.6 GFLOP/s`, mean `33192.9 GFLOP/s`, best `33656.4 GFLOP/s`, derived median `33.160 ms`.
+- Same-session re-baseline kept existing generated artifacts and added separate override CSVs so prior results remain intact. Pure-HHS VWB2 CSV `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_rebaseline_hot_loop.csv`: `10` rows, median `33444.6 GFLOP/s`, mean `33389.4 GFLOP/s`, best `33824.3 GFLOP/s`, derived median `32.876 ms`. Scale/bias VWB2 CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_rocblas_1ldsb_vwb2_probe_8192_rebaseline_hot_loop.csv`: `10` rows, median `32016.2 GFLOP/s`, mean `32013.5 GFLOP/s`, best `32344.2 GFLOP/s`, derived median `34.342 ms`. Then-current-best `mt128x128_tlds0_pgr1` scale/bias CSV `~/tmp/feather_ops/tensile_fp16_nt_hhs/outputs/hhs_nt_scale_bias_mt128x128_tlds0_pgr1_8192_rebaseline_hot_loop.csv`: `10` rows, median `33652.1 GFLOP/s`, mean `33542.5 GFLOP/s`, best `33798.8 GFLOP/s`, derived median `32.673 ms`.
 - Re-baseline interpretation: existing VWB2 artifacts still validate and have the expected patched assembly shape (`ds_load_u16`/`ds_load_u16_d16_hi`, `.sgpr_count: 74`, compact `vgprSerial=218`). Before static-WGM, scale/bias VWB2 was not competitive with `mt128x128_tlds0_pgr1`. Guarded static-WGM plus later SIA3/no-store-priority tuning ultimately made this path the winner.
 
 ### Prior Gap Isolation
 
 - Purpose: this is historical evidence from before static-WGM/forced-WGM8. It explains why we stopped looking at main-loop opcodes, L2/LDS behavior, and broad launch/ABI rewrites.
-- Full-Tensile no-beta VWB2 control used `HHS_H`, `UseBeta: False`, `readsPerIterA/B=64`, `.sgpr_count: 64`, `.vgpr_count: 256`, LDS `8192`. Hot-loop CSV `tmp_tensile_fp16_nt/outputs_full_tensile/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_hot_loop.csv`: median `35233.2 GFLOP/s`, mean `35247.5`, best `35576.9`, derived median `31.207 ms`.
+- Full-Tensile no-beta VWB2 control used `HHS_H`, `UseBeta: False`, `readsPerIterA/B=64`, `.sgpr_count: 64`, `.vgpr_count: 256`, LDS `8192`. Hot-loop CSV `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs_full_tensile/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_probe_8192_hot_loop.csv`: median `35233.2 GFLOP/s`, mean `35247.5`, best `35576.9`, derived median `31.207 ms`.
 - Normalized steady-loop opcode stream was effectively matched: first unroll-half count `187`, including `4` `buffer_load_b128`, `4` `ds_store_b128`, `64` `ds_load_u16`, `64` `ds_load_u16_d16_hi`, `16` WMMA, and `2` barriers. The only spelling difference was TL `s_waitcnt` versus full `s_waitcnt_lgkmcnt`, targeting the same wait class here.
 - Static object check showed identical main-loop size (`0xa9c` bytes), but much larger TL non-loop code: TL entry/open/end `0x2800/0x3c08/0xb368`. Full entry/open/end `0x1b00/0x20d4/0x7094`. Conclusion: the old gap was prologue/alternate-path/ABI state, not the compiled main loop.
 - Resource/prologue contrast worth remembering: TL kept `.sgpr_count: 74`, UserArgs/general-batch routing, dynamic GSU setup, and runtime workgroup/WGM quotient-remainder code. Full no-beta was `.sgpr_count: 64` with more compact precomputed fields. rocprof rounded both to `vgpr_count=256`, `sgpr_count=128`, LDS `8192`, scratch `0`, so this was not an occupancy-level difference in that profile.
-- rocprof counter DBs: TL `tmp_tensile_fp16_nt/rocprof_tl_hhs_vwb2_rebaseline/tl_hhs_vwb2_results.db`. Full `tmp_tensile_fp16_nt/rocprof_full_hhs_vwb2_rebaseline/full_hhs_vwb2_results.db`. Counters over 12 GEMM dispatches showed similar L2 hit rate (`18.99%` TL vs `18.50%` full) and `LDSBankConflict=0`. TL `VALUInsts` median `9224`, full `9140`.
+- rocprof counter DBs: TL `~/tmp/feather_ops/tensile_fp16_nt_hhh/rocprof_tl_hhs_vwb2_rebaseline/tl_hhs_vwb2_results.db`. Full `~/tmp/feather_ops/tensile_fp16_nt_hhh/rocprof_full_hhs_vwb2_rebaseline/full_hhs_vwb2_results.db`. Counters over 12 GEMM dispatches showed similar L2 hit rate (`18.99%` TL vs `18.50%` full) and `LDSBankConflict=0`. TL `VALUInsts` median `9224`, full `9140`.
 - Launch mapping observation: TL dispatch was flattened `(grid_x=524288, grid_y=1)`, full used `(8192,64)`, both with `4096` workgroups. `ContractionSolution::generateSingleCall` deliberately flattens when `internalArgsSupport.version >= 1`. Assembly reconstructs `WorkGroup0/1/2`. Direct 2D launch remains a broad runtime/codegen ABI refactor, not a local tuning patch.
 - Ruled-out mapping probes from this investigation are summarized below: scalar `NumWorkGroups0/1` regressed to `31909.6 GFLOP/s`, WGMXCC1 regressed to `31691.3`, and WGM1 regressed to `14544.3`.
 - Static-WGM followed from this isolation and is now summarized in the artifact section and experiment log. Important implementation note: the first valid static-WGM compile crashed because a temp SGPR overwrite lost the original WGM block id before `blockId * WGM` was added back to `WorkGroup1`. Preserving the original block id fixed validation.
@@ -316,12 +316,12 @@ Full-Tensile notes:
 ### Ruled-Out Low-Risk Controls
 
 - `MIArchVgpr: 0`: generated and validated, but the kernel still had `MIAV1` in the name and unchanged `.sgpr_count: 74`, `.vgpr_count: 255`, `vgprValuA=136`, `vgprValuB=201`, `vgprG2LA=234`, `vgprG2LB=242`, `vgprSerial=250` before the later allocation fixes.
-- `LocalWriteUseSgprA/B`: rejected before generation as invalid TensileLite fork parameters. Log path `tmp_tensile_fp16_nt/logs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_lwsgpr_probe_8192.log`.
-- `SupportUserArgs: False`: generated as `HHS_H` and validated, but kept the same general/multigemm prologue and `.sgpr_count: 74`. Hot-loop CSV `tmp_tensile_fp16_nt/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_no_userargs_probe_8192_hot_loop.csv`, median `33372.1 GFLOP/s`.
-- `Batched: False`: after switching to 3-index `ProblemSizes: [8192, 8192, 8192]`, generation reached `Cij_Aik_Bjk_HHS_H_UserArgs` but failed in `KernelWriterAssembly.py::computeLoadSrd` with `UnboundLocalError: cannot access local variable 'stridedBatchedGemmLoad_End'`. Log path `tmp_tensile_fp16_nt/logs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_nonbatched_probe_8192.log`.
-- `GlobalSplitU: 0`: rejected before assembly generation with `reject: Either GSU or StreamK must be enabled`, then `0 valid solutions`. Log path `tmp_tensile_fp16_nt/logs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_gsu0_probe_8192.log`.
+- `LocalWriteUseSgprA/B`: rejected before generation as invalid TensileLite fork parameters. Log path `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_lwsgpr_probe_8192.log`.
+- `SupportUserArgs: False`: generated as `HHS_H` and validated, but kept the same general/multigemm prologue and `.sgpr_count: 74`. Hot-loop CSV `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_no_userargs_probe_8192_hot_loop.csv`, median `33372.1 GFLOP/s`.
+- `Batched: False`: after switching to 3-index `ProblemSizes: [8192, 8192, 8192]`, generation reached `Cij_Aik_Bjk_HHS_H_UserArgs` but failed in `KernelWriterAssembly.py::computeLoadSrd` with `UnboundLocalError: cannot access local variable 'stridedBatchedGemmLoad_End'`. Log path `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_nonbatched_probe_8192.log`.
+- `GlobalSplitU: 0`: rejected before assembly generation with `reject: Either GSU or StreamK must be enabled`, then `0 valid solutions`. Log path `~/tmp/feather_ops/tensile_fp16_nt_hhh/logs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_gsu0_probe_8192.log`.
 - `PreloadKernArgs: True`: generated and validated but forced back to `PKA0` on gfx1151 and left resources/prologue unchanged.
-- `GlobalSplitUAlgorithm: SingleBuffer`: generated and validated but worsened resources to `.sgpr_count: 76`, `.vgpr_count: 255`. Hot-loop CSV `tmp_tensile_fp16_nt/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_singlebuffer_probe_8192_hot_loop.csv`, median `32445.7 GFLOP/s`.
+- `GlobalSplitUAlgorithm: SingleBuffer`: generated and validated but worsened resources to `.sgpr_count: 76`, `.vgpr_count: 255`. Hot-loop CSV `~/tmp/feather_ops/tensile_fp16_nt_hhh/outputs/hhs_nt_hhs_mt128x128_tlds0_rocblas_vwb2_singlebuffer_probe_8192_hot_loop.csv`, median `32445.7 GFLOP/s`.
 - Scalar `NumWorkGroups0/1` calculation: source patch generated and validated, but pure-HHS VWB2 hot-loop median regressed to `31909.6 GFLOP/s`. Skip scale/bias follow-up and keep the original vector ceil-divide path.
 - Explicit WGMXCC1 config: pure-HHS generated and validated, but did not remove the WGMXCC prologue and regressed to median `31691.3 GFLOP/s`. Skip scale/bias follow-up.
 - `WorkGroupMapping: 1`: pure-HHS generated and validated, but collapsed to median `14544.3 GFLOP/s`. WGM8 cache/traversal behavior is required for this shape.
@@ -386,14 +386,14 @@ Full-Tensile notes:
 
 ## Key Files
 
-- HHS scale/bias generator: `tmp_tensile_fp16_nt_hhs/scripts/make_fp16_nt_hhs_scale_bias_sweep.py`.
-- HHS scale/bias runner: `tmp_tensile_fp16_nt_hhs/scripts/run_fp16_nt_hhs_variant.sh`.
-- PyTorch rocBLAS benchmark: `tmp_tensile_fp16_nt_hhs/scripts/benchmark_pytorch_rocblas_nt.py`.
-- Pure-HHS/HHH generator: `tmp_tensile_fp16_nt/scripts/make_fp16_nt_speed_sweep.py`.
-- Pure-HHS/HHH runner: `tmp_tensile_fp16_nt/scripts/run_fp16_nt_variant.sh`.
+- HHS scale/bias generator: `~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/make_fp16_nt_hhs_scale_bias_sweep.py`.
+- HHS scale/bias runner: `~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/run_fp16_nt_hhs_variant.sh`.
+- PyTorch rocBLAS benchmark: `~/tmp/feather_ops/tensile_fp16_nt_hhs/scripts/benchmark_pytorch_rocblas_nt.py`.
+- Pure-HHS/HHH generator: `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/make_fp16_nt_speed_sweep.py`.
+- Pure-HHS/HHH runner: `~/tmp/feather_ops/tensile_fp16_nt_hhh/scripts/run_fp16_nt_variant.sh`.
 - TensileLite source to patch: `~/rocm-libraries/projects/hipblaslt/tensilelite`.
 - Full Tensile source reference: `~/rocm-libraries/shared/tensile`.
 - rocBLAS logic reference: `~/rocm-libraries/projects/rocblas/library/src/blas3/Tensile/Logic/asm_full/strixhalo/strixhalo_Cijk_Ailk_Bjlk_HHS_BH.yaml`.
-- FeatherOps wrapper benchmark: `benchmark_mm_hipblaslt_fp16.py`.
-- FeatherOps hipBLASLt wrapper: `kernel/hip/hipblaslt_kernel_fp16.cu`.
+- FeatherOps wrapper benchmark: `~/feather-ops/bench/benchmark_mm_hipblaslt_fp16.py`.
+- FeatherOps hipBLASLt wrapper: `~/feather-ops/csrc/hipblaslt_kernel_fp16.cu`.
 - gfx1151 profiling reference: `doc/gfx1151_reference.md`.

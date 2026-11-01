@@ -33,7 +33,7 @@
 
 ## Scope and artifacts
 
-This analysis focuses on the steady-state tuned kernel for `profile_scaled_mm_torch.py` at `N=8192`, on this machine (`gfx1151`).
+This analysis focuses on the steady-state tuned kernel for `~/feather-ops/profile/profile_scaled_mm_torch.py` at `N=8192`, on this machine (`gfx1151`).
 
 Artifacts generated in this repo:
 - `rocprof_torch_8192_steady/torch8192_steady_results.db`
@@ -41,8 +41,8 @@ Artifacts generated in this repo:
 - `rocprof_torch_8192/torch8192_results.db` (earlier run with autotune activity)
 
 Key source files inspected:
-- `profile_scaled_mm_torch.py`
-- `kernel/naive.py`
+- `~/feather-ops/profile/profile_scaled_mm_torch.py`
+- `~/feather-ops/feather_ops/naive.py`
 - `~/pytorch/torch/_inductor/kernel/mm.py`
 - `~/pytorch/torch/_inductor/utils.py`
 - `~/pytorch/torch/_inductor/config.py`

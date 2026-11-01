@@ -7,7 +7,7 @@ Code in this repo is from commit `71bada8f73ab35f1ce1ed67ebaf237bcb0744a91`. `sc
 
 ## C++ Benchmarks
 
-`cpp_benchmarks/build_benchmark_scaled_mm_hip.sh`, `cpp_benchmarks/build_benchmark_mm_hipblaslt_fp16.sh`, without Python and torch overhead.
+`~/feather-ops/cpp_benchmarks/CMakeLists.txt` targets `benchmark_scaled_mm_hip` and `benchmark_mm_hipblaslt_fp16`, without Python and torch overhead.
 
 | rocm | scaled_mm_hip avg ms | scaled_mm_hip std ms | scaled_mm_hip avg TFLOPS | mm_hipblaslt_fp16 avg ms | mm_hipblaslt_fp16 std ms | mm_hipblaslt_fp16 avg TFLOPS |
 |---|---|---|---|---|---|---|
@@ -39,7 +39,7 @@ The hipBLASLt kernel is highly sensitive to thermal throttling, so it may give 3
 
 From now on we use rocm 7.13.0a20260327 .
 
-`benchmark_scaled_mm_hip_configs.py`, where the PyTorch overhead matters.
+`~/feather-ops/bench/benchmark_scaled_mm_hip_configs.py`, where the PyTorch overhead matters.
 
 | torch | scaled_mm_hip avg ms | scaled_mm_hip std ms | scaled_mm_hip avg TFLOPS |
 |---|---|---|---|

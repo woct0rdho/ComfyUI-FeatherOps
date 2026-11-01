@@ -85,8 +85,8 @@ Compiler hides these waits by interleaving conversion VALU. E.8 proved eliminati
 
 - Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
 - Per-step order:
-  - `python test_scaled_mm_hip.py`
-  - `python benchmark_scaled_mm_hip.py`
+  - `python -m pytest ~/feather-ops/tests/test_scaled_mm_hip.py -q`
+  - `python ~/feather-ops/bench/benchmark_scaled_mm_hip.py`
   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
 - Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
 - If a new baseline is kept, commit the kernel immediately.
@@ -259,7 +259,7 @@ rocprofv3 on gfx1151: max 6 PMC counters per run (more causes crash). Use two ru
 - Run 2: `SQ_INSTS_FLAT SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_TEX_STORE SQ_INSTS_WAVE32_VALU SQ_WAVE32_INSTS`
 
 ```bash
-rocprofv3 --pmc <COUNTER1> <COUNTER2> ... -- python -u profile_scaled_mm_hip.py
+rocprofv3 --pmc <COUNTER1> <COUNTER2> ... -- python -u ~/feather-ops/profile/profile_scaled_mm_hip.py
 # Results in x2/<pid>_results.db
 sqlite3 x2/<pid>_results.db "
 SELECT ipm.name, AVG(p.value) as avg_val
@@ -272,7 +272,7 @@ GROUP BY ipm.name ORDER BY avg_val DESC;"
 
 Compile single config with `-save-temps` (edit `_CONFIGS` and dispatch table to 1 config first):
 ```bash
-hipcc -save-temps [flags] -c kernel/hip/hip_kernel.hip -o /tmp/out.o
+hipcc -save-temps [flags] -c ~/feather-ops/csrc/hip_kernel.cu -o /tmp/out.o
 # GPU ASM: hip_kernel-hip-amdgcn-amd-amdhsa-gfx1151.s
 # Hot kernel: kContigFastPath=true variant (Lb0ELb1E in mangled name)
 # Config 2,4,2,2,4,4: Li2ELi4ELi2ELi2ELi4ELi4ELb0ELb1E (lines 36919-38617)
@@ -296,11 +296,11 @@ hipcc -save-temps [flags] -c kernel/hip/hip_kernel.hip -o /tmp/out.o
 
 ## File References
 
-- `kernel/hip/hip_kernel.cu` - Main kernel (baseline, 36.134 TFLOPS)
-- `kernel/hip/hip_kernel.py` - Python wrapper, JIT, autotune
-- `test_scaled_mm_hip.py` - Correctness test (all configs x 5 sizes)
-- `benchmark_scaled_mm_hip.py` - Full benchmark (N=128..8192)
-- `profile_scaled_mm_hip.py` - Profiling script for rocprofv3
-- `profile_out/` - Profiling output directory
+- `~/feather-ops/csrc/hip_kernel.cu` - Main kernel (baseline, 36.134 TFLOPS)
+- `~/feather-ops/feather_ops/scaled_mm.py` - Python wrapper and autotune
+- `~/feather-ops/tests/test_scaled_mm_hip.py` - Parameterized correctness test (all compatible configs and sizes)
+- `~/feather-ops/bench/benchmark_scaled_mm_hip.py` - Full benchmark (N=128..8192)
+- `~/feather-ops/profile/profile_scaled_mm_hip.py` - Profiling script for rocprofv3
+- `~/feather-ops/profile_out/` - Profiling output directory
 - `~/rdna35-isa-markdown/` - ISA reference (large, grep don't read)
 - `~/amd-llvm-project/`, especially `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst` - hipcc source code

@@ -10,8 +10,8 @@
   - Treat layout as part of the kernel design space.
   - Keep prepack out of the timed region when comparing kernel performance.
 - Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Primary performance metric for gap-closing: native C++ fixed-config benchmark (`cpp_benchmarks/benchmark_mm_hip_fp16`).
-- Secondary integration metric: `benchmark_mm_hip_fp16.py` TFLOPS.
+- Primary performance metric for gap-closing: native C++ fixed-config benchmark (`~/feather-ops/cpp_benchmarks/build/benchmark_mm_hip_fp16`).
+- Secondary integration metric: `~/feather-ops/bench/benchmark_mm_hip_fp16.py` TFLOPS.
   - C++ and Python results are not directly comparable because Python/Torch overhead is different.
   - Only compare absolute TFLOPS within the same harness.
 - Keep rule:
@@ -26,7 +26,7 @@
   - our current HIP kernel, forced `(1,8,2,8,2)`: `28.7 TFLOPS`
   - hipBLASLt native benchmark, `solution_index 1112`: `37.6 TFLOPS`
   - current gap: `8.9 TFLOPS` (`31%`)
-- Latest full benchmark (`python benchmark_mm_hip_fp16.py`):
+- Latest full benchmark (`python ~/feather-ops/bench/benchmark_mm_hip_fp16.py`):
   - `N=2048`: 15.7 TFLOPS
   - `N=4096`: 34.3 TFLOPS
   - `N=8192`: 27.9 TFLOPS
@@ -63,7 +63,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - temporary B-identity-load variant (`rocprof_fp16_bank_b_identity/`): `0.0%` -> conflicts came from the B LDS load remap in `wmma_compute_stage`
 - Implemented fix: change FP16 prepack to keep logical N order while preserving `(K/8, N, 8)` vec8 chunks, and change compute-side B LDS reads to identity mapping.
 - Final validation (`rocprof_fp16_bank_identity_final/`, forced `(1,8,2,8,2)`): `LDSBankConflict = 0.0%`, average profiled kernel time `37.9 ms`.
-- Full benchmark result (`python benchmark_mm_hip_fp16.py`): `N=8192` 27.4 TFLOPS (up from 26.7), with the winner config still `(1,8,2,8,2)`.
+- Full benchmark result (`python ~/feather-ops/bench/benchmark_mm_hip_fp16.py`): `N=8192` 27.4 TFLOPS (up from 26.7), with the winner config still `(1,8,2,8,2)`.
 - Key takeaway: B prepack is useful for 128-bit transport, but it does not need the old swizzled-N order. Identity-order prepack keeps the same LDS footprint and removes bank conflicts.
 
 ### P2: Bottleneck Profiling For `(1,8,2,8,2)` - KEEP analysis
@@ -87,7 +87,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - `L2CacheHit 32.5`
   - `VALUInsts = 11406`
 - Main conclusion: after fixing B bank conflicts, the `(1,8,2,8,2)` kernel is bottlenecked by serialized chunk-boundary refill + synchronization. The current loop computes the whole current chunk, then hits a barrier, then fetches the next chunk, then hits another barrier. There is effectively no overlap between next-chunk global refill and current-chunk WMMA.
-- Controlled C++ ablation benchmark (`tmp_fp16_analysis/mm_fp16_vram_lds_ablation.cu`, `tmp_fp16_analysis/benchmark_mm_fp16_vram_lds_ablation.cpp`) now isolates the chunk-refill path without Python/Torch overhead and without zero-input bias:
+- Controlled C++ ablation benchmark (`~/tmp/feather_ops/fp16_analysis/mm_fp16_vram_lds_ablation.cu`, `~/tmp/feather_ops/fp16_analysis/benchmark_mm_fp16_vram_lds_ablation.cpp`) now isolates the chunk-refill path without Python/Torch overhead and without zero-input bias:
   - Forced config only: `(1,8,2,8,2)`
   - Kept method: load the first chunk from real random fp16 inputs, then for later chunks selectively reuse the already-random LDS contents instead of refilling from global memory. This avoids the known `WMMA-with-zeros` speedup while also avoiding synthetic-PRNG overhead in the timed loop.
   - Repeated `N=8192` runs (2 passes, 100 timed iters each) give mean kernel times:
@@ -100,7 +100,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - The B-side refill dominates the exposed cost. That matches the larger per-chunk B payload (`16 KB`) versus A (`8 KB`) for `(1,8,2,8,2)`.
     - The A-only and B-only deltas are not additive (`5.4 + 13.7 > 15.2 ms`), so the refill costs share fixed sync/issue overhead and interact with each other.
     - With both refills removed, the kernel rises to `44.06 TFLOPS`, which is strong evidence that the math/LDS-read body is already capable of near-FP8-class throughput once chunk refills are taken out of the critical path.
-- Controlled C++ ablation benchmark for the compute-side LDS->VGPR path (`tmp_fp16_analysis/mm_fp16_lds_vgpr_ablation.cu`, `tmp_fp16_analysis/benchmark_mm_fp16_lds_vgpr_ablation.cpp`) now measures the *exposed* cost of the inner `ds_read -> VGPR` fragment loads while keeping global refill intact:
+- Controlled C++ ablation benchmark for the compute-side LDS->VGPR path (`~/tmp/feather_ops/fp16_analysis/mm_fp16_lds_vgpr_ablation.cu`, `~/tmp/feather_ops/fp16_analysis/benchmark_mm_fp16_lds_vgpr_ablation.cpp`) now measures the *exposed* cost of the inner `ds_read -> VGPR` fragment loads while keeping global refill intact:
   - Forced config only: `(1,8,2,8,2)`
   - Kept method: always use real random fp16 A/B input tensors. Inside the compute stage, selectively reuse already-loaded random fragments to remove part of the LDS->VGPR traffic without introducing zero operands.
   - To avoid changing occupancy with long-lived fragment caches, the A-side study uses a *pairwise* reuse mode (`reuse_a_p2`): the kernel loads A from LDS on even `rm` and reuses that fragment for the next odd `rm`, so 50% of A LDS->VGPR loads are removed. The B-side study (`reuse_b`) loads only one of the two `rn` fragments and reuses it for the second tile, so 50% of B LDS->VGPR loads are removed.
@@ -127,7 +127,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - Generated-code / metadata confirmation on the kept variant (`extracted hsaco metadata`):
   - `(1,8,2,8,2)` now uses `VGPR=190`, `LDS=24576 B`, `private=0`, `vgpr_spills=0`.
   - This preserves the old LDS footprint while adding only modest register pressure.
-- Full benchmark result (`python benchmark_mm_hip_fp16.py`) after adding a small/medium-N autotune guard:
+- Full benchmark result (`python ~/feather-ops/bench/benchmark_mm_hip_fp16.py`) after adding a small/medium-N autotune guard:
   - `N=2048`: 15.7 TFLOPS, autotuned to `(4,2,2,2,4)`
   - `N=4096`: 34.3 TFLOPS, autotuned to `(1,8,2,8,2)`
   - `N=8192`: 27.9 TFLOPS, autotuned to `(1,8,2,8,2)`
@@ -149,12 +149,12 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 ### P5: Native B-Prefetch Sweep And Runtime Heuristic - KEEP
 
 - Added native `auto|on|off` B-prefetch control to the FP16 benchmark/kernel path:
-  - benchmark harness: `cpp_benchmarks/benchmark_mm_hip_fp16.cpp`
-  - build script: `cpp_benchmarks/build_benchmark_mm_hip_fp16.sh`
-  - sweep runner: `tmp_fp16_analysis/run_b_prefetch_sweep.py`
-  - transition sweep runner: `tmp_fp16_analysis/run_b_prefetch_region_sweep.py`
-  - raw sweep results: `tmp_fp16_analysis/b_prefetch_sweep.csv`
-  - focused transition sweep log: `tmp_fp16_analysis/b_prefetch_region_sweep.txt`
+  - benchmark harness: `~/feather-ops/cpp_benchmarks/benchmark_mm_hip_fp16.cpp`
+  - build target: `benchmark_mm_hip_fp16` in `~/feather-ops/cpp_benchmarks/CMakeLists.txt`
+  - sweep runner: `~/tmp/feather_ops/fp16_analysis/run_b_prefetch_sweep.py`
+  - transition sweep runner: `~/tmp/feather_ops/fp16_analysis/run_b_prefetch_region_sweep.py`
+  - raw sweep results: `~/tmp/feather_ops/fp16_analysis/b_prefetch_sweep.csv`
+  - focused transition sweep log: `~/tmp/feather_ops/fp16_analysis/b_prefetch_region_sweep.txt`
 - The kernel now supports the simplified policy requested for this search:
   - either prefetch all B stages in the next chunk,
   - or prefetch none of them.
@@ -178,7 +178,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - `(2,1,4,2,2)`
   - The wide `128x256` family `(1,8,*,8,2)` benefits on most shapes, but the large wide-N / short-K case `(8192,12288,2048)` is a real exception and should keep prefetch off.
   - Very small-`M` row paths need a small explicit exception: `(1,8,2,1,2)` helps on `(32,12288,2048)` even though the general short-K rule is more conservative.
-- Focused transition sweep (`tmp_fp16_analysis/b_prefetch_region_sweep.txt`) tightened the boundaries:
+- Focused transition sweep (`~/tmp/feather_ops/fp16_analysis/b_prefetch_region_sweep.txt`) tightened the boundaries:
   - short-K wide-N `128x256` tile `(1,8,2,8,2)` stays positive through `M=2048`, then flips negative by `M=4096`
   - long-K `128x128` / `warps_n=2` families split into two coarse regions:
     - balanced `warps_m == warps_n` stays positive only through `M=512`
@@ -203,13 +203,13 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 ### P6: Native A-WSGR Sweep And Runtime Heuristic - KEEP
 
 - Restored native FP16 benchmark controls and added explicit A-side WSGR mode selection:
-  - benchmark harness: `cpp_benchmarks/benchmark_mm_hip_fp16.cpp`
+  - benchmark harness: `~/feather-ops/cpp_benchmarks/benchmark_mm_hip_fp16.cpp`
   - kernel launch entrypoint: `launch_mm_fp16_tuning_mode(...)`
-  - full sweep runner: `tmp_fp16_analysis/run_a_wsgr_sweep.py`
-  - focused transition runner: `tmp_fp16_analysis/run_a_wsgr_region_sweep.py`
-  - raw sweep results: `tmp_fp16_analysis/a_wsgr_sweep.csv`
-  - focused transition log: `tmp_fp16_analysis/a_wsgr_region_sweep.txt`
-  - target-shape auto validation: `tmp_fp16_analysis/a_wsgr_auto_validation.txt`
+  - full sweep runner: `~/tmp/feather_ops/fp16_analysis/run_a_wsgr_sweep.py`
+  - focused transition runner: `~/tmp/feather_ops/fp16_analysis/run_a_wsgr_region_sweep.py`
+  - raw sweep results: `~/tmp/feather_ops/fp16_analysis/a_wsgr_sweep.csv`
+  - focused transition log: `~/tmp/feather_ops/fp16_analysis/a_wsgr_region_sweep.txt`
+  - target-shape auto validation: `~/tmp/feather_ops/fp16_analysis/a_wsgr_auto_validation.txt`
 - Sweep protocol:
   - keep `B-prefetch=auto`,
   - benchmark only native C++ `--no-bias`,
@@ -244,7 +244,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 - Replay result on the 10-shape native sweep:
   - this kept heuristic matches the per-shape best winner across the studied sweep set.
   - the old `repeat_m <= 4` rule missed the best winner on `(128,2048,12288)` by over-enabling WSGR on a `repeat_m=1` path.
-- Auto validation on the four target Qwen-Image shapes (`tmp_fp16_analysis/a_wsgr_auto_validation.txt`):
+- Auto validation on the four target Qwen-Image shapes (`~/tmp/feather_ops/fp16_analysis/a_wsgr_auto_validation.txt`):
   - `(32,12288,2048)` -> best `(1,8,2,1,2)` at `7.23 TFLOPS`
   - `(32,2048,12288)` -> best `(1,1,4,1,2)` at `5.40 TFLOPS`
   - `(8192,12288,2048)` -> best `(1,8,2,8,2)` at `29.58 TFLOPS`
@@ -307,9 +307,9 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
 
 - Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
 - Per-step order:
-  - `python test_mm_hip_fp16.py`
-  - for the current `8192^3` gap-closing branch, use `cpp_benchmarks/benchmark_mm_hip_fp16` as the primary performance check with a single forced config
-  - only after a promising C++ win, optionally run `python benchmark_mm_hip_fp16.py` as a secondary integration check
+  - `python -m pytest ~/feather-ops/tests/test_mm_hip_fp16.py -q`
+  - for the current `8192^3` gap-closing branch, use `~/feather-ops/cpp_benchmarks/build/benchmark_mm_hip_fp16` as the primary performance check with a single forced config
+  - only after a promising C++ win, optionally run `python ~/feather-ops/bench/benchmark_mm_hip_fp16.py` as a secondary integration check
   - never compare absolute TFLOPS between C++ and Python
   - If it regresses, explain the reason by inspecting the generated code and/or profiling.
 - Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.

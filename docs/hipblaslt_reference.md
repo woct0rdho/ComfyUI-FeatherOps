@@ -8,12 +8,12 @@
 ## Current Verified Status
 
 - Local native benchmark:
-  - `cpp_benchmarks/build_benchmark_mm_hipblaslt_fp16.sh`
-  - `cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`
+  - Build: `~/feather-ops/cpp_benchmarks/CMakeLists.txt` (target `benchmark_mm_hipblaslt_fp16`)
+  - `~/feather-ops/cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`
 - Logging command:
 
 ```bash
-HIPBLASLT_LOG_MASK=96 ./cpp_benchmarks/benchmark_mm_hipblaslt_fp16 --warmup 0 --iters 1 --workspace-mb 64
+HIPBLASLT_LOG_MASK=96 ~/feather-ops/cpp_benchmarks/build/benchmark_mm_hipblaslt_fp16 --warmup 0 --iters 1 --workspace-mb 64
 ```
 
 - For `8192^3`, hipBLASLt selects public `solution_index 1112`.
@@ -140,8 +140,8 @@ Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_...
 
 ## Relevant Local Files
 
-- `cpp_benchmarks/build_benchmark_mm_hipblaslt_fp16.sh`
-- `cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`
-- `kernel/hip/hipblaslt_kernel_fp16.cu`
-- `kernel/hip/hipblaslt_kernel_fp16.py`
-- `benchmark_mm_hipblaslt_fp16.py`
+- `~/feather-ops/cpp_benchmarks/CMakeLists.txt` (target `benchmark_mm_hipblaslt_fp16`)
+- `~/feather-ops/cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`
+- `~/feather-ops/csrc/hipblaslt_kernel_fp16.cu`
+- `~/feather-ops/feather_ops/mm_hipblaslt.py`
+- `~/feather-ops/bench/benchmark_mm_hipblaslt_fp16.py`
