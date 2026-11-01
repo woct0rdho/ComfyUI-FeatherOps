@@ -11,7 +11,9 @@ Our branch carries these changes (see the `develop` commit log), and the test li
 - AK16 mixed float8 (`TensorALayoutA`) support.
 - local build scripts.
 
-Upstream also reworked the subsystems these changes sit in (the package rename to `tensilelite`, the persistent execution policy / `isPersistent`, `ReuseAcrossPersistent`, the `UseE` paths, GL2 prefetch, StreamK 2D clusters and their scheduling ABI2, the complex-B local-read wait tuning, the independent TensileLite packaging, and the `SolutionUID` and `stochasticRounding` migrations).
+Upstream also reworked the subsystems these changes sit in: the package rename to `tensilelite`, the persistent execution policy / `isPersistent`, `ReuseAcrossPersistent`, the `UseE` paths, GL2 prefetch, StreamK 2D clusters and their scheduling ABI2, and the complex-B local-read wait tuning.
+
+The same period brought MX 128 scaling blocks (`MXBlockFreeA`/`MXBlockFreeB`, which changed the MX pack-index condition our local-read commit merges), paired LDS buffers for tight segment interleave, the independent TensileLite packaging, and the `SolutionUID` and `stochasticRounding` migrations.
 
 The upstream tests that cover those subsystems are included below.
 
@@ -77,6 +79,13 @@ Adjacent tests for the code these commits touch (local-read/LDS packing, WMMA VG
 
 ```bash
 python -m pytest -q \
+  tensilelite/Tests/unit/test_lds_layout.py \
+  tensilelite/Tests/unit/test_segment_interleave_policy.py \
+  tensilelite/Tests/unit/test_MXBlockTile.py \
+  tensilelite/Tests/unit/test_mx_free_phase_validation.py \
+  tensilelite/Tests/unit/test_mx_scale_row_pitch.py \
+  tensilelite/Tests/unit/test_mx_tile_tdm.py \
+  tensilelite/Tests/unit/characterization/_codegen/test_mx_block128x128_lra_char.py \
   tensilelite/Tests/unit/characterization/LocalRead/test_r3_localread_char.py \
   tensilelite/Tests/unit/test_initc_iter_wmma.py \
   tensilelite/Tests/unit/test_occupancy.py \
@@ -150,11 +159,16 @@ python -m pytest -q \
   tensilelite/Tests/unit/test_streamk_work_stealing.py
 ```
 
-- `test_gl2_prefetch_offset.py` is the direct production address-generation verifier. It runs only on a real gfx1250 GPU, so on gfx1151 all of its cases skip.
+- `test_gl2_prefetch_offset.py` is the direct production address-generation verifier. Its gfx1250-gated cases skip on gfx1151 (`GL2 prefetch tests require gfx1250`). The CPU-side cases still run and pass.
+- `test_lds_layout.py` checks the reported LDS addresses, the buffer copies and the segment-boundary clipping that the local-read changes rely on.
+- `test_segment_interleave_policy.py` exercises the paired-placement policy for tight LDS segment interleave through gfx1250 `Solution` derivation.
+- `test_MXBlockTile.py` (with the `test_mx_*` files and `test_mx_block128x128_lra_char.py`) covers the `MXBlock{A,B}`/`MXBlockFree{A,B}` tile spelling and scale-row mapping. Run these with the local-read set: our pack-index merge keeps upstream's `mxUnitA == 1` condition next to `localReadNeedsPack`.
 - `test_prefetchgl2_streamk_guard.py` validates the DP-first StreamK PrefetchGL2 guard with both `StreamKForceDPOnly` modes. It uses gfx1250 assembler/capability data but does not need a gfx1250 GPU. It skips if the installed `amdclang++` cannot describe gfx1250.
 - `test_subtile_gl2_prefetch.py` is a Python-only scheduler test and does not require a GPU.
 
-Upstream's PR `#14338` fixed the same partial-store bug by routing the `tmpS01` offset updates into the same deferred module as the stores, so each store's offset update travels with it instead of being emitted earlier. The GTest and `test_streamk_group_load_store_char.py` above assert the resulting invariant (an offset update between consecutive workspace stores) rather than the implementation, so they pass against either form.
+Upstream's PR `#14338` fixed the same partial-store bug by routing the `tmpS01` offset updates into the same deferred module as the stores, so each store's offset update travels with it instead of being emitted earlier.
+
+The GTest and `test_streamk_group_load_store_char.py` above assert the resulting invariant (an offset update between consecutive workspace stores) rather than the implementation, so they pass against either form.
 
 Upstream also ships `tensilelite/Tests/common/streamk/gfx1250/core/sk_group_load_store_partials.yaml`, which needs gfx1250 hardware. Run it through the build-only entry point described below when no gfx1250 device is available.
 
@@ -211,6 +225,13 @@ python -m pytest -q \
 
 (Run the second command without the directory list to cover all 64 subdirectories. The shortened list is the subset nearest to our changes.)
 
+The `ProblemType` goldens pin every default in `_defaultProblemType` and the state-key count, so adding a default changes them. Our AK16 commit adds `TensorALayoutA`, which updates exactly three files:
+- `ProblemType/__snapshots__/test_helpers_char.ambr` (the parameter-type roster)
+- `ProblemType/__snapshots__/test_problemtype_char.ambr` (the state dumps and the key count)
+- `SolutionDerivationSweep/__snapshots__/test_setcover_reject_other_char.ambr` (only because the fp8 type-gate message also names bfloat8)
+
+Regenerate only those nodes with `--snapshot-update` and keep the result in the commit that changes the behavior. The blanket-regeneration guard trips above three changed `.ambr` files, so this set needs no `Bulk-Snapshot-Update` ADR. Re-run the same nodes twice without `--snapshot-update` and confirm the files are byte-identical.
+
 ## `shared/tensile` Tests
 
 `MaxLgkmcnt` is a `shared/tensile` capability, and our commit also added its probe test there:
@@ -239,13 +260,13 @@ The Python unit tests do not need `tensilelite-client`. The YAML/common tests do
 ```
 
 `HIPBLASLT_ENABLE_YAML` selects the host library backend instead of adding to it. The hipBLASLt superbuild forwards it to `TENSILELITE_ENABLE_YAML` (`projects/hipblaslt/CMakeLists.txt`):
-- `build_tensilelite_client.sh` passes `-DHIPBLASLT_ENABLE_YAML=ON`, so the client's `build/tensilelite-client/tensilelite/libtensilelite-host.so.1` can read the YAML libraries that the Python driver writes by default, but it does **not** export `TensileLite::LoadLibraryMapping`.
+- `build_tensilelite_client.sh` passes `-DHIPBLASLT_ENABLE_YAML=ON`, so the client's `build/tensilelite-client/tensilelite/libtensilelite-host.so.1` can read the YAML libraries that the Python driver writes by default, but it does not export `TensileLite::LoadLibraryMapping`.
 - `build_hipblaslt.sh` leaves YAML off, so the installed `$ROCM_PATH/lib/libtensilelite-host.so.1.0` is msgpack-only: it exports `LoadLibraryMapping` (needed by the installed `libhipblaslt`) but cannot read YAML libraries.
 
 Upstream also rejects the client, tests and autobuild targets in a standalone TensileLite configure (`TENSILELITE_STANDALONE`, when `tensilelite/` is the top-level CMake project) with `The TensileLite client, tests, and autobuild scripts require the hipBLASLt build.` `build_tensilelite_client.sh` configures `projects/hipblaslt`, so it stays on the supported path.
 
 Consequences for running the common tests:
-- Put the client's build directory **first** on `LD_LIBRARY_PATH`, otherwise the installed msgpack-only copy wins and every hardware config fails immediately with `Failed to load solution library`.
+- Put the client's build directory first on `LD_LIBRARY_PATH`, otherwise the installed msgpack-only copy wins and every hardware config fails immediately with `Failed to load solution library`.
 - Disable the `transformersci_otel` pytest plugin with `-p no:transformersci_otel`: it imports `torch`, which preloads the installed `libhipblaslt` that requires `LoadLibraryMapping` from the host library.
 
 Common YAMLs are parameters of `tensilelite/Tests/common/test_config.py`. Naming a YAML directly does not collect a test. Select the exact parameterized node ID:
@@ -290,7 +311,7 @@ This compiles and packages gfx1250 code-generation coverage for sparse metadata 
 
 ## hipBLASLt Bench and Tests After A Rebuild
 
-These use the installed msgpack-only host library, so the order is the **opposite** of the common tests: keep `$ROCM_PATH/lib` first (the default `LD_LIBRARY_PATH` hinted by the build scripts) and do not put the client build directory in front.
+These use the installed msgpack-only host library, so the order is the opposite of the common tests: keep `$ROCM_PATH/lib` first (the default `LD_LIBRARY_PATH` hinted by the build scripts) and do not put the client build directory in front.
 
 ```bash
 cd ~/rocm-libraries/build/hipblaslt-bench/clients

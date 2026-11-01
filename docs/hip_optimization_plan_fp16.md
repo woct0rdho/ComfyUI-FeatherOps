@@ -100,10 +100,10 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - The B-side refill dominates the exposed cost. That matches the larger per-chunk B payload (`16 KB`) versus A (`8 KB`) for `(1,8,2,8,2)`.
     - The A-only and B-only deltas are not additive (`5.4 + 13.7 > 15.2 ms`), so the refill costs share fixed sync/issue overhead and interact with each other.
     - With both refills removed, the kernel rises to `44.06 TFLOPS`, which is strong evidence that the math/LDS-read body is already capable of near-FP8-class throughput once chunk refills are taken out of the critical path.
-- Controlled C++ ablation benchmark for the compute-side LDS->VGPR path (`~/tmp/feather_ops/fp16_analysis/mm_fp16_lds_vgpr_ablation.cu`, `~/tmp/feather_ops/fp16_analysis/benchmark_mm_fp16_lds_vgpr_ablation.cpp`) now measures the *exposed* cost of the inner `ds_read -> VGPR` fragment loads while keeping global refill intact:
+- Controlled C++ ablation benchmark for the compute-side LDS->VGPR path (`~/tmp/feather_ops/fp16_analysis/mm_fp16_lds_vgpr_ablation.cu`, `~/tmp/feather_ops/fp16_analysis/benchmark_mm_fp16_lds_vgpr_ablation.cpp`) now measures the exposed cost of the inner `ds_read -> VGPR` fragment loads while keeping global refill intact:
   - Forced config only: `(1,8,2,8,2)`
   - Kept method: always use real random fp16 A/B input tensors. Inside the compute stage, selectively reuse already-loaded random fragments to remove part of the LDS->VGPR traffic without introducing zero operands.
-  - To avoid changing occupancy with long-lived fragment caches, the A-side study uses a *pairwise* reuse mode (`reuse_a_p2`): the kernel loads A from LDS on even `rm` and reuses that fragment for the next odd `rm`, so 50% of A LDS->VGPR loads are removed. The B-side study (`reuse_b`) loads only one of the two `rn` fragments and reuses it for the second tile, so 50% of B LDS->VGPR loads are removed.
+  - To avoid changing occupancy with long-lived fragment caches, the A-side study uses a pairwise reuse mode (`reuse_a_p2`): the kernel loads A from LDS on even `rm` and reuses that fragment for the next odd `rm`, so 50% of A LDS->VGPR loads are removed. The B-side study (`reuse_b`) loads only one of the two `rn` fragments and reuses it for the second tile, so 50% of B LDS->VGPR loads are removed.
   - Repeated `N=8192` runs (2 passes, 100 timed iters each) give mean kernel times:
     - `full`: `40.37 ms` (`27.23 TFLOPS`)
     - `reuse_a_p2` (50% A LDS->VGPR removed): `40.23 ms` (`delta 0.14 ms`, `0.36%`)
@@ -113,7 +113,7 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
     - The exposed LDS->VGPR cost is heavily B-side dominated on this config.
     - A-side LDS->VGPR reads are close to noise-floor in this experiment. Either their direct cost is very small, or they are largely hidden by the existing schedule.
     - The `reuse_b` delta implies that the full B LDS->VGPR fragment load cost is on the order of `6-7 ms` if the effect scaled linearly, but treat that as an upper estimate rather than a strict decomposition.
-    - The combined half-ablation is not additive, which means these inner LDS reads interact with the surrounding instruction schedule. Simple per-side deltas should be read as *exposed* cost, not exact standalone service time.
+    - The combined half-ablation is not additive, which means these inner LDS reads interact with the surrounding instruction schedule. Simple per-side deltas should be read as exposed cost, not exact standalone service time.
 
 ### P3: B-Only Full-Chunk Prefetch Under WMMA - KEEP
 
