@@ -1,6 +1,8 @@
 from collections.abc import Sequence
 from typing import Protocol
 
+import torch
+
 class _LoadedModel:
     model: object | None
 
@@ -9,3 +11,9 @@ class _FreeMemory(Protocol):
 
 current_loaded_models: Sequence[_LoadedModel]
 free_memory: _FreeMemory
+
+def get_torch_device() -> torch.device: ...
+def unet_dtype(
+    device: torch.device | None = None, model_params: int = 0, supported_dtypes: Sequence[torch.dtype] = ..., weight_dtype: torch.dtype | None = None
+) -> torch.dtype: ...
+def unet_manual_cast(weight_dtype: torch.dtype, inference_device: torch.device, supported_dtypes: Sequence[torch.dtype] = ...) -> torch.dtype | None: ...
