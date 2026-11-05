@@ -1,0 +1,3 @@
+from .lora import LoRAAdapter as LoRAAdapter
+
+class WeightAdapterBase: ...

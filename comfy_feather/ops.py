@@ -6,7 +6,6 @@ from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_w
 from feather_ops import scaled_mm_hip
 from torch import nn
 
-from .lora import apply_lora_patches
 from .quant import get_feather_plain_tensors, is_feather_quantized_weight, make_feather_quantized_weight, quantize_feather_weight
 
 
@@ -95,19 +94,27 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 dtype_orig = x.dtype
                 x = x.contiguous()
 
-                # Temporarily clear weight_function so cast_bias_weight does not apply low-VRAM patches to prepacked weight
-                saved_weight_function = self.weight_function
-                self.weight_function = []
-
+                # Patch application is ComfyUI's, not ours: `cast_bias_weight` dequantizes, runs every
+                # patch in `weight_lowvram_function`/`weight_function` (LoRA, LoHa, LoKr, DoRA, weight
+                # diffs) and, with `want_requant`, repacks the patched weight through this layout's
+                # `quantize` instead of handing back a bf16 tensor. That is the contract
+                # `MixedPrecisionOps` in `comfy/ops.py` uses for its own quantized Linears. Without
+                # `want_requant` the offloaded path would lose the pack, and without the patches the
+                # LoRA would be silently dropped.
+                lazy_patch = getattr(self, "weight_lowvram_function", None) is not None
                 bias_dtype = self.bias.dtype if self.bias is not None else None
-                weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True)
-                weight, scale = get_feather_plain_tensors(weight)
-                scale = scale.to(device=x.device, dtype=torch.float32)
+                weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True, want_requant=lazy_patch)
 
-                y = scaled_mm_hip(x, weight, scale, bias, out_dtype=self.out_dtype)
+                if is_feather_quantized_weight(weight):
+                    plain, scale = get_feather_plain_tensors(weight)
+                    scale = scale.to(device=x.device, dtype=torch.float32)
+                    y = scaled_mm_hip(x, plain, scale, bias, out_dtype=self.out_dtype)
+                else:
+                    # A weight wrapper produced a plain tensor (ComfyUI does not requantize those), or
+                    # the weight is a layout this kernel does not pack: let `F.linear` handle it.
+                    y = F.linear(x, weight, bias)
 
                 uncast_bias_weight(self, weight, bias, offload_stream)
-                self.weight_function = saved_weight_function
                 y = y.to(dtype_orig)
                 return y
 
@@ -126,15 +133,11 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
 
                 x_shape_orig = x.shape
                 x = x.reshape(-1, x_shape_orig[-1])
-
                 m = x.shape[0]
                 if m == 0:
                     return x.new_empty(*x_shape_orig[:-1], self.out_features)
 
                 y = self._forward(x)
-
-                y = apply_lora_patches(x, y, self.weight_function)
-
                 return y.view(*x_shape_orig[:-1], y.shape[-1])
 
     return FeatherOps

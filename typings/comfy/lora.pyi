@@ -1,0 +1,3 @@
+import torch
+
+def calculate_weight(patches: list, weight: torch.Tensor, key: str, intermediate_dtype: torch.dtype = ..., original_weights: dict | None = None) -> torch.Tensor: ...

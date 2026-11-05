@@ -7,6 +7,7 @@ Run with `python -m pytest tests` from the repository root. Everything here exer
 import copy
 
 import comfy.ops
+import nodes
 import pytest
 import torch
 from feather_ops.conv2d import _miopen_flags, select_backend
@@ -195,8 +196,6 @@ def test_grad_enabled_falls_back_but_matches():
 
 def test_vae_loader_is_a_load_vae_node():
     """Same node contract as ComfyUI's, so it drops into the graph next to it."""
-    import nodes
-
     assert issubclass(vae_loader.FeatherVAELoader, nodes.VAELoader)
     assert vae_loader.FeatherVAELoader.FUNCTION == nodes.VAELoader.FUNCTION == "load_vae"
     assert vae_loader.FeatherVAELoader.RETURN_TYPES == nodes.VAELoader.RETURN_TYPES == ("VAE",)
