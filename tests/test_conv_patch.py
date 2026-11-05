@@ -11,7 +11,8 @@ import comfy.ops
 import nodes
 import pytest
 import torch
-from feather_ops.conv2d import _miopen_flags, select_backend
+from feather_ops.conv2d import miopen_flags, select_backend
+from feather_ops.conv2d_module import ModuleCache
 
 from comfy_feather import conv as conv_patch
 from comfy_feather import vae as vae_loader
@@ -28,12 +29,13 @@ def _no_grad():
 
 def _packed(module):
     """The prepacked weight of a relabelled conv, or None when the kernel never ran on it."""
-    return module._buffers.get("_feather_packed")
+    entry = ModuleCache().peek(module)
+    return torch.empty(0) if entry is None else entry[0]
 
 
 def _miopen_ref(x, module):
     """The reference for a delegated call: F.conv2d with MIOpen forced on (ComfyUI disables cuDNN)."""
-    with _miopen_flags():
+    with miopen_flags():
         return torch.nn.functional.conv2d(x, module.weight, module.bias, 1, 1)
 
 
@@ -56,7 +58,7 @@ def test_patch_is_opt_in_per_module():
     module = _build(64, 64)
     assert type(module) is not type(plain)
     assert type(plain) is comfy.ops.disable_weight_init.Conv2d
-    assert _packed(plain) is None
+    assert _packed(plain).numel() == 0
     # a second pass over the same tree finds nothing left to relabel
     assert conv_patch.patch_conv_modules(module) == 0
     with torch.no_grad():

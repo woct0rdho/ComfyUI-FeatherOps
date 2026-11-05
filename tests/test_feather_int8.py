@@ -11,6 +11,7 @@ import comfy.model_patcher
 import pytest
 import torch
 from comfy.weight_adapter.lora import LoRAAdapter
+from feather_ops import int8_convrot
 
 from comfy_feather import quant as q
 from comfy_feather.ops import feather_ops
@@ -88,13 +89,14 @@ def test_int8_layer_loads_packed_and_runs_the_int8_kernel(ops, monkeypatch):
     assert linear.weight._qdata.dtype == torch.int8, "int8 storage, bf16 logical dtype"
 
     calls = []
-    real = q.int8_scaled_mm
+    real = int8_convrot.int8_scaled_mm
 
     def spy(*args, **kwargs):
         calls.append(args[0].dtype)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(q, "int8_scaled_mm", spy)
+    # `convrot_int8_linear` calls it from the op module, which is what decides the kernel
+    monkeypatch.setattr(int8_convrot, "int8_scaled_mm", spy)
     x = torch.randn(64, IN, device="cuda", dtype=DTYPE)
     with torch.no_grad():
         out = linear(x)

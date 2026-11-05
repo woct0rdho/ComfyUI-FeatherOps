@@ -13,12 +13,14 @@ parameters and their buffers are the same objects, only `type(conv)` changed.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 import comfy.ops
-import feather_ops
 import torch
 from comfy.ops import cast_bias_weight, run_every_op, uncast_bias_weight
-from feather_ops.conv2d import _miopen_flags, prepack_conv2d_weight_3x3, select_backend, weight_cache_key
+from feather_ops.conv2d import conv3x3_prepacked, miopen_flags, prepack_conv2d_weight_3x3, select_backend, weight_cache_key
+from feather_ops.conv2d_module import ModuleCache, conv3x3_module_reason, prepacked_conv3x3
+from feather_ops.modules import relabel_modules
 
 logger = logging.getLogger(__name__)
 
@@ -37,112 +39,85 @@ _GROUPED = "grouped conv"
 # model is not on the kernel for a reason the user may want to know.
 _QUIET_REASONS = frozenset({_MIOPEN, _LAYOUT, _CHANNELS, _NO_TILE, _NOT_3x3, _NOT_STRIDE1, _GROUPED})
 
-# The feather class of each eligible conv, keyed by the class it was built from. Created once per
-# base so `type(module)` is one stable object: `copy.deepcopy` (how a multigpu clone copies a model)
-# carries the class over, and every VAE loaded in the process shares it.
-_FEATHER_CLASSES: dict[type, type] = {}
+# The prepack cache and the reason vocabulary are feather_ops'. The mixin below adds what is ComfyUI's:
+# the per-call cast/offload copy, `run_every_op`, the weight-patch checks and the log policy.
+_CACHE = ModuleCache()
 
 
 def _static_reason(module: torch.nn.modules.conv._ConvNd) -> str | None:
     """Why this module's convolutions can never use the kernel, or None if they can."""
-    if tuple(module.kernel_size) != (3, 3) or tuple(module.padding) != (1, 1) or module.padding_mode != "zeros":
+    reason = conv3x3_module_reason(module)
+    if reason is None:
+        return None
+    if module.padding_mode != "zeros" or tuple(module.kernel_size) != (3, 3) or tuple(module.padding) != (1, 1):
         return _NOT_3x3
     if tuple(module.stride) != (1, 1) or tuple(module.dilation) != (1, 1):
         return _NOT_STRIDE1
-    if module.groups != 1:
-        return _GROUPED
-    return None
+    return _GROUPED
 
 
-def _feather_attach(module: torch.nn.modules.conv._ConvNd) -> None:
-    """The state a relabelled conv needs. Its `__init__` cannot run on a module that already exists."""
-    if "_feather_packed" in module._buffers:
-        return
-    module.register_buffer("_feather_packed", torch.empty(0), persistent=False)
-    module.register_buffer("_feather_bias", None, persistent=False)
-    # Attributes the mixin reads. `_ConvNd` does not declare them and cannot, they exist only on a
-    # relabelled conv.
-    module.__dict__.update(_feather_key=None, _feather_static=_static_reason(module), _feather_warned=False)
+# Under type checking the mixin derives from `nn.Conv2d`, so `self.weight`, `self.padding` and the
+# `super().forward()` call resolve. At runtime it derives from `object`, because `relabelled_class` puts it
+# in front of an existing conv class and that class is the one carrying the conv behaviour.
+_ConvBase = torch.nn.Conv2d if TYPE_CHECKING else object
 
 
-class _FeatherConv2dMixin:
+class _FeatherConv2dMixin(_ConvBase):
     """Mixin placed in front of a conv class whose instances take the feather path.
 
-    The attributes below come from the conv class it is mixed into, and are declared here so type
-    checkers can see them through `Self`. There is no `__init__`: instances are never built with
-    this class, `patch_conv_modules` relabels convs ComfyUI already built and `_feather_attach`
-    gives them the prepack state.
+    There is no `__init__`: instances are never built with this class, `patch_conv_modules` relabels convs
+    ComfyUI already built. The prepack state lives in feather_ops' `ModuleCache`, so nothing has to be
+    attached.
     """
 
-    weight: torch.Tensor
-    bias: torch.Tensor | None
-    kernel_size: tuple[int, ...]
-    padding: tuple[int, ...]
-    stride: tuple[int, ...]
-    dilation: tuple[int, ...]
-    groups: int
-    padding_mode: str
     comfy_cast_weights: bool
     weight_function: list
     bias_function: list
-    _feather_packed: torch.Tensor
-    _feather_bias: torch.Tensor | None
-    _feather_key: tuple | None
     _feather_static: str | None
     _feather_warned: bool
 
     # prepack lifetime
 
     def _feather_invalidate(self) -> None:
-        self._feather_key = None
-        if self._feather_packed.numel():
-            self._feather_packed = torch.empty(0, device=self.weight.device, dtype=self.weight.dtype)
-        self._feather_bias = None
+        _CACHE.invalidate(self)
 
     def _load_from_state_dict(self, *args, **kwargs) -> None:
-        super()._load_from_state_dict(*args, **kwargs)  # ty: ignore[unresolved-attribute]
+        super()._load_from_state_dict(*args, **kwargs)
         self._feather_invalidate()
 
     def _apply(self, fn, recurse: bool = True):
-        result = super()._apply(fn, recurse)  # ty: ignore[unresolved-attribute]
+        result = super()._apply(fn, recurse)
         self._feather_invalidate()
         return result
 
-    def _feather_stale(self, input: torch.Tensor) -> bool:
-        """Whether the prepacked copy has to be rebuilt for this call."""
-        return self._feather_key != self._feather_cache_key(input) or not self._feather_packed.numel()
-
-    def _feather_cache_key(self, input: torch.Tensor) -> tuple:
-        # The packed buffer has to match the device and dtype the kernel will read, which under dynamic
-        # VRAM is the compute copy rather than wherever the parameter happens to live.
-        return (*weight_cache_key(self.weight), input.device, input.dtype)
-
-    def _feather_pack(self, input: torch.Tensor) -> None:
-        """Build the prepacked weight for `input`'s device and dtype.
+    def _feather_pack(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The prepacked weight for `input`'s device and dtype, cached on the module.
 
         With dynamic VRAM ComfyUI sets `comfy_cast_weights` and the parameter may sit on the offload
         device, so the weight the kernel must read is its per-call cast copy: that is what
-        `cast_bias_weight` returns, patches included. The packed buffer is one conv's 3x3 weights (a
-        few hundred KB), it follows the module through `_apply`, and it is rebuilt only when the weight
-        or the compute device changes.
+        `cast_bias_weight` returns, patches included. The cache key therefore includes the compute
+        device and dtype, since the parameter itself does not change between those calls.
         """
-        if getattr(self, "comfy_cast_weights", False) and hasattr(self, "weight_function"):
-            cast_weight, cast_bias, offload_stream = cast_bias_weight(self, input, dtype=input.dtype, bias_dtype=input.dtype, offloadable=True)
-            try:
-                self._feather_packed = prepack_conv2d_weight_3x3(cast_weight.detach())
-                self._feather_bias = None if cast_bias is None else cast_bias.detach().contiguous()
-            finally:
-                uncast_bias_weight(self, cast_weight, cast_bias, offload_stream)
-        else:
+
+        def make():
+            if getattr(self, "comfy_cast_weights", False) and hasattr(self, "weight_function"):
+                cast_weight, cast_bias, offload_stream = cast_bias_weight(self, input, dtype=input.dtype, bias_dtype=input.dtype, offloadable=True)
+                try:
+                    packed = prepack_conv2d_weight_3x3(cast_weight.detach())
+                    packed_bias = None if cast_bias is None else cast_bias.detach().contiguous()
+                finally:
+                    uncast_bias_weight(self, cast_weight, cast_bias, offload_stream)
+                return packed, packed_bias
             weight = self.weight.detach().to(device=input.device, dtype=input.dtype)
-            self._feather_packed = prepack_conv2d_weight_3x3(weight)
             bias = self.bias
-            if bias is None:
-                self._feather_bias = None
-            else:
+            packed_bias = None
+            if bias is not None:
                 bias = bias.detach().to(device=input.device, dtype=weight.dtype)
-                self._feather_bias = bias if bias.is_contiguous() else bias.contiguous()
-        self._feather_key = self._feather_cache_key(input)
+                packed_bias = bias if bias.is_contiguous() else bias.contiguous()
+            return prepack_conv2d_weight_3x3(weight), packed_bias
+
+        key = (*weight_cache_key(self.weight), input.device, input.dtype)
+        return prepacked_conv3x3(self, key=key, make=make)
 
     # forward
 
@@ -182,9 +157,8 @@ class _FeatherConv2dMixin:
         reason = self._feather_reason(input)
         if reason is None:
             run_every_op()
-            if self._feather_stale(input):
-                self._feather_pack(input)
-            return feather_ops.conv3x3_prepacked(input, self._feather_packed, self._feather_bias)
+            packed, packed_bias = self._feather_pack(input)
+            return conv3x3_prepacked(input, packed, packed_bias)
         # The first conv of `VAE.encode` gets a non-contiguous view, so a layout miss says nothing
         # about the shape. It must not use up the one line this module is allowed to log.
         if reason is not _LAYOUT and not self._feather_warned:
@@ -194,9 +168,9 @@ class _FeatherConv2dMixin:
         if reason is _MIOPEN:
             # ComfyUI sets torch.backends.cudnn.enabled = False on AMD, which would send this call
             # down the im2col path. Force MIOpen on for it, without exhaustive search (no autotune).
-            with _miopen_flags():
-                return super().forward(input)  # ty: ignore[unresolved-attribute]
-        return super().forward(input)  # ty: ignore[unresolved-attribute]
+            with miopen_flags():
+                return super().forward(input)
+        return super().forward(input)
 
 
 def patch_conv_modules(root: torch.nn.Module) -> int:
@@ -212,18 +186,13 @@ def patch_conv_modules(root: torch.nn.Module) -> int:
     none of the bases.
     """
     bases = {torch.nn.Conv2d, comfy.ops.disable_weight_init.Conv2d, comfy.ops.manual_cast.Conv2d}
-    patched = 0
-    for module in root.modules():
-        if type(module) not in bases or not isinstance(module, torch.nn.modules.conv._ConvNd):
-            continue
+
+    def accept(module: torch.nn.Module) -> bool:
+        if type(module) not in bases or not isinstance(module, torch.nn.Conv2d):
+            return False
         if tuple(module.kernel_size) != (3, 3) or tuple(module.padding) != (1, 1):
-            continue
-        cls = type(module)
-        feather_cls = _FEATHER_CLASSES.get(cls)
-        if feather_cls is None:
-            feather_cls = type(cls.__name__, (_FeatherConv2dMixin, cls), {"__module__": __name__, "__qualname__": cls.__qualname__})
-            _FEATHER_CLASSES[cls] = feather_cls
-        module.__class__ = feather_cls
-        _feather_attach(module)
-        patched += 1
-    return patched
+            return False
+        module.__dict__.update(_feather_static=_static_reason(module), _feather_warned=False)
+        return True
+
+    return relabel_modules(root, _FeatherConv2dMixin, accept)

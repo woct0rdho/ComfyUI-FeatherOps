@@ -6,7 +6,9 @@ In scope: inference-only `conv2d`, `kernel=3x3`, `stride=1`, `padding=1`, `dilat
 
 Out of scope, delegated to torch: `groups>1`, dilation>1, NHWC, transposed conv, 1D/3D conv, fp32 (no WMMA on RDNA3.5). fp16 3x3 stride 1 is delegated to torch too, on purpose: MIOpen's Winograd kernels run 1.03-1.59x faster than this kernel on every 3x3 s1 shape measured, and `select_backend` is the one place that decides (fp16 always, while the input is at most a 512 MiB tensor). bf16 stays here, because MIOpen has no bf16 Winograd and its best bf16 path is 1.5x slower. Winograd of our own is rejected for both dtypes (`Rejected Optimizations`). 3x3 stride 2 and 1x1 are delegated for now and are candidates for later work.
 
-The Python API is a drop-in for `F.conv2d` and `nn.Conv2d`. Everything else is internal: the tile table, the row-count rule and the fp16 delegation window live inside `conv3x3_prepacked` and `select_backend`, so the package exports no selector tables and no tuning knobs beyond the explicit `block_m`/`block_n`/`rows` arguments of `conv3x3_prepacked`. The package root is exactly `conv2d`, `Conv2d`, `conv3x3_prepacked`, `prepack_conv2d_weight_3x3` plus the int8/fp8 matmul entry points. `select_backend` stays importable from `feather_ops.conv2d` because the ComfyUI patch needs the decision before it packs a weight (a packed copy in that integration is a module buffer that follows offload, which a global cache cannot do).
+The Python API is a drop-in for `F.conv2d` and `nn.Conv2d`. Everything else is internal: the tile table, the row-count rule and the fp16 delegation window live inside `conv3x3_prepacked` and `select_backend`, so the package exports no selector tables and no tuning knobs beyond the explicit `block_m`/`block_n`/`rows` arguments of `conv3x3_prepacked`.
+
+The package is split the way a consumer uses it: `feather_ops.conv2d` is the operation (`conv2d`, `conv3x3_prepacked`, `prepack_conv2d_weight_3x3`, `select_backend`, `conv3x3_eligibility`, `conv2d_miopen`), `feather_ops.conv2d_module` is the module side (`Conv2d`, `conv3x3_module_reason`, `prepacked_conv3x3`, `ModuleCache`) and `feather_ops.modules` is the relabel helper both integrations use (`relabel_modules`, `relabelled_class`). The package root carries only the drop-in surface (`feather_ops.Conv2d`, `feather_ops.conv3x3_prepacked`, `feather_ops.prepack_conv2d_weight_3x3` and the int8/fp8 entry points). The functional `conv2d` stays in its submodule, because a root name `conv2d` would shadow it. `select_backend` stays importable from `feather_ops.conv2d` because the ComfyUI patch needs the decision before it packs a weight (the packed copy there follows the cast/offload copy, which a global cache cannot do).
 
 ```python
 def prepack_conv2d_weight_3x3(weight: Tensor) -> Tensor:
@@ -360,6 +362,37 @@ The one non-contiguous case. The first conv of `VAE.encode` receives a `movedim`
 
 Tiled VAEs and 3D VAEs. `VAEDecodeTiled` passes contiguous CHW tiles, which take the fast path per tile (verified: 1.83x, rel 1.5e-3). 3D VAEs are untouched except their embedded 2D resamplers (Wan 2.1 decode 1.10x). `groups>1`, the audio/mel VAEs and fp8 AIO VAEs fall back automatically.
 
+## sd-scripts Integration
+
+sd-scripts (kohya) trains LoRAs here, and a VAE is used in exactly two places: once to encode the training images into latents (`--cache_latents`) and on every `--sample_every_n_steps` to decode an example image. Both run through the same model object, so the wiring is one relabel after the VAE is loaded and nothing else has to know:
+
+```text
+~/sd-scripts/library/feather_conv.py      # patch_conv_modules(), the mixin's routing, conv_backend()
+~/sd-scripts/train_network.py             # NetworkTrainer.train(): patch after load_target_model, --vae_dtype
+~/sd-scripts/anima_train.py               # Anima full fine-tune (own loop): patch after load_qwen_image_vae
+~/sd-scripts/anima_train_control_net_lllite.py
+~/sd-scripts/tools/cache_latents.py       # the standalone latent-cache tool reuses the same cache files
+~/sd-scripts/tests/test_feather_conv.py   # 20 tests: routing, transparency, prepack lifetime, --vae_dtype
+~/tmp/sd-scripts/check_vae_conv_wiring.py # the measurement below (patch on/off, per VAE and dtype)
+```
+
+`patch_conv_modules` assigns `type(conv)` to a cached subclass of `(mixin, type(conv))` for the 3x3 stride-1 padding-1 convs, so the parameters, buffers, module names and `state_dict` keys are untouched (ComfyUI's approach, for the same reason: the patch happens after the checkpoint is loaded and `load_state_dict` keeps working). The mixin's `forward` calls `super().forward()` unless the call is entirely in scope - bf16/fp16, contiguous NCHW, frozen, `no_grad`, matching bias - and then routes with `select_backend`: the kernel for `"kernel"`, feather's `conv2d` for `"miopen"` (which forces `cudnn.enabled=True, benchmark=False` around MIOpen's Winograd), and `super()` for `"torch"`. The prepack is attached to the module and keyed on `weight_cache_key` with an identity check, so it is built once per weight version and dropped on a dtype/device move.
+
+Two sd-scripts-specific details. Its Qwen-Image VAEs use `ChunkedConv2d`, a subclass that zeroes `padding` and pads the input in its own `forward`: the mixin reads `original_padding`, which is the padding the conv really has, so these are the same 3x3 s1 p1 convs. When the module's height chunking is actually engaged (`--vae_chunk_size`) the fast path declines and the module keeps its own path, because chunking is a memory decision. And the baseline is different from ComfyUI's: sd-scripts does not disable cuDNN on AMD, so its `F.conv2d` already runs MIOpen and the plan's im2col column does not apply - the achievable gain is the vs-MIOpen column.
+
+Measured on this machine through the patched models (medians of 5, torch and patched in one process. The VAE is the same object, patch on/off in between):
+
+| VAE | dtype | convs | encode | decode | numerics (patched vs torch) |
+| --- | --- | --- | ---: | ---: | --- |
+| Qwen 2D (Anima, `qwen_2d_vae.safetensors`) | bf16 | 55 of 67 | 324.8 -> 256.2 ms (1.27x) | 492.4 -> 365.5 ms (1.35x) | encode latent rel 3.9e-3, decode pixel rel 4.3e-3 (max abs 0.048 on -1..1) |
+| FLUX.2 small (MOSS, `flux2_vae_small.safetensors`) | fp32 | 55 of 72 | 578.3 -> 568.4 ms (1.02x) | 641.1 -> 633.7 ms (1.01x) | identical (fp32 is out of the kernel's scope, so it is the same call) |
+| FLUX.2 small | fp16 | 55 of 72 | 331.5 -> 332.6 ms (1.00x) | 350.6 -> 351.5 ms (1.00x) | identical, `torch.equal`-level: the delegation is the call torch makes |
+| FLUX.2 small | bf16 | 55 of 72 | 463.7 -> 344.4 ms (1.35x) | 517.3 -> 366.7 ms (1.41x) | encode rel 7.1e-3, decode rel 9.8e-3 |
+
+So the fp16 delegation is a *no-op* in sd-scripts (unlike ComfyUI, where it recovers the 2.27x that turning cuDNN off had cost), and the win comes from putting the VAE in bf16. Anima already does that (`vae_dtype` = the mixed precision dtype), MOSS pins its VAE to fp32, so a `--vae_dtype {auto,fp32,fp16,bf16}` argument was added: `auto` keeps each model's choice, `bf16` is the one that reaches this kernel for the FLUX.2 VAE, and the docs note that it changes the cached latents (the FLUX.2 VAE's BatchNorm running statistics are buffers, so they are cast along with the weights. ComfyUI does the same).
+
+The 12 non-candidate convs of the Anima VAE are 1x1 attention projections and stride-2 downsamplers (out of the kernel's scope by construction), which keep MIOpen. The VAE itself does not run during the training step: it runs while the latents are cached (a few ms per image, minutes for a large dataset) and when a sample image is decoded every `--sample_every_n_steps` (0.37 s instead of 0.49 s at 1024^2), so this is a caching and sampling win, not a step-time win.
+
 ## Numerics And Tests
 
 The fp16 policy has its own tests: `select_backend` answers for both dtypes, both sides of the 512 MiB gate and the no-tile case. The delegated `conv2d`/`Conv2d` output is `torch.equal` to `F.conv2d` with MIOpen forced on and is not equal to this kernel's fp16 output, and a delegated module never prepacks its weight. The dispatch is covered by a 14x6 `(C_out, W)` matrix test against `F.conv2d` at `C_in = 32, H = 7`, which is how the prepack-cache stale hit described in `Scope And API` was found.
@@ -396,9 +429,11 @@ Three implementation bugs worth remembering, because each cost real time and eac
 ```text
 ~/feather-ops/
   csrc/hip_conv2d_3x3.cu              # kernel, prepack layout, tile dispatch, prefetch variant
-  feather_ops/conv2d.py               # prepack, conv3x3_prepacked, conv2d, Conv2d, select_backend, weight_cache_key
-  feather_ops/__init__.py             # re-exports
+  feather_ops/conv2d.py               # the operation: prepack, conv3x3_prepacked, conv2d, select_backend, conv3x3_eligibility, conv2d_miopen, weight_cache_key
+  feather_ops/conv2d_module.py        # the module side: Conv2d, conv3x3_module_reason, prepacked_conv3x3, ModuleCache
+  feather_ops/modules.py              # relabel_modules / relabelled_class, shared with the int8 wiring
   tests/test_conv3x3.py               # kernel tests (pytest)
+  tests/test_conv3x3_module.py        # module-side tests (drop-in, prepack cache, relabelling)
   bench/benchmark_conv3x3.py
 ~/ComfyUI-FeatherOps/
   comfy_feather/conv.py               # patch_conv_modules, the conv mixin's routing

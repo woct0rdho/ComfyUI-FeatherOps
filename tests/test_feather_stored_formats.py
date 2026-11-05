@@ -9,6 +9,7 @@ import json
 
 import pytest
 import torch
+from comfy_kitchen.tensor import TensorCoreNVFP4Layout, TensorWiseINT8Layout
 
 from comfy_feather import loader as loader_module
 from comfy_feather import quant as q
@@ -140,8 +141,6 @@ def test_fp8_with_a_per_channel_scale_is_dequantized(no_recipe):
 
 def test_int8_rotated_at_another_group_is_unrotated_by_comfy(no_recipe):
     """ConvRot at a group size this kernel does not implement: ComfyUI's loader un-rotates it at that size."""
-    from comfy_kitchen.tensor import TensorWiseINT8Layout
-
     weight = torch.randn(OUT, IN) * 0.05
     qdata, params = TensorWiseINT8Layout.quantize(weight, per_channel=True, convrot=True, convrot_groupsize=64)
     state = {"bias": None, "comfy_quant": marker_bytes(convrot_groupsize=64)}
@@ -163,8 +162,6 @@ def test_int8_without_the_marker_is_dequantized(no_recipe):
 
 def test_packed_checkpoint_entry_is_dequantized_by_comfy(no_recipe):
     """nvfp4 and friends hold byte codes plus several scales. ComfyUI's own loader turns them into floats."""
-    from comfy_kitchen.tensor import TensorCoreNVFP4Layout
-
     weight = torch.randn(OUT, IN) * 0.05
     qdata, params = TensorCoreNVFP4Layout.quantize(weight)
     state = {"bias": None, "comfy_quant": marker_bytes(format="nvfp4")}

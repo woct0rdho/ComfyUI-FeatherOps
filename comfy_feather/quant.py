@@ -20,8 +20,8 @@ import comfy.float
 import comfy.ops
 import torch
 from comfy_kitchen.tensor import BaseLayoutParams, QuantizedLayout, QuantizedTensor, register_layout_class
-from comfy_quants.formats.convrot import build_hadamard, rotate_weight
-from feather_ops import convrot_quantize_activation, int8_scaled_mm, prepack_int8_convrot_weight, scaled_mm_hip, unpack_int8_convrot_weight
+from feather_ops import convrot_int8_linear, prepack_int8_weight, scaled_mm_hip, unpack_int8_weight
+from feather_ops.int8_convrot import CONVROT_GROUP, build_hadamard, convrot_int8_supported, dequantize_convrot_weight, quantize_rowwise_int8, rotate
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ FEATHER_LAYOUTS = (FEATHER_FP8E5M2_LAYOUT, FEATHER_INT8_LAYOUT)
 
 # ConvRot's group size. The int8 kernel rotates activations with this block-diagonal Hadamard, and
 # comfy-quants rotates the weights with the same one, so the two bases only match at this size.
-CONVROT_GROUP = 256
+assert CONVROT_GROUP == 256
 
 
 # (N, K) -> (K/16, N, 16)
@@ -77,26 +77,17 @@ def quantize_fp8e5m2_scaled(x, scale="recalculate", seed=None, inplace_ops=False
     return x, scale.float()
 
 
-def _rotate(x, group=CONVROT_GROUP, dtype=torch.float32):
-    """`x @ H^T` per group-256 block. H is symmetric and orthogonal, so this also un-rotates."""
-    return rotate_weight(x, build_hadamard(group, device=x.device, dtype=dtype), group)
-
-
 def quantize_int8_convrot_rows(x, scale="recalculate"):
     """Rotate group-256 blocks of `x` and quantize per row, the way comfy-quants stores int8 weights.
 
-    Rows are scaled by `absmax / 127` and rounded to nearest. The rotation happens in the input dtype and
-    the division in float32, which is what makes a re-pack of a loaded checkpoint re-derive its own bytes.
+    Rows are scaled by `absmax / 127` and rounded to nearest, clamped at -127 (the comfy-quants
+    convention). The rotation happens in the input dtype and the division in float32, which is what
+    makes a re-pack of a loaded checkpoint re-derive its own bytes.
     """
-    rotated = _rotate(x, dtype=x.dtype)
+    rotated = rotate(x, build_hadamard(CONVROT_GROUP, device=x.device, dtype=x.dtype), CONVROT_GROUP)
     if scale is None or scale == "recalculate":
-        scale = (rotated.abs().amax(dim=1).float() / 127.0).clamp(min=1e-30)
-    elif not isinstance(scale, torch.Tensor):
-        scale = torch.tensor(scale, device=x.device, dtype=torch.float32)
-    else:
-        scale = scale.reshape(-1).to(device=x.device, dtype=torch.float32)
-    q = torch.clamp(torch.round(rotated.float() / scale[:, None]), -127, 127).to(torch.int8)
-    return q, scale
+        scale = None
+    return quantize_rowwise_int8(rotated, scale)
 
 
 class FeatherFP8E5M2PackedLayout(QuantizedLayout):
@@ -139,15 +130,16 @@ class FeatherInt8ConvRotPackedLayout(QuantizedLayout):
         if tensor.ndim != 2:
             raise ValueError(f"Feather int8 packed weights require a 2D tensor, got {tensor.ndim}D")
         n, k = tensor.shape
-        if k % CONVROT_GROUP or n % 4 or k % 4:
-            raise ValueError(f"Feather int8 packed weights require K divisible by {CONVROT_GROUP} and both axes by 4, got {tuple(tensor.shape)}")
+        ok, reason = convrot_int8_supported((n, k), CONVROT_GROUP, backward=False)
+        if not ok:
+            raise ValueError(f"Feather int8 packed weights cannot hold {tuple(tensor.shape)}: {reason}")
         qdata, scale = quantize_int8_convrot_rows(tensor, scale=scale)
-        return prepack_int8_convrot_weight(qdata), cls.Params(scale=scale, orig_dtype=tensor.dtype, orig_shape=tuple(tensor.shape))
+        return prepack_int8_weight(qdata), cls.Params(scale=scale, orig_dtype=tensor.dtype, orig_shape=tuple(tensor.shape))
 
     @classmethod
     def dequantize(cls, qdata, params):
-        weight = unpack_int8_convrot_weight(qdata).float() * params.scale.reshape(-1, 1).to(device=qdata.device, dtype=torch.float32)
-        return _rotate(weight).to(params.orig_dtype)
+        weight = dequantize_convrot_weight(unpack_int8_weight(qdata), params.scale.to(device=qdata.device))
+        return weight.to(params.orig_dtype)
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
@@ -157,7 +149,7 @@ class FeatherInt8ConvRotPackedLayout(QuantizedLayout):
     def state_dict_tensors(cls, qdata, params):
         # The released form, which is what comfy-quants writes: rotated int8 rows and a [N, 1] scale.
         return {
-            "": unpack_int8_convrot_weight(qdata),
+            "": unpack_int8_weight(qdata),
             "_scale": params.scale.reshape(-1, 1),
         }
 
@@ -189,7 +181,7 @@ def make_feather_int8_weight(weight, scale, orig_dtype):
         raise ValueError(f"Feather int8 packed weights require a 2D tensor, got {weight.ndim}D")
     scale = scale.reshape(-1).to(device=weight.device, dtype=torch.float32)
     params = BaseLayoutParams(scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(weight.shape))
-    return QuantizedTensor(prepack_int8_convrot_weight(weight), FEATHER_INT8_LAYOUT, params)
+    return QuantizedTensor(prepack_int8_weight(weight), FEATHER_INT8_LAYOUT, params)
 
 
 @functools.lru_cache(maxsize=32)
@@ -208,7 +200,7 @@ def int8_convrot_eligible(weight, scale, marker: bytes | None) -> bool:
     if weight.dtype != torch.int8 or scale is None or weight.ndim != 2 or marker is None:
         return False
     n, k = weight.shape
-    if n % 4 or k % 4 or k % CONVROT_GROUP or scale.numel() != n:
+    if not convrot_int8_supported((n, k), CONVROT_GROUP, backward=False)[0] or scale.numel() != n:
         return False
     conf = _quant_marker(marker)
     return bool(conf.get("convrot", False)) and int(conf.get("convrot_groupsize", 0)) == CONVROT_GROUP
@@ -341,8 +333,7 @@ def get_feather_plain_tensors(weight):
 def feather_linear(x, weight, bias, out_dtype):
     """`x @ weight.T + bias` on a Feather-packed weight, with the layout picking the kernel."""
     if is_feather_int8_weight(weight):
-        a, a_scale = convrot_quantize_activation(x)
-        return int8_scaled_mm(a, weight._qdata.reshape(-1), a_scale, weight._params.scale, bias, out_dtype=out_dtype)
+        return convrot_int8_linear(x, weight._qdata.reshape(-1), weight._params.scale, bias, out_dtype, weight_packed=True)
     plain, scale = get_feather_plain_tensors(weight)
     return scaled_mm_hip(x, plain, scale.to(device=x.device, dtype=torch.float32), bias, out_dtype=out_dtype)
 
