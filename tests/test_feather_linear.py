@@ -16,7 +16,7 @@ from feather_ops import scaled_mm_hip
 
 from comfy_feather import ops as feather_ops_module
 from comfy_feather.ops import feather_ops
-from comfy_feather.quant import is_feather_quantized_weight
+from comfy_feather.quant import get_feather_plain_tensors, is_feather_fp8_weight
 
 IN, OUT, RANK = 512, 256, 16
 DTYPE = torch.bfloat16
@@ -75,7 +75,7 @@ def test_quantized_linear_matches_the_packed_kernel(ops):
     with torch.no_grad():
         out = model.lin(x)
         ref = _reference(model.lin, x)
-    assert is_feather_quantized_weight(model.lin.weight)
+    assert is_feather_fp8_weight(model.lin.weight)
     assert _rel(out, ref) < 2e-2, "fp8 e5m2 round trip of the weight"
     assert model.lin.is_quantized
 
@@ -90,7 +90,7 @@ def test_baked_lora_keeps_the_packed_weight(ops):
         patcher = comfy.model_patcher.ModelPatcher(model, load_device="cuda", offload_device="cpu")
         patcher.add_patches({KEY: patches[KEY][0][1]}, 1.0)
         patcher.patch_weight_to_device(KEY)
-        assert is_feather_quantized_weight(model.lin.weight), "set_weight must repack, not store bf16"
+        assert is_feather_fp8_weight(model.lin.weight), "set_weight must repack, not store bf16"
         out = model.lin(x)
         ref = _reference(model.lin, x)
         patched = _reference(model.lin, x, patches)
@@ -129,16 +129,16 @@ def test_requantize_from_float_is_what_the_dynamic_path_calls(ops):
         _, patches = _lora_patches(linear.weight)
         patched_float = comfy.lora.calculate_weight(patches[KEY], linear.weight.dequantize().float(), KEY, intermediate_dtype=torch.float32)
         requant = linear.weight.requantize_from_float(patched_float, scale="recalculate")
-        assert is_feather_quantized_weight(requant)
+        assert is_feather_fp8_weight(requant)
         assert requant.shape == linear.weight.shape
-        plain, scale = feather_ops_module.get_feather_plain_tensors(requant)
+        plain, scale = get_feather_plain_tensors(requant)
         out = scaled_mm_hip(x, plain, scale, linear.bias, out_dtype=DTYPE)
         requantized = requant.dequantize()
         ref = torch.nn.functional.linear(x, requantized.to(DTYPE), linear.bias)
         base = _reference(linear, x)
         # the exact call `comfy/ops.py` makes when it requantizes a lazily patched weight
         seeded = linear.weight.requantize_from_float(patched_float, scale="recalculate", stochastic_rounding=1234)
-        assert is_feather_quantized_weight(seeded)
+        assert is_feather_fp8_weight(seeded)
     # e5m2 has two mantissa bits, so this is the quantization error and not something we control
     assert _rel(requantized, patched_float) < 0.08
     # the kernel must compute what the requantized weight says, not something else
@@ -154,8 +154,8 @@ def test_requant_flag_keeps_a_resident_weight_packed(ops):
     with torch.no_grad():
         weight, bias, stream = cast_bias_weight(linear, x, dtype=linear.weight.dtype, bias_dtype=DTYPE, offloadable=True, want_requant=True)
         uncast_bias_weight(linear, weight, bias, stream)
-        assert is_feather_quantized_weight(weight)
-        plain, scale = feather_ops_module.get_feather_plain_tensors(weight)
+        assert is_feather_fp8_weight(weight)
+        plain, scale = get_feather_plain_tensors(weight)
         out = scaled_mm_hip(x, plain, scale, bias, out_dtype=DTYPE)
     assert _rel(out, _reference(linear, x)) < 2e-2
 
@@ -193,7 +193,7 @@ def test_weight_wrapper_falls_back_to_bf16_linear(ops):
             ref = torch.nn.functional.linear(x, linear.weight.dequantize().to(DTYPE) * 1.5, linear.bias)
         finally:
             linear.weight_function = []
-    assert is_feather_quantized_weight(linear.weight), "a wrapper must not overwrite the packed weight"
+    assert is_feather_fp8_weight(linear.weight), "a wrapper must not overwrite the packed weight"
     assert _rel(out, ref) < 2e-2
     assert _rel(out, base) > 5e-2
 

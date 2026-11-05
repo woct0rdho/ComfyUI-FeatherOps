@@ -450,6 +450,22 @@ Constraints that shaped the list above, kept so a future change does not re-lear
 - The producer's neighbourhood. Rotation and quantize run in one kernel (see Accepted), and the weight scale for the gradient path is folded into it. The producer is done: 123-202 GB/s against a 241 GB/s roof, bandwidth-bound in the gradient and latency-bound in the forward until the radix-4 stages moved into registers. What is left there is only a tiled-A output layout, if the GEMM ever wants one (see the tiled-A item above).
 - Tile choice stability. Only the `M = 512` cells with a large contraction (32-128 blocks over 40 CUs) switch winners between sessions, so the heuristic is deliberately coarse there. The two small-M residuals listed above (`M = 256` wide-output gradient, `M = 512` short-contraction forward) are the same effect and are left unfitted.
 
+## ComfyUI inference wiring
+
+The same kernel now serves inference through `~/ComfyUI-FeatherOps`. `comfy_feather/quant.py` registers `FeatherInt8ConvRotPackedLayout` as a `comfy.quant_ops.QuantizedLayout`: `quantize` rotates group-256 blocks with the same regular Hadamard the kernel's activation pass applies and quantizes per output channel, `dequantize` un-rotates, `get_plain_tensors` hands the prepacked micro-tiles and the `[N]` scale to `int8_scaled_mm`, and `state_dict_tensors` reproduces the released `[N, K]` int8 + `[N, 1]` scale exactly. Because it is a layout rather than a bespoke class, ComfyUI's own patch machinery works on it unchanged: a LoRA is merged in float and requantized by `quantize`, and ComfyUI asks for that with `want_requant` on the offloaded path (`comfy_feather/ops.py`).
+
+`FeatherUNetLoader` picks the format per layer from the checkpoint, and a checkpoint that is already quantized is never quantized twice:
+- int8 with a `comfy_quant` marker saying `convrot: true, convrot_groupsize: 256` and one scale per output channel goes through `make_feather_int8_weight`, which is only a byte permutation - no rotation, no re-quantization, so the load is bit-exact.
+- fp8e5m2 is prepacked from its stored bytes with its own scale, or with scale 1 when the file has none (Kijai's `fp8_e5m2_scaled` files bake the scale into the values), and runs on the fp16-fp8 kernel.
+- packed codes (nvfp4, mxfp8, int4, grouped int8) are dequantized through `comfy.ops._load_quantized_module`, so that key-to-params table stays ComfyUI's rather than a copy of it here.
+- and the layers the exporter deliberately kept in float stay in float.
+
+A file that stores neither int8 nor fp8e5m2 is a float model: the comfy-quants recipe decides which modules are cast to fp8e5m2. The recipe is not consulted for an already-quantized file, because the exporter's per-layer split is the accuracy decision. That is also what ComfyUI's own `mixed_precision_ops` Linear does.
+
+Measured end to end on Anima (`anima-base-v1.0-int8_convrot.safetensors`, one KSampler step at 512^2, medians of five, one session): 254 layers on this kernel, 261 in float, 277.4 ms against ComfyUI's own int8 path at 325.2 ms on the same file (1.17x), landing 1.6e-2 from the bf16 model against ComfyUI's 1.6e-2.
+
+The stored-fp8e5m2 case measures 3236.9 ms against ComfyUI's 4777.3 ms on Wan 2.2 LOW `fp8_e5m2_scaled` (1.48x, one 832x480x5 step), with the latents 2.6e-3 apart. The fp8 path on the bf16 checkpoint is 257.6 ms and lands 7.4e-2 away, so on a file that only quantizes part of its layers the fp8 cast is faster but half an order of magnitude less accurate. On a fully int8 file the two kernels measure within a few percent of each other in TFLOPS (`Where this kernel stands against the fp8 one`), and this kernel's per-row/per-channel scaling is what buys the accuracy.
+
 ## sd-scripts wiring
 
 The kernels are consumed through `~/sd-scripts/library/convrot_int8_kernels.py` (feather-ops backend region) and `library/convrot_int8_utils.py`:
@@ -462,6 +478,7 @@ The training-loop view of the same numbers (what else the step spends time on, w
 
 ## Verification
 
+- `~/ComfyUI-FeatherOps/tests/test_feather_int8.py`: the layout's eligibility gates (int8, per-output-channel scale, `comfy_quant` marker with `convrot`/group 256, K a whole number of groups), that `_load_from_state_dict` picks this layout for an int8 entry and fp8 for a float one, that the dispatcher calls `int8_scaled_mm`, that `state_dict_tensors` reproduces the checkpoint bytes, that a merged LoRA requantizes back into this layout, and that the `comfy_quant` marker is consumed rather than leaked.
 - `tests/test_int8_convrot.py` (feather-ops): prepack/unpack round trip is lossless and byte-count preserving, forward and backward match a dequantized int8 float64 reference within the output dtype's rounding on every model cell and every table config, partial M/N tiles, `M = 1`, fp16 and bf16 outputs, and the shape heuristic's classes. The activation quantizer matches the reference recipe on every group-256 width in the shape tables (1024 through 248320, i.e. both the staged and the streamed rows), with and without the rotation and the column-scale fold, in fp16 and bf16.
 - `tests/test_convrot_int8.py` (sd-scripts): the packed path agrees with the plain path to 1e-3 (forward and input gradient), the packed bytes round-trip to the released `[N, K]` form exactly, and the load-time prepack keeps `weight.shape`.
 - `bench/benchmark_int8_convrot.py` is the tuning loop: kernel-only, configs interleaved, medians, one line per `(dir, M, N, K)` cell, `--verbose` for the full config matrix. It runs the shared grid in `bench/cells.py` (106 cells over 20 groups), the same one the fp8 bench and `bench/benchmark_kernels.py` use, and `--groups` selects a subset in all three.
