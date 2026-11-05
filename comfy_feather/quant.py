@@ -10,7 +10,13 @@ FEATHER_FP8E5M2_LAYOUT = "FeatherFP8E5M2PackedLayout"
 # (N, K) -> (K/16, N, 16)
 def prepack_transpose(x):
     N, K = x.shape
-    return x.view(N, K // 16, 16).permute(1, 0, 2).contiguous()
+    # Zero-pad K to a multiple of 128 so the kernel's last K chunk reads zeros, not past the weight.
+    K_pad = -(-K // 128) * 128
+    if K_pad != K:
+        padded = torch.zeros((N, K_pad), device=x.device, dtype=x.dtype)
+        padded[:, :K] = x
+        x = padded
+    return x.view(N, K_pad // 16, 16).permute(1, 0, 2).contiguous()
 
 
 # (K/16, N, 16) -> (N, K)

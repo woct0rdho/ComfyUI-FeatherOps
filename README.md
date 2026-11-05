@@ -4,10 +4,12 @@ See https://github.com/woct0rdho/feather-ops for an introduction and the kernels
 
 ## Use in ComfyUI
 
+You can ask AI if you don't know how to install.
+
 1. Install feather-ops
 2. Install [comfy-quants](https://github.com/Comfy-Org/comfy-quants)
 3. git clone this repo to `ComfyUI/custom_nodes/`
-4. In ComfyUI, use `FeatherUNetLoader` node to load the model. See the [example workflows](https://github.com/woct0rdho/ComfyUI-FeatherOps/tree/master/example_workflows)
+4. In ComfyUI, use `FeatherUNetLoader` node to load the model, and `FeatherVAELoader` to load the VAE. See the [example workflows](https://github.com/woct0rdho/ComfyUI-FeatherOps/tree/master/example_workflows)
 
 I recommend to load fp16/bf16 model, or fp8e5m2 model if you can find one, but not fp8e4m3 or fp4 model, because that would suffer from quantizing twice. For Wan, you can find fp8e5m2 models at https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled
 

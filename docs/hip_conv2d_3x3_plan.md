@@ -12,16 +12,18 @@ The Python API is a drop-in for `F.conv2d` and `nn.Conv2d`. Everything else is i
 def prepack_conv2d_weight_3x3(weight: Tensor) -> Tensor:
     """[C_out, C_in, 3, 3] -> [ceil(C_in/16) * 18, C_out, 8] in the kernel's k order."""
 
-def conv3x3_prepacked(x: Tensor, w_packed: Tensor, bias: Tensor | None = None,
-                      block_m: int | None = None, block_n: int | None = None,
-                      rows: int | None = None) -> Tensor:
+
+def conv3x3_prepacked(x: Tensor, w_packed: Tensor, bias: Tensor | None = None, block_m: int | None = None, block_n: int | None = None, rows: int | None = None) -> Tensor:
     """3x3, stride 1, padding 1 over a prepacked weight. No fall back, no extra checking."""
+
 
 # module-level, not package API - the one helper the ComfyUI patch shares:
 #   feather_ops.conv2d.select_backend(dtype, c_in, c_out, height, width) -> 'kernel' | 'miopen' | 'torch'
 
+
 def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) -> Tensor:
     """Drop-in for F.conv2d. Uses the kernel when in scope, else falls back to F.conv2d."""
+
 
 class Conv2d(nn.Conv2d):
     """Drop-in for nn.Conv2d. state_dict keeps the standard [C_out, C_in, 3, 3] weight."""
@@ -238,7 +240,7 @@ The kernel is therefore balanced: the LDS pipe (61.7 KB of staging stores plus ~
 | Zero weight rows for the padded channel plane | `C_in % 16 != 0` works with no per-channel masking in the loader | unit tests at `C_in = 8, 24, 40, 56`. The earlier guarded loader cost 256 VGPRs + spills, see `History` |
 | fp16 as a second instantiation of the same body | the Flux 2 small VAE family (Ideogram 4, Klein 9B, MOSS-Image) runs fp16 | decode 606.1 -> 310.0 ms (1.96x), image rel 1.8e-4 |
 | Next-group register prefetch (`kPrefetchGroup`), per-cell switch | the dominant 128x256 tiles gain 3.5-7.9 %, the 128x128 two-row tile 6.1 %, and `C_out = 144` (48x256) 13.7 %. No measurable end-to-end change yet (455.7 vs 456.8 ms SDXL, 310.0 vs 309.9 ms Flux 2 small), because conv is now roughly half of VAE decode time | `python -m bench.benchmark_conv3x3 --variants both`, 14 VAE shapes, 3 rounds: prefetch on vs off is +4.1 % at `512->512 256^2`, +3.5 % at `384->384`, +5.7 % at `256->256`, +4.3 % at `128->128`, +7.9 % at `1152->1152 256^2`, +6.1 % at `1152->1152 128^2` (two-row), +2.3 % at `288->288`, +13.7 % at `144->144`, +1.0 % at `96->96 512^2`. -1.3 % at `96->96 256^2` and -8..-9 % on the 64x256 two-row tile (the doubled accumulator set leaves no room to preload), hence the per-cell gate. Costs 20 VGPRs (3 + 2 `uint4` per thread at 512 threads): 156 -> 162 VGPRs, still no spills |
-| ComfyUI class patch instead of module surgery | zero-copy fast path, `state_dict`/patcher/offload unchanged | `~/ComfyUI-FeatherOps/tests/test_conv_patch.py`: transparency, inference mode, ineligible fallbacks, `weight_function`, enable switch |
+| Per-instance class relabel from a `FeatherVAELoader` node instead of patching `comfy.ops` | zero-copy fast path, opt-in, `state_dict`/patcher/offload unchanged, and the plain `Load VAE` keeps the torch path. Measured through the node at 512^2 on random latents: Flux 2 small VAE decode 623.5 -> 286.6 ms (2.18x), Qwen 2D 149.5 -> 81.0 ms (1.85x), Qwen-Image 2.1 2D 1349.3 -> 806.9 ms (1.67x), rel 5.4e-4 / 2.2e-3 / 2.7e-3. The Wan 2.1 3D VAE relabels 3 convs (its 2D resampler) and decodes within 1.9e-3, its `CausalConv3d` modules untouched. The multigpu reload factory returns a relabelled patcher (55 of 55 convs on the Flux 2 VAE) | `~/ComfyUI-FeatherOps/tests/test_conv_patch.py`: transparency, inference mode, ineligible fallbacks, `weight_function`, the node contract, and that an unpatched conv is left alone |
 
 ## Rejected Optimizations And Dead Ends
 
@@ -309,16 +311,21 @@ Not on the list, deliberately: everything in `Rejected Optimizations And Dead En
 
 What ComfyUI does today. Every VAE conv is a `comfy.ops.disable_weight_init.Conv2d` (`comfy_cast_weights = False`) whose `forward` reaches `F.conv2d` -> `im2col_kernel` + `addmm`, because `torch.backends.cudnn.enabled` is turned off on RDNA3+. Activations between convs are contiguous NCHW. The first conv of `VAE.encode` gets an `movedim` view that is not contiguous in CHW order.
 
-Patch point. `comfy_feather/conv.py` installs two subclasses at import time, before any VAE is built:
+Patch point. `comfy_feather/vae.py` adds a `FeatherVAELoader` node, and `comfy_feather/conv.py` relabels the convs of the VAE it just loaded:
 
 ```python
-comfy.ops.disable_weight_init.Conv2d = FeatherConv2d            # every VAE here
-comfy.ops.manual_cast.Conv2d         = FeatherManualCastConv2d  # fp8/mixed, keeps the cast path
+class FeatherVAELoader(nodes.VAELoader):  # same inputs, same load path, same RETURN_TYPES
+    def load_vae(self, vae_name):
+        (vae,) = super().load_vae(vae_name)  # ComfyUI's own loader, untouched
+        patch_conv_modules(vae.first_stage_model)  # relabel 3x3 s1 p1 convs, in place
+        return (vae,)
 ```
 
-Model code resolves `ops.Conv2d` at module-construction time, so mutating the attribute is enough, and the module tree, `ModelPatcher`, `state_dict` and offload paths are untouched. The node's `__init__.py` calls `install_conv_patch()` inside a `try/except` so a missing dependency can never take ComfyUI down. Module surgery after `VAE.__init__` was rejected: the patcher and `load_state_dict` run inside that constructor, and swapping modules afterwards invalidates the patcher's bookkeeping.
+`patch_conv_modules` assigns `type(conv)` to a cached subclass of `(mixin, type(conv))`, so the conv objects, their parameters and their buffers are the same objects with the same names: the module tree, `state_dict`, `ModelPatcher` and offload paths see what ComfyUI built, and `copy.deepcopy` (how a multigpu clone copies a model) carries the relabelled class over. Only exact `comfy.ops` Conv2d and bare `torch.nn.Conv2d` types are relabelled - a subclass may override `forward`, and prefixing it would drop that override. Nothing inside `comfy.ops` is replaced, so the plain `Load VAE` node, checkpoints that carry a VAE, and every other consumer keep the torch path: the kernel is opt-in per load.
 
-The fp16 delegation lives here too, and it has one ComfyUI-specific trap: `comfy/model_management.py` sets `torch.backends.cudnn.enabled = False` on AMD unless `COMFYUI_ENABLE_MIOPEN=1`, so a bare `super().forward()` would run the im2col path for the delegated convs - 2x slower than this kernel, the opposite of the intent. The patch therefore wraps its delegated call in `torch.backends.cudnn.flags(enabled=True, benchmark=False)`: MIOpen on, exhaustive search off (no autotune), and the caller's global state untouched. The delegation is reported once per module as its own reason (`fp16 is delegated to MIOpen...`) and counted as `stats()["miopen"]`, and a delegated weight is never prepacked.
+Reusing `VAELoader.load_vae` is what makes the node cover every VAE ComfyUI can load - the TAESD decoders, `pixel_space`, the 3D VAEs, and VAEs a third-party pack teaches `comfy.sd.VAE` to build, since that pack's `__init__` is what runs inside `super().load_vae`. It also inherits the `cached_patcher_init` reload factory that ComfyUI registers for multigpu deepclones. The node wraps that factory so a clone is relabelled too. Module surgery that replaces modules was rejected and stays rejected: the patcher and `load_state_dict` run inside `VAE.__init__`, and swapping modules afterwards invalidates the patcher's bookkeeping, whereas a class relabel does not touch it at all.
+
+The fp16 delegation lives here too, and it has one ComfyUI-specific trap: `comfy/model_management.py` sets `torch.backends.cudnn.enabled = False` on AMD unless `COMFYUI_ENABLE_MIOPEN=1`, so a bare `super().forward()` would run the im2col path for the delegated convs - 2x slower than this kernel, the opposite of the intent. The patch therefore wraps its delegated call in `torch.backends.cudnn.flags(enabled=True, benchmark=False)`: MIOpen on, exhaustive search off (no autotune), and the caller's global state untouched. The delegation is reported once per module as its own reason (`fp16 is delegated to MIOpen...`), and a delegated weight is never prepacked.
 
 MIOpen's find mode is process-global and read from `MIOPEN_FIND_MODE` (this machine's `~/rocm.sh` sets `FAST`). `FAST` is the mode the numbers above were measured in, and it is also the mode to keep: with `NORMAL` MIOpen runs a timed search per new shape (that is the autotune we are avoiding) and, on this grid, picks a worse solver for `1152->1152 256^2` (54.6 vs 39.9 ms), so heuristic-only is both cheaper to start and better here. A library cannot safely set it (MIOpen reads it at init), so it stays an environment setting.
 
@@ -329,7 +336,7 @@ Fast-path contract (checked per call in `forward`, all cheap attribute tests):
 - no `comfy_cast_weights`, no `weight_function`/`bias_function`.
 - `torch.is_grad_enabled()` is false (ComfyUI's execution loop runs nodes under `torch.inference_mode()`).
 
-Anything else falls back to `F.conv2d`. The first fallback per module logs one INFO line with the reason, so a silent 2x slowdown cannot hide. One ComfyUI detail worth knowing: for the Qwen-family VAEs `VAE.process_input` pads a 3-channel image to 4 with `pad_channel_value = 1.0`, so their first encoder conv sees `C_in = 4` and falls back on `C_in % 8` as well. No `.contiguous()`, no `.to()`, no `.permute()` happens on the fast path.
+Anything else falls back to `F.conv2d`. The first fallback per module logs one INFO line with the reason, so a silent 2x slowdown cannot hide. A layout miss does not count as that first fallback, because the first conv of `VAE.encode` gets a non-contiguous view and would otherwise use up the line for a module that is otherwise fine. One ComfyUI detail worth knowing: for the Qwen-family VAEs `VAE.process_input` pads a 3-channel image to 4 with `pad_channel_value = 1.0`, so their first encoder conv sees `C_in = 4` and falls back on `C_in % 8` as well. No `.contiguous()`, no `.to()`, no `.permute()` happens on the fast path.
 
 The registered op is an out variant: `conv3x3_prepacked` allocates the single output with `torch.empty` and the op - and the C++ kernel behind it - writes into it, so the extension itself never allocates (`Tensor(a!) out` by reference) and the allocation sits outside the custom-op boundary, where the compiler can pool and reuse it. Eager ComfyUI does not care either way, since a per-call `torch.empty` is just a caching-allocator hit.
 
@@ -350,8 +357,6 @@ Prepack lifetime. The prepack is a non-persistent buffer keyed on `(data_ptr, _v
 The one non-contiguous case. The first conv of `VAE.encode` receives a `movedim` view and has `C_in = 3`, so it falls back on two counts at once (layout and `C_in % 8`). That is why no strided/KC-major loader was written: the only layer that would use it is one the kernel cannot handle anyway, and it is ~0.1 % of the decode+encode FLOPs.
 
 Tiled VAEs and 3D VAEs. `VAEDecodeTiled` passes contiguous CHW tiles, which take the fast path per tile (verified: 1.83x, rel 1.5e-3). 3D VAEs are untouched except their embedded 2D resamplers (Wan 2.1 decode 1.10x). `groups>1`, the audio/mel VAEs and fp8 AIO VAEs fall back automatically.
-
-Controls. `FEATHER_CONV=0` disables the patch at import. `comfy_feather.conv.set_enabled(False)` switches the kernel off at runtime with the fallback being exactly `F.conv2d`. `comfy_feather.conv.stats()` returns the kernel-call and repack counters used by the tests and the benchmarks.
 
 ## Numerics And Tests
 
@@ -375,7 +380,6 @@ Kept so the same estimates are not reused. The plan's own phase ladder (P0 skele
 | 1-3-tap weight staging "to free LDS for 12-24 tiles/wave" was worth +2-4 % | rejected on measurement: 25.2-28.6 TF against 33.6-37.7 TF for the shipped tiles. The barrier count it adds is worth more than the fragment amortisation, and `rows = 2` gets the same "more work per block" for free |
 | the 8 scalar 2-byte staging loads were "well enough", no register transpose worth its risk | half right: the transpose alternatives are still not worth it, but pairing two pixels per 32-bit load is a 40-line loader change worth +0.7..+2.8 % on the M-narrow tiles and -0.8 % on the wide one, so it is compiled only where it pays |
 | Winograd F(2x3) as an optional phase worth gating at "+20 % with the accuracy gate met" | rejected as our own kernel, but the target was real: MIOpen's fp16 Winograd does deliver it. The answer is to delegate rather than to write one: fp16 3x3 s1 now goes to MIOpen by default (1.15x per conv, Flux 2 small decode 310 -> 287.1 ms), while bf16 stays on this kernel because gfx1151 has no packed bf16 VALU and MIOpen has no bf16 Winograd at all. AITER's "three launches + materialized V/M tensors" argument is about the unfused variant. MIOpen's is a single fused ASM kernel |
-| `FEATHER_CONV_STRICT=1` env var, `register_custom_op_autotuning`, a `GemmFwd1x1` wrapper, `comfy.ops.manual_cast.Conv2d` short-circuiting on a no-op cast | no strict mode at all (neither the env var nor a `set_strict()` switch. The fallback is part of the public contract and the tests only assert public invariants). No autotuning, and no custom-op wrapper either: the out= native op is called directly because it returns nothing. 1x1 is still delegated to torch, not to hipBLASLt. `manual_cast` falls back whenever a cast would happen. |
 | "MIOpen's best is 33 TF at `C_in=1152`, so for the widest layers the target is parity" | parity was not enough and not where the win came from. For a while 1152@128^2 was the one shape MIOpen won (32.4 TF vs our 29.3), and the plan's 12.2 ms target looked missed by a reading (13.3 ms) that itself sat mid-band in the 12.4-14.05 ms thermal spread. The two-row tile then took the same shape to 11.18 ms (35.0 TF) without touching the 12.2 ms target's assumptions, so the shape is now 1.09x ahead of MIOpen. Everywhere else the kernel is 1.3-2.4x MIOpen's tuned choice. |
 | 6 % of the 128-wide tile's time was "build context": code placement in a module that also carries the matmul kernels, or the output allocation living inside the custom op | no build effect at all. Three build contexts of the same source interleaved in one process land within 0.2 % (12.795 / 12.808 / 12.823 ms). The 13.5-13.7 ms readings came from runs that followed sustained load, and the shape spans 13.02-14.05 ms purely by thermal state. No kernel packing is needed. |
 
@@ -395,8 +399,9 @@ Three implementation bugs worth remembering, because each cost real time and eac
   tests/test_conv3x3.py               # kernel tests (pytest)
   bench/benchmark_conv3x3.py
 ~/ComfyUI-FeatherOps/
-  comfy_feather/conv.py               # install_conv_patch, set_enabled, stats
-  __init__.py                         # installs the patch at import
+  comfy_feather/conv.py               # patch_conv_modules, the conv mixin's routing
+  comfy_feather/vae.py                # FeatherVAELoader: ComfyUI's load_vae + the relabel
+  __init__.py                         # registers FeatherUNetLoader and FeatherVAELoader
   tests/test_conv_patch.py            # integration tests for the patch (pytest)
   tests/conftest.py                   # sys.path for comfy_feather and ~/ComfyUI
   pyproject.toml                      # ruff/ty config and the pytest namespace-package setting

@@ -12,6 +12,11 @@ class disable_weight_init:
         weight_function: list[_TensorTransform]
         bias_function: list[_TensorTransform]
 
+    class Conv2d(nn.Conv2d):
+        comfy_cast_weights: bool
+        weight_function: list[_TensorTransform] | None
+        bias_function: list[_TensorTransform] | None
+
 class manual_cast(disable_weight_init): ...
 
 def run_every_op() -> None: ...

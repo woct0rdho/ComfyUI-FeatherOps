@@ -91,10 +91,9 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 assert inplace_update is False  # TODO: eventually remove the inplace_update stuff
                 self.weight = nn.Parameter(weight, requires_grad=False)
 
-            def _forward_padded(self, x):
-                # The kernel requires fp16 x and produces the configured output dtype
+            def _forward(self, x):
                 dtype_orig = x.dtype
-                x = x.contiguous().to(torch.float16)
+                x = x.contiguous()
 
                 # Temporarily clear weight_function so cast_bias_weight does not apply low-VRAM patches to prepacked weight
                 saved_weight_function = self.weight_function
@@ -132,23 +131,7 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 if m == 0:
                     return x.new_empty(*x_shape_orig[:-1], self.out_features)
 
-                if m > 256:
-                    block_size = 128
-                elif m > 128:
-                    block_size = 64
-                elif m > 64:
-                    block_size = 32
-                else:
-                    block_size = 16
-
-                m_padded = (m + block_size - 1) // block_size * block_size
-                if m_padded != m:
-                    x_padded = F.pad(x, (0, 0, 0, m_padded - m))
-                else:
-                    x_padded = x
-
-                y = self._forward_padded(x_padded)
-                y = y[:m]
+                y = self._forward(x)
 
                 y = apply_lora_patches(x, y, self.weight_function)
 
