@@ -15,6 +15,7 @@ from comfy.weight_adapter.lora import LoRAAdapter
 from feather_ops import scaled_mm_hip
 
 from comfy_feather import ops as feather_ops_module
+from comfy_feather import quant as q
 from comfy_feather.ops import feather_ops
 from comfy_feather.quant import get_feather_plain_tensors, is_feather_fp8_weight
 
@@ -196,6 +197,28 @@ def test_weight_wrapper_falls_back_to_bf16_linear(ops):
     assert is_feather_fp8_weight(linear.weight), "a wrapper must not overwrite the packed weight"
     assert _rel(out, ref) < 2e-2
     assert _rel(out, base) > 5e-2
+
+
+def test_state_dict_survives_inference_mode(ops):
+    """ComfyUI estimates model memory with `state_dict()` inside `torch.inference_mode()`.
+
+    The generic `_save_to_state_dict` detaches the weight, and detaching a `QuantizedTensor` builds a new
+    wrapper that torch refuses for an inference tensor, so the packed form has to come from the layout.
+    """
+    model = _build(ops)
+    x = torch.randn(64, IN, device="cuda", dtype=DTYPE)
+    with torch.inference_mode():
+        model.lin(x)
+        saved = model.lin.state_dict()
+    assert set(saved) == {"weight", "weight_scale", "bias", "comfy_quant"}
+    assert saved["weight"].dtype == torch.float8_e5m2, "storage dtype, unprepacked"
+    # the saved form loads back into the same layout, marker and all
+    reloaded = ops.Linear(IN, OUT, bias=True)
+    missing, unexpected, errors = [], [], []
+    reloaded._load_from_state_dict(dict(saved), "", {}, False, missing, unexpected, errors)
+    assert not errors and not missing and not unexpected
+    assert q.is_feather_fp8_weight(reloaded.weight)
+    assert torch.equal(reloaded.weight._qdata, model.lin.weight._qdata)
 
 
 def test_unquantized_linear_still_goes_through_comfy_ops(ops):

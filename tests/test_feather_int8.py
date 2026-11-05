@@ -149,6 +149,21 @@ def test_patch_on_int8_layer_stays_int8(ops):
     assert rel(out, ref) < 3e-2
 
 
+def test_int8_state_dict_survives_inference_mode(ops):
+    """Same inference-mode constraint as the fp8 layout, and the rotation marker has to be saved."""
+    state, _ = int8_state()
+    linear, _, _ = load(ops, state)
+    x = torch.randn(64, IN, device="cuda", dtype=DTYPE)
+    with torch.inference_mode():
+        linear(x)
+        saved = linear.state_dict()
+    assert set(saved) == {"weight", "weight_scale", "bias", "comfy_quant"}
+    assert torch.equal(saved["weight"].cpu(), state["weight"]), "unprepacked, still in the rotated basis"
+    reloaded, _, unexpected = load(ops, {"weight": saved["weight"], "weight_scale": saved["weight_scale"], "comfy_quant": saved["comfy_quant"]})
+    assert not unexpected
+    assert q.is_feather_int8_weight(reloaded.weight), "the marker keeps a saved int8 model on the int8 kernel"
+
+
 def test_float_layer_of_an_int8_checkpoint_takes_the_fp8_path(ops):
     """A mixed checkpoint: what the exporter kept in float follows the recipe, i.e. fp8e5m2."""
     int8_part, _ = int8_state()

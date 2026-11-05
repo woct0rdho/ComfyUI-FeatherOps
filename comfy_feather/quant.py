@@ -287,6 +287,30 @@ def take_stored_weight(state_dict: dict, prefix: str, orig_shape: tuple[int, int
     return packed.dequantize().to(dtype), None, marker_bytes
 
 
+def packed_state_dict(weight: torch.Tensor, key: str) -> dict[str, torch.Tensor]:
+    """`{key}` and `{key}_scale` for a packed weight, without detaching the wrapper.
+
+    `key` is the weight's own state-dict key (`...weight`), which is how the layout's suffixes line up with
+    what `_load_from_state_dict` reads. `QuantizedTensor.detach()` builds a new wrapper, which torch
+    refuses once the tensor is an inference tensor. The layout's own tensors are what a state dict wants.
+    """
+    return cast(QuantizedTensor, weight).state_dict(key)
+
+
+def quant_marker(weight: torch.Tensor) -> torch.Tensor:
+    """The `comfy_quant` entry for a packed weight: json bytes in a uint8 tensor, as ComfyUI writes it.
+
+    Saving one of these keeps a reload on the same layout instead of re-deriving it: an fp8 checkpoint is
+    read back as fp8, and an int8 ConvRot one keeps its rotation marker (without it the rows could not be
+    told apart from unrotated int8, which the kernel must not run).
+    """
+    if is_feather_int8_weight(weight):
+        conf = {"format": "int8_tensorwise", "per_row": True, "convrot": True, "convrot_groupsize": CONVROT_GROUP}
+    else:
+        conf = {"format": "float8_e5m2"}
+    return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
+
+
 def requantize_feather_weight(old: torch.Tensor, weight: torch.Tensor, seed: int | None = None) -> torch.Tensor:
     """Re-derive packed bytes for `weight` with the layout `old` already uses.
 
@@ -315,7 +339,7 @@ def get_feather_plain_tensors(weight):
 
 
 def feather_linear(x, weight, bias, out_dtype):
-    """`F.linear(x, weight, bias)` on a Feather-packed 2D weight, with the layout picking the kernel."""
+    """`x @ weight.T + bias` on a Feather-packed weight, with the layout picking the kernel."""
     if is_feather_int8_weight(weight):
         a, a_scale = convrot_quantize_activation(x)
         return int8_scaled_mm(a, weight._qdata.reshape(-1), a_scale, weight._params.scale, bias, out_dtype=out_dtype)

@@ -6,6 +6,7 @@ Run with `python -m pytest tests` from the repository root. Everything here exer
 
 import copy
 
+import comfy.model_patcher
 import comfy.ops
 import nodes
 import pytest
@@ -179,6 +180,69 @@ def test_weight_function_disables_kernel():
     assert not _packed(module).numel()
     ref = torch.nn.functional.conv2d(x, module.weight, module.bias, 1, 1)
     assert torch.equal(out, ref)
+
+
+def test_offloaded_weight_is_packed_from_the_cast_copy():
+    """With dynamic VRAM the parameter may sit on the offload device. The kernel needs the compute copy."""
+    module = _build(96, 96)
+    x = torch.randn((1, 96, 48, 48), device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        reference = torch.nn.functional.conv2d(x, module.weight, module.bias, 1, 1)
+        module.cpu()  # the offload side of the pair, as ModelPatcherDynamic leaves it
+        assert module.weight.device.type == "cpu"
+        module.comfy_cast_weights = True
+        out = module(x)
+    assert _packed(module).numel() and _packed(module).device.type == "cuda", "packed copy follows the compute device"
+    assert float((out.double() - reference.double()).norm() / reference.double().norm()) < 4e-3
+    # the cast copy is rebuilt only when the key changes: a second call reuses the pack
+    first = _packed(module).data_ptr()
+    with torch.no_grad():
+        module(x)
+    assert _packed(module).data_ptr() == first
+
+
+def test_weight_in_the_other_kernel_dtype_is_cast_at_pack_time():
+    """A checkpoint stored fp16 behind bf16 activations (what dynamic VRAM leaves) is cast, not refused."""
+    module = _build(96, 96, dtype=torch.float16)  # fp16 weights
+    x = torch.randn((1, 96, 48, 48), device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        out = module(x)
+        reference = torch.nn.functional.conv2d(x, module.weight.to(torch.bfloat16), module.bias.to(torch.bfloat16), 1, 1)
+    assert _packed(module).numel() and _packed(module).dtype == torch.bfloat16
+    assert float((out.double() - reference.double()).norm() / reference.double().norm()) < 4e-3
+
+
+def test_fp32_stored_weight_is_cast_at_pack_time():
+    """fp32 VAE files stay fp32 under dynamic VRAM and are cast per call. The pack does the same."""
+    module = _build(96, 96).to(torch.float32)  # an fp32 checkpoint, as `qwen_2d_vae.safetensors` ships
+    x = torch.randn((1, 96, 48, 48), device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        out = module(x)
+        reference = torch.nn.functional.conv2d(x, module.weight.to(torch.bfloat16), module.bias.to(torch.bfloat16), 1, 1)
+    assert _packed(module).numel() and _packed(module).dtype == torch.bfloat16
+    assert float((out.double() - reference.double()).norm() / reference.double().norm()) < 4e-3
+
+
+def test_lowvram_patch_falls_back_to_comfy():
+    """A lazily applied conv patch (LoCon) must not be hidden behind a cached prepack.
+
+    ComfyUI applies `weight_lowvram_function` inside its own cast path, which a resident module never
+    reaches, so what this pins is the gate: the pack stays empty, and the call goes through
+    `comfy.ops.Conv2d.forward` exactly as it did before the patch.
+    """
+    module = _build(96, 96)
+    x = torch.randn((1, 96, 48, 48), device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn(96, 96, 3, 3, device="cuda", dtype=torch.bfloat16) * 0.01
+    with torch.no_grad():
+        reference = torch.nn.functional.conv2d(x, module.weight, module.bias, 1, 1)
+        module.comfy_cast_weights = True
+        module.weight_lowvram_function = comfy.model_patcher.LowVramPatch("weight", {"weight": [("diff", (delta,))]})
+        try:
+            out = module(x)
+        finally:
+            del module.weight_lowvram_function
+    assert not _packed(module).numel(), "the cached pack cannot see a lazily changing patch"
+    assert torch.equal(out, reference)
 
 
 def test_grad_enabled_falls_back_but_matches():

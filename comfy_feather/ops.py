@@ -12,6 +12,8 @@ from .quant import (
     is_feather_packed_weight,
     make_feather_int8_weight,
     make_feather_quantized_weight,
+    packed_state_dict,
+    quant_marker,
     requantize_feather_weight,
     take_stored_weight,
 )
@@ -85,6 +87,20 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 else:
                     self.bias = None
 
+            def _save_to_state_dict(self, destination, prefix, keep_vars):
+                # The generic path detaches `self.weight`, and detaching a `QuantizedTensor` builds a new
+                # wrapper, which torch refuses for an inference tensor ("Cannot set version_counter ...").
+                # ComfyUI runs node bodies under `torch.inference_mode()` and calls `state_dict()` for its
+                # memory estimate, so this is on the hot path. `QuantizedTensor.state_dict` returns the
+                # layout's own tensors instead, which is exactly the form `_load_from_state_dict` reads.
+                if not self.is_quantized:
+                    super()._save_to_state_dict(destination, prefix, keep_vars)
+                    return
+                destination.update(packed_state_dict(self.weight, prefix + "weight"))
+                destination[prefix + "comfy_quant"] = quant_marker(self.weight)
+                if self.bias is not None:
+                    destination[prefix + "bias"] = self.bias if keep_vars else self.bias.detach()
+
             def convert_weight(self, weight, inplace=False, **kwargs):
                 if not self.is_quantized:
                     return weight
@@ -122,6 +138,9 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True, want_requant=lazy_patch)
 
                 if is_feather_packed_weight(weight):
+                    # `F.linear` cannot reach this kernel: torch lowers `linear` to `t` + `addmm`, and a
+                    # transposed packed weight has no packed form (kitchen's 1:1 layouts can, the
+                    # packed ones register `aten.t` to flag it). So the kernel is called here.
                     y = feather_linear(x, weight, bias, self.out_dtype)
                 else:
                     # A weight wrapper produced a plain tensor (ComfyUI does not requantize those), or
