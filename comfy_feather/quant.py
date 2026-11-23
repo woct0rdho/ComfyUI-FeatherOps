@@ -5,10 +5,15 @@ dequantizes a patched weight, applies every LoRA/LyCORIS/DoRA patch in float, an
 the layout's `quantize`:
 - `FeatherFP8E5M2PackedLayout`: per-tensor scale, `(K/16, N, 16)` prepack for `scaled_mm_hip`, which
   takes bf16/fp16 activations against fp8e5m2 weights. A checkpoint in any float format is cast to it.
+  Quantizing and dequantizing are `comfy.quant_ops.TensorCoreFP8E5M2Layout`'s own methods, so a
+  re-packed weight is byte-identical to what a native fp8 model would hold. Only the storage order
+  (and the prepack that follows) is this layout's.
 - `FeatherInt8ConvRotPackedLayout`: the comfy-quants int8 ConvRot form, i.e. group-256 regular-Hadamard
   rotated rows, per-output-channel int8 scales, `(K/4, N/4, 4, 4)` micro-tile prepack for
   `int8_scaled_mm`, which takes int8 activations (rotated and per-row quantized by the kernel) against
   int8 weights. An int8 checkpoint already stores exactly this, so loading it is a byte permutation.
+  Quantizing, dequantizing and the ConvRot flags are `comfy.quant_ops.TensorWiseINT8Layout`'s, which is
+  what makes a LoRA-merged weight come back byte-identical to the native path (dithering included).
 """
 
 import functools
@@ -17,11 +22,13 @@ import logging
 from typing import cast
 
 import comfy.float
+import comfy.model_management
 import comfy.ops
 import torch
+from comfy.quant_ops import TensorCoreFP8E5M2Layout, TensorWiseINT8Layout
 from comfy_kitchen.tensor import BaseLayoutParams, QuantizedLayout, QuantizedTensor, register_layout_class
 from feather_ops import convrot_int8_linear, prepack_int8_weight, scaled_mm_hip, unpack_int8_weight
-from feather_ops.int8_convrot import CONVROT_GROUP, build_hadamard, convrot_int8_supported, dequantize_convrot_weight, quantize_rowwise_int8, rotate
+from feather_ops.int8_convrot import CONVROT_GROUP, convrot_int8_supported
 
 logger = logging.getLogger(__name__)
 
@@ -52,45 +59,14 @@ def unprepack_transpose(x):
     return x.permute(1, 0, 2).reshape(N, k * 16)
 
 
-def quantize_fp8e5m2_scaled(x, scale="recalculate", seed=None, inplace_ops=False):
-    if scale is None or scale == "recalculate":
-        scale = torch.amax(x.abs()).to(dtype=torch.float32) / torch.finfo(torch.float8_e5m2).max
-        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-        if x.dtype not in {torch.float32, torch.bfloat16}:
-            dtype_info = torch.finfo(x.dtype)
-            scale = 1.0 / torch.clamp(1.0 / scale, min=dtype_info.min, max=dtype_info.max)
-    elif not isinstance(scale, torch.Tensor):
-        scale = torch.tensor(scale, device=x.device, dtype=torch.float32)
-    else:
-        scale = scale.to(device=x.device, dtype=torch.float32)
-
-    inv_scale = (1.0 / scale).to(dtype=x.dtype)
-    if inplace_ops:
-        x *= inv_scale
-    else:
-        x = x * inv_scale
-
-    if seed is not None and seed > 0:
-        x = comfy.float.stochastic_rounding(x, dtype=torch.float8_e5m2, seed=seed)
-    else:
-        x = x.to(torch.float8_e5m2)
-    return x, scale.float()
-
-
-def quantize_int8_convrot_rows(x, scale="recalculate"):
-    """Rotate group-256 blocks of `x` and quantize per row, the way comfy-quants stores int8 weights.
-
-    Rows are scaled by `absmax / 127` and rounded to nearest, clamped at -127 (the comfy-quants
-    convention). The rotation happens in the input dtype and the division in float32, which is what
-    makes a re-pack of a loaded checkpoint re-derive its own bytes.
-    """
-    rotated = rotate(x, build_hadamard(CONVROT_GROUP, device=x.device, dtype=x.dtype), CONVROT_GROUP)
-    if scale is None or scale == "recalculate":
-        scale = None
-    return quantize_rowwise_int8(rotated, scale)
-
-
 class FeatherFP8E5M2PackedLayout(QuantizedLayout):
+    """ComfyUI's fp8e5m2 layout, stored in `scaled_mm_hip`'s `(K/16, N, 16)` order.
+
+    Quantizing and dequantizing are `TensorCoreFP8E5M2Layout`'s, the same code a native fp8 model runs,
+    so the bytes (and the scale, and the stochastic-rounding behaviour under it) are the same ones
+    ComfyUI would produce. Only the storage order is this layout's.
+    """
+
     Params = BaseLayoutParams
 
     @classmethod
@@ -99,16 +75,12 @@ class FeatherFP8E5M2PackedLayout(QuantizedLayout):
             raise ValueError(f"Feather FP8 packed weights require a 2D tensor, got {tensor.ndim}D")
         if tensor.shape[1] % 16 != 0:
             raise ValueError(f"Feather FP8 packed weights require K divisible by 16, got {tensor.shape}")
-
-        orig_dtype, orig_shape = tensor.dtype, tuple(tensor.shape)
-        qdata, scale = quantize_fp8e5m2_scaled(tensor, scale=scale, seed=stochastic_rounding, inplace_ops=inplace_ops)
-        return prepack_transpose(qdata), cls.Params(scale=scale, orig_dtype=orig_dtype, orig_shape=orig_shape)
+        qdata, comfy_params = TensorCoreFP8E5M2Layout.quantize(tensor, scale=scale, stochastic_rounding=stochastic_rounding, inplace_ops=inplace_ops)
+        return prepack_transpose(qdata), cls.Params(scale=comfy_params.scale, orig_dtype=tensor.dtype, orig_shape=tuple(tensor.shape))
 
     @classmethod
     def dequantize(cls, qdata, params):
-        weight = unprepack_transpose(qdata)
-        scale = params.scale.to(device=weight.device, dtype=torch.float32)
-        return (weight.to(torch.float32) * scale).to(params.orig_dtype)
+        return TensorCoreFP8E5M2Layout.dequantize(unprepack_transpose(qdata), params)
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
@@ -123,23 +95,55 @@ class FeatherFP8E5M2PackedLayout(QuantizedLayout):
 
 
 class FeatherInt8ConvRotPackedLayout(QuantizedLayout):
-    Params = BaseLayoutParams
+    """ComfyUI's int8 ConvRot layout, stored in the 4x4 micro-tile order both GEMMs read.
+
+    The ConvRot flags, the quantizer and the dequantizer are `TensorWiseINT8Layout`'s. Only the storage
+    order is this layout's.
+    """
+
+    Params = TensorWiseINT8Layout.Params
 
     @classmethod
     def quantize(cls, tensor, scale="recalculate", stochastic_rounding=0, inplace_ops=False, **kwargs):
+        """Quantize with ComfyUI's own ConvRot quantizer, so re-packed bytes match the native path.
+
+        `TensorWiseINT8Layout.quantize` is the function `comfy.ops.MixedPrecisionOps` reaches through
+        `requantize_from_float`, so a weight patched here comes out byte-identical to the same weight
+        patched by a native int8 model. That matters beyond consistency: it dithers when
+        `stochastic_rounding` is set, and a LoRA delta smaller than one int8 step (which is the normal
+        case for a rank-16..64 LoRA on a per-row int8 weight) survives dithering but not round-to-nearest.
+        """
         if tensor.ndim != 2:
             raise ValueError(f"Feather int8 packed weights require a 2D tensor, got {tensor.ndim}D")
         n, k = tensor.shape
         ok, reason = convrot_int8_supported((n, k), CONVROT_GROUP, backward=False)
         if not ok:
             raise ValueError(f"Feather int8 packed weights cannot hold {tuple(tensor.shape)}: {reason}")
-        qdata, scale = quantize_int8_convrot_rows(tensor, scale=scale)
-        return prepack_int8_weight(qdata), cls.Params(scale=scale, orig_dtype=tensor.dtype, orig_shape=tuple(tensor.shape))
+        qdata, comfy_params = TensorWiseINT8Layout.quantize(
+            tensor,
+            scale=scale,
+            stochastic_rounding=stochastic_rounding,
+            is_weight=kwargs.get("is_weight", True),
+            per_channel=kwargs.get("per_channel", True),
+            convrot=kwargs.get("convrot", True),
+            convrot_groupsize=kwargs.get("convrot_groupsize", CONVROT_GROUP),
+        )
+        if not (comfy_params.convrot and comfy_params.convrot_groupsize == CONVROT_GROUP):
+            raise RuntimeError(f"comfy_kitchen requantized without the ConvRot rotation this layout stores: {comfy_params}")
+        # Per-output-channel scale as comfy_kitchen returns it, `[N, 1]`: its dequantize broadcasts the
+        # scale against the row, and `copy_from` compares shapes.
+        return prepack_int8_weight(qdata), cls.Params(
+            scale=comfy_params.scale.reshape(-1, 1),
+            orig_dtype=tensor.dtype,
+            orig_shape=tuple(tensor.shape),
+            is_weight=True,
+            convrot=True,
+            convrot_groupsize=CONVROT_GROUP,
+        )
 
     @classmethod
     def dequantize(cls, qdata, params):
-        weight = dequantize_convrot_weight(unpack_int8_weight(qdata), params.scale.to(device=qdata.device))
-        return weight.to(params.orig_dtype)
+        return TensorWiseINT8Layout.dequantize(unpack_int8_weight(qdata), params)
 
     @classmethod
     def get_plain_tensors(cls, qtensor):
@@ -166,8 +170,8 @@ def make_feather_quantized_weight(weight, scale, orig_dtype):
     if weight.dtype == torch.float8_e5m2:
         qdata = prepack_transpose(weight.to(torch.float8_e5m2))
     else:
-        qdata, scale = quantize_fp8e5m2_scaled(weight.to(torch.float32) * scale)
-        qdata = prepack_transpose(qdata)
+        qdata, params = FeatherFP8E5M2PackedLayout.quantize(weight.to(torch.float32) * scale, scale="recalculate")
+        scale = params.scale
 
     params = BaseLayoutParams(scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(weight.shape))
     return QuantizedTensor(qdata, FEATHER_FP8E5M2_LAYOUT, params)
@@ -179,8 +183,10 @@ def make_feather_int8_weight(weight, scale, orig_dtype):
         raise TypeError(f"Feather int8 packed weights require int8, got {weight.dtype}")
     if weight.ndim != 2:
         raise ValueError(f"Feather int8 packed weights require a 2D tensor, got {weight.ndim}D")
-    scale = scale.reshape(-1).to(device=weight.device, dtype=torch.float32)
-    params = BaseLayoutParams(scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(weight.shape))
+    scale = scale.reshape(-1, 1).to(device=weight.device, dtype=torch.float32)
+    params = FeatherInt8ConvRotPackedLayout.Params(
+        scale=scale, orig_dtype=orig_dtype, orig_shape=tuple(weight.shape), is_weight=True, convrot=True, convrot_groupsize=CONVROT_GROUP
+    )
     return QuantizedTensor(prepack_int8_weight(weight), FEATHER_INT8_LAYOUT, params)
 
 
@@ -303,15 +309,6 @@ def quant_marker(weight: torch.Tensor) -> torch.Tensor:
     return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 
-def requantize_feather_weight(old: torch.Tensor, weight: torch.Tensor, seed: int | None = None) -> torch.Tensor:
-    """Re-derive packed bytes for `weight` with the layout `old` already uses.
-
-    This is the hook ComfyUI calls when it bakes a patch: the fp8 pack re-quantizes per tensor, the int8
-    pack re-rotates per group-256 block and quantizes per output channel.
-    """
-    return cast(QuantizedTensor, old).requantize_from_float(weight, scale="recalculate", stochastic_rounding=seed, inplace_ops=True)
-
-
 def is_feather_fp8_weight(weight):
     return isinstance(weight, QuantizedTensor) and weight._layout_cls == FEATHER_FP8E5M2_LAYOUT
 
@@ -327,7 +324,24 @@ def is_feather_packed_weight(weight):
 def get_feather_plain_tensors(weight):
     if not is_feather_fp8_weight(weight):
         raise TypeError(f"Expected {FEATHER_FP8E5M2_LAYOUT}, got {type(weight).__name__}")
-    return FeatherFP8E5M2PackedLayout.get_plain_tensors(weight)
+    return weight.layout_cls.get_plain_tensors(weight)
+
+
+def requantize_after_patch(weight, device) -> bool:
+    """Whether a patched weight goes back into `weight`'s own packed format, as ComfyUI's Linear does.
+
+    Weight-only formats (int8 ConvRot) are requantized and keep their quantized GEMM on every device, so
+    a patched int8 weight is byte-identical to the native path's and the int8 kernel stays in use.
+
+    A format that also quantizes the activation (fp8e5m2/e4m3) is only requantized where ComfyUI can run
+    the fp8 GEMM. Everywhere else ComfyUI marks the layer `full_precision_matrix_mult` and multiplies by
+    the merged float weight, and following it is also the accurate choice: rounding a merged weight
+    back to e5m2 (two mantissa bits) replaces it with dithered fp8 noise that is far larger than the LoRA
+    delta it was meant to add.
+    """
+    if is_feather_fp8_weight(weight):
+        return comfy.model_management.supports_fp8_compute(device)
+    return True
 
 
 def feather_linear(x, weight, bias, out_dtype):

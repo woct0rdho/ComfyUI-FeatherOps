@@ -1,5 +1,5 @@
-from .comfy_feather.loader import FeatherUNetLoader  # ty: ignore[unresolved-import]
-from .comfy_feather.vae import FeatherVAELoader  # ty: ignore[unresolved-import]
+from .comfy_feather.loader import FeatherUNetLoader  # ty: ignore[import-not-found]
+from .comfy_feather.vae import FeatherVAELoader  # ty: ignore[import-not-found]
 
 NODE_CLASS_MAPPINGS = {
     "FeatherUNetLoader": FeatherUNetLoader,

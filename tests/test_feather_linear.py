@@ -7,17 +7,19 @@ against `comfy.lora.calculate_weight`, which is the reference for every adapter 
 """
 
 import comfy.lora
+import comfy.model_management
 import comfy.model_patcher
 import pytest
 import torch
 from comfy.ops import cast_bias_weight, uncast_bias_weight
 from comfy.weight_adapter.lora import LoRAAdapter
-from feather_ops import scaled_mm_hip
+from feather_ops import quantize_convrot_weight, scaled_mm_hip
+from torch import nn
 
 from comfy_feather import ops as feather_ops_module
 from comfy_feather import quant as q
 from comfy_feather.ops import feather_ops
-from comfy_feather.quant import get_feather_plain_tensors, is_feather_fp8_weight
+from comfy_feather.quant import get_feather_plain_tensors, is_feather_fp8_weight, make_feather_int8_weight
 
 IN, OUT, RANK = 512, 256, 16
 DTYPE = torch.bfloat16
@@ -161,8 +163,14 @@ def test_requant_flag_keeps_a_resident_weight_packed(ops):
     assert _rel(out, _reference(linear, x)) < 2e-2
 
 
-def test_offloaded_patch_flag_is_passed(ops, monkeypatch):
-    """The Linear asks for a requant exactly when ComfyUI left a lazy patch on the weight."""
+def test_patch_requant_follows_comfyui_per_format(ops, monkeypatch):
+    """A lazy patch is repacked only where ComfyUI would run the quantized GEMM.
+
+    Weight-only formats keep their quantized GEMM everywhere, so a patched int8 weight is repacked
+    (that is what makes the bytes match the native path). A format that also quantizes the activation
+    is only repacked where the fp8 GEMM runs. Where ComfyUI emulates it, the native loader multiplies
+    by the merged float weight, and rounding that back to e5m2 would add more noise than the LoRA.
+    """
     calls = {}
 
     def spy(s, x, **kwargs):
@@ -172,12 +180,27 @@ def test_offloaded_patch_flag_is_passed(ops, monkeypatch):
     monkeypatch.setattr(feather_ops_module, "cast_bias_weight", spy)
     model = _build(ops)
     x = torch.randn(64, IN, device="cuda", dtype=DTYPE)
+    patch = comfy.model_patcher.LowVramPatch(KEY, _lora_patches(model.lin.weight)[1])
+
     with torch.no_grad():
         model.lin(x)
         assert calls["want_requant"] is False, "a resident, unpatched weight needs no requant"
-        model.lin.weight_lowvram_function = comfy.model_patcher.LowVramPatch(KEY, _lora_patches(model.lin.weight)[1])
+
+        model.lin.weight_lowvram_function = patch
+        monkeypatch.setattr(comfy.model_management, "supports_fp8_compute", lambda device=None: False)
         model.lin(x)
-        assert calls["want_requant"] is True, "a lazy patch has to be requantized into the pack"
+        assert calls["want_requant"] is False, "no fp8 GEMM here, so the merged float weight is used"
+
+        monkeypatch.setattr(comfy.model_management, "supports_fp8_compute", lambda device=None: True)
+        model.lin(x)
+        assert calls["want_requant"] is True, "where the fp8 GEMM runs, the patch is repacked"
+
+        # int8 ConvRot is weight-only: ComfyUI repacks a patched weight and keeps its int8 GEMM
+        qdata, scale = quantize_convrot_weight(torch.randn(OUT, IN) * 0.05)
+        model.lin.weight = nn.Parameter(make_feather_int8_weight(qdata, scale, DTYPE), requires_grad=False)
+        monkeypatch.setattr(comfy.model_management, "supports_fp8_compute", lambda device=None: False)
+        model.lin(x)
+        assert calls["want_requant"] is True, "an int8 pack is always repacked"
         del model.lin.weight_lowvram_function
 
 

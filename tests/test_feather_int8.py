@@ -45,7 +45,7 @@ def int8_state(shape=(OUT, IN)):
     """A ConvRot-quantized weight, as a checkpoint would carry it."""
     n, k = shape
     weight = torch.randn(n, k) * 0.05
-    qdata, scale = q.quantize_int8_convrot_rows(weight)
+    qdata, scale = int8_convrot.quantize_convrot_weight(weight)
     return {"weight": qdata, "weight_scale": scale.reshape(-1, 1)}, weight
 
 
@@ -122,7 +122,7 @@ def test_int8_requantize_round_trips_the_layout(ops):
     with torch.no_grad():
         logical = packed.dequantize()
         assert rel(logical, weight) < 2e-2, "un-rotation has to give back the released weight"
-        again = q.requantize_feather_weight(packed, logical)
+        again = packed.requantize_from_float(logical, scale="recalculate", inplace_ops=True)
     assert q.is_feather_int8_weight(again)
     assert rel(again.dequantize(), logical) < 2e-2, "requantizing a dequantized weight is stable"
 

@@ -1,8 +1,10 @@
 import fnmatch
+from typing import cast
 
 import torch
 import torch.nn.functional as F
 from comfy.ops import cast_bias_weight, manual_cast, run_every_op, uncast_bias_weight
+from comfy.quant_ops import QuantizedTensor
 from torch import nn
 
 from .quant import (
@@ -14,7 +16,7 @@ from .quant import (
     make_feather_quantized_weight,
     packed_state_dict,
     quant_marker,
-    requantize_feather_weight,
+    requantize_after_patch,
     take_stored_weight,
 )
 
@@ -36,7 +38,15 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
         _exclude = exclude
         _out_dtype = out_dtype
 
-        class Linear(manual_cast.Linear):  # ty: ignore[invalid-attribute-override]
+        class Linear(manual_cast.Linear):
+            # `comfy.ops.linear_input_act`/`linear()` fold an activation into a generic GEMM by taking
+            # over the weight cast themselves. That skips this class's routing, and for a patched fp8
+            # weight it requantizes where ComfyUI's own Linear does not (Wan's FFN down-projection is
+            # written that way). Declaring the module's own forward as the only entry point makes
+            # ComfyUI apply the activation eagerly and then run this forward, which is where the
+            # layout decides between its kernel and a float GEMM.
+            comfy_force_forward = True
+
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.include = FeatherOps._include
@@ -109,10 +119,10 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 return weight.dequantize()
 
             def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
-                # Layout-agnostic: each pack re-derives its own bytes from the float weight, and the int8
-                # one re-rotates and re-scales as it quantizes.
+                # Layout-agnostic: each pack re-derives its own bytes from the float weight through the
+                # layout's own `quantize`, and the int8 one re-rotates and re-scales as it does.
                 if self.is_quantized:
-                    weight = requantize_feather_weight(self.weight, weight, seed=seed)
+                    weight = cast(QuantizedTensor, self.weight).requantize_from_float(weight, scale="recalculate", stochastic_rounding=seed, inplace_ops=True)
                 else:
                     weight = weight.to(self.weight.dtype)
 
@@ -129,13 +139,13 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 # Patch application is ComfyUI's, not ours: `cast_bias_weight` dequantizes, runs every
                 # patch in `weight_lowvram_function`/`weight_function` (LoRA, LoHa, LoKr, DoRA, weight
                 # diffs) and, with `want_requant`, repacks the patched weight through this layout's
-                # `quantize` instead of handing back a bf16 tensor. That is the contract
-                # `MixedPrecisionOps` in `comfy/ops.py` uses for its own quantized Linears. Without
-                # `want_requant` the offloaded path would lose the pack, and without the patches the
-                # LoRA would be silently dropped.
+                # `quantize`. Without it the patch would be dropped on the offloaded path. With it for a
+                # format ComfyUI itself does not requantize here, we would answer a different question
+                # than the native loader (see `quant.requantize_after_patch`).
                 lazy_patch = getattr(self, "weight_lowvram_function", None) is not None
+                requant = lazy_patch and requantize_after_patch(self.weight, x.device)
                 bias_dtype = self.bias.dtype if self.bias is not None else None
-                weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True, want_requant=lazy_patch)
+                weight, bias, offload_stream = cast_bias_weight(self, x, dtype=self.weight.dtype, bias_dtype=bias_dtype, offloadable=True, want_requant=requant)
 
                 if is_feather_packed_weight(weight):
                     # `F.linear` cannot reach this kernel: torch lowers `linear` to `t` + `addmm`, and a

@@ -10,6 +10,7 @@ import json
 import pytest
 import torch
 from comfy_kitchen.tensor import TensorCoreNVFP4Layout, TensorWiseINT8Layout
+from feather_ops.int8_convrot import quantize_convrot_weight
 
 from comfy_feather import loader as loader_module
 from comfy_feather import quant as q
@@ -154,7 +155,7 @@ def test_int8_rotated_at_another_group_is_unrotated_by_comfy(no_recipe):
 
 def test_int8_without_the_marker_is_dequantized(no_recipe):
     """An int8 entry our layout cannot verify (no marker) is dequantized with its scale, not run as int8."""
-    qdata, scale = q.quantize_int8_convrot_rows(torch.randn(OUT, IN) * 0.05)
+    qdata, scale = quantize_convrot_weight(torch.randn(OUT, IN) * 0.05)
     linear, _ = load(no_recipe, {"weight": qdata, "weight_scale": scale.reshape(-1, 1), "bias": None})
     assert not linear.is_quantized
     assert linear.weight.dtype == DTYPE
