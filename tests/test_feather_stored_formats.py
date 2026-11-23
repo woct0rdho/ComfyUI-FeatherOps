@@ -195,3 +195,72 @@ def test_stored_format_detection():
     assert loader_module._stored_formats({"a.weight": int8, "b.weight": fp8}) == frozenset({"int8", "fp8e5m2"})
     assert loader_module._stored_formats({"a.weight": torch.zeros(4, 4)}) == frozenset()
     assert loader_module._stored_formats({"a.weight_scale": int8}) == frozenset(), "only weights count"
+
+
+def test_saved_form_matches_what_the_layout_exports(ops):
+    """`ModelPatcher.model_state_dict_for_saving` takes the safetensors header from `_save_to_state_dict`
+    (shape, dtype, element count) and the bytes from `weight.state_dict`, so the two have to be the same
+    form. This pins that, for both layouts: anything that makes them diverge writes a corrupt file."""
+    for state in (fp8_state()[0], {**int8_state_like()}):
+        linear, _ = load(ops, state)
+        saved = linear.state_dict()
+        exported = linear.weight.state_dict("weight")
+        assert set(exported) <= set(saved)
+        for key, value in exported.items():
+            assert saved[key].shape == value.shape, key
+            assert saved[key].dtype == value.dtype, key
+            assert saved[key].nbytes == value.nbytes, key
+
+
+def int8_state_like():
+    """An int8 ConvRot checkpoint entry, as comfy-quants writes it."""
+    weight = torch.randn(OUT, IN) * 0.05
+    qdata, scale = quantize_convrot_weight(weight)
+    return {"weight": qdata, "weight_scale": scale.reshape(-1, 1), "bias": None, "comfy_quant": marker_bytes()}
+
+
+def test_packed_marker_drives_the_reload(ops):
+    """A packed entry is adopted as stored. The same bytes without the flag are read as released rows.
+
+    That difference is why the marker exists: the prepacked int8 bytes are a different tensor from the
+    rotated rows, so a file that lost the flag must not be adopted (it would be silently wrong) - it is
+    read as the released form, which is what a file from another exporter holds.
+    """
+    state = int8_state_like()
+    packed_linear, _ = load(ops, dict(state))
+    assert q.is_feather_int8_weight(packed_linear.weight)
+    unpacked = state["weight"]
+    assert torch.equal(q.unpack_int8_weight(packed_linear.weight._qdata.cpu()), unpacked)
+
+    # A packed weight with the flag stripped keeps the `shape` field, and the two have to agree: adopting
+    # it would permute the packed bytes twice, reading it as released rows would multiply by a permutation
+    # of the weight. Since the entry now states the logical `(N, K)`, the shape cannot tell the two apart,
+    # so the marker's own consistency is what rejects it.
+    saved = dict(packed_linear.state_dict())
+    saved["comfy_quant"] = torch.tensor(list(json.dumps({**json.loads(bytes(saved["comfy_quant"].tolist())), q.PACKED_STATE_DICT: False}).encode("utf-8")), dtype=torch.uint8)
+    broken = ops.Linear(IN, OUT, bias=True)
+    with pytest.raises(ValueError):
+        broken._load_from_state_dict(saved, "", {}, False, [], [], [])
+    assert not broken.is_quantized
+
+
+def test_detection_view_restores_logical_weight_shapes():
+    """Model detection reads weight shapes, so a packed file has to be read at its logical `(N, K)`.
+
+    Without this, a packed Flux-2 export detects `hidden_size` 3072 instead of 4096: detection reads the
+    storage shape of a Linear. The padding is why the marker records the shape instead of the view
+    dividing the storage shape by its tile.
+    """
+    for k in (IN, IN + 16):  # the second is zero-padded to 128 by the fp8 prepack
+        linear = feather_ops(policy=(("*",), ()), out_dtype=DTYPE).Linear(k, OUT, bias=True)
+        linear._load_from_state_dict({"weight": torch.randn(OUT, k) * 0.05, "bias": None}, "", {}, False, [], [], [])
+        marker = q.quant_marker(linear.weight)
+        packed = {"a.weight": linear.weight._qdata, "a.weight_scale": linear.weight._params.scale, "a.comfy_quant": marker}
+        view = loader_module._detection_view(packed)
+        assert tuple(view["a.weight"].shape) == (OUT, k), "the logical shape, padding included"
+        assert view["a.weight"].dtype == view["a.weight"].dtype and view["a.weight"].device.type == "meta"
+        assert q.marker_shape(bytes(marker.tolist())) == (OUT, k)
+        assert view["a.weight_scale"] is packed["a.weight_scale"], "only weight shapes are rebuilt"
+
+    released = {"a.weight": torch.zeros(OUT, IN, dtype=torch.int8), "a.comfy_quant": marker_bytes()}
+    assert loader_module._detection_view(released) is released, "released files are untouched"

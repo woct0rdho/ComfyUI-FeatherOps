@@ -13,7 +13,9 @@ from .quant import (
     int8_convrot_eligible,
     is_feather_packed_weight,
     make_feather_int8_weight,
+    make_feather_packed_weight,
     make_feather_quantized_weight,
+    packed_marker,
     packed_state_dict,
     quant_marker,
     requantize_after_patch,
@@ -69,7 +71,12 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 else:
                     selected = self._selected(prefix.rstrip("."))
                     is_dim1 = self.in_features == 1 or self.out_features == 1 or weight.ndim == 1
-                    if int8_convrot_eligible(weight, stored_scale, marker):
+                    if packed_marker(marker):
+                        # This loader's own state dict: the bytes are already in the kernel's order, so
+                        # they are adopted as they are. Permuting them again would be a full-weight copy
+                        # on every reload, and for fp8 it would also re-pad the K the file already holds.
+                        packed = make_feather_packed_weight(weight, stored_scale, self.out_dtype, (self.out_features, self.in_features))
+                    elif int8_convrot_eligible(weight, stored_scale, marker):
                         # Already int8 ConvRot: prepack the stored rows, never quantize them again.
                         packed = make_feather_int8_weight(weight, stored_scale, self.out_dtype)
                     elif weight.dtype == torch.float8_e5m2 and weight.ndim == 2 and self.in_features % 16 == 0 and (stored_scale is None or stored_scale.numel() == 1):
@@ -97,19 +104,28 @@ def feather_ops(out_dtype=torch.bfloat16, policy=None):
                 else:
                     self.bias = None
 
-            def _save_to_state_dict(self, destination, prefix, keep_vars):
-                # The generic path detaches `self.weight`, and detaching a `QuantizedTensor` builds a new
-                # wrapper, which torch refuses for an inference tensor ("Cannot set version_counter ...").
-                # ComfyUI runs node bodies under `torch.inference_mode()` and calls `state_dict()` for its
-                # memory estimate, so this is on the hot path. `QuantizedTensor.state_dict` returns the
-                # layout's own tensors instead, which is exactly the form `_load_from_state_dict` reads.
+            def state_dict(self, destination=None, prefix="", keep_vars=False):
+                """The released form of a packed weight, not its storage.
+
+                Overriding `_save_to_state_dict` is not enough: after it runs, `nn.Module.state_dict`
+                writes every parameter again from its generic loop, and detaching a `QuantizedTensor`
+                unwraps it to the storage (the `(K/4, N/4, 4, 4)` micro-tiles or the fp8
+                `(K_pad/16, N, 16)` order). ComfyUI reads these shapes - `comfy.lora.model_lora_keys_unet`
+                derives the fused-qkv split of a MOSS/Flux3 file from `state_dict()[...].shape[0] // 3`,
+                which sent a third of the qkv rows to the LoRA - and the exporter builds the safetensors
+                header from them, so they have to be the `[N, K]` form the layout's `state_dict_tensors`
+                writes. That is also why the layout tensors are returned as views rather than a copy.
+                """
                 if not self.is_quantized:
-                    super()._save_to_state_dict(destination, prefix, keep_vars)
-                    return
+                    if destination is None:
+                        return super().state_dict(prefix=prefix, keep_vars=keep_vars)
+                    return super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+                destination = {} if destination is None else destination
                 destination.update(packed_state_dict(self.weight, prefix + "weight"))
                 destination[prefix + "comfy_quant"] = quant_marker(self.weight)
                 if self.bias is not None:
                     destination[prefix + "bias"] = self.bias if keep_vars else self.bias.detach()
+                return destination
 
             def convert_weight(self, weight, inplace=False, **kwargs):
                 if not self.is_quantized:

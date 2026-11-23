@@ -10,6 +10,7 @@ from comfy_quants import list_model_adapters
 from comfy_quants.registry.global_registry import registry
 
 from .ops import feather_ops
+from .quant import marker_shape, packed_marker
 from .sampling import install_sampling_model_pin
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,34 @@ def _stored_formats(sd) -> frozenset[str]:
             elif value.dtype == torch.float8_e5m2:
                 formats.add("fp8e5m2")
     return frozenset(formats)
+
+
+def _detection_view(sd) -> dict:
+    """`sd` with weights this loader packed itself restored to their logical `(N, K)` shape.
+
+    Model detection reads weight shapes, and a packed weight's storage shape is not the logical one: a
+    `(N, K)` Linear is stored `(K/4, N/4, 4, 4)` or `(K_pad/16, N, 16)`. Detection would read the wrong
+    `in_features` and pick the wrong config, or none - measured on a packed Flux-2 export, it halves
+    `hidden_size`. Only the shapes detection reads are rebuilt, as meta tensors, so nothing is allocated
+    and no weight is moved. The load that follows reads the file's own bytes. Files from comfy-quants or
+    a ComfyUI fp8 export have no packed marker and come through untouched.
+    """
+    view = None
+    for key in list(sd):
+        if not key.endswith(".comfy_quant"):
+            continue
+        weight_key = key[: -len("comfy_quant")] + "weight"
+        weight = sd.get(weight_key)
+        if weight is None:
+            continue
+        marker = bytes(sd[key].cpu().tolist())
+        shape = marker_shape(marker) if packed_marker(marker) else None
+        if shape is None:
+            continue
+        if view is None:
+            view = dict(sd)
+        view[weight_key] = torch.empty(shape, dtype=weight.dtype, device="meta")
+    return sd if view is None else view
 
 
 def _strip_prefix(pattern, prefix):

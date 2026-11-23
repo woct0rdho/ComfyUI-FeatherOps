@@ -14,11 +14,17 @@ the layout's `quantize`:
   int8 weights. An int8 checkpoint already stores exactly this, so loading it is a byte permutation.
   Quantizing, dequantizing and the ConvRot flags are `comfy.quant_ops.TensorWiseINT8Layout`'s, which is
   what makes a LoRA-merged weight come back byte-identical to the native path (dithering included).
+
+Both layouts store the kernel's order, and their `state_dict` keeps it: the weight entry is the resident
+`_qdata` and the `comfy_quant` marker says so (`PACKED_STATE_DICT`), which is what makes a `state_dict()`
+free - ComfyUI takes one for every memory estimate and every LoRA key scan. Permuting a weight back to
+the released order is a full-weight copy, so only `dequantize` does it.
 """
 
 import functools
 import json
 import logging
+import math
 from typing import cast
 
 import comfy.float
@@ -64,7 +70,9 @@ class FeatherFP8E5M2PackedLayout(QuantizedLayout):
 
     Quantizing and dequantizing are `TensorCoreFP8E5M2Layout`'s, the same code a native fp8 model runs,
     so the bytes (and the scale, and the stochastic-rounding behaviour under it) are the same ones
-    ComfyUI would produce. Only the storage order is this layout's.
+    ComfyUI would produce. Only the storage order is this layout's, and `state_dict` keeps that order
+    (see `packed_marker`): permuting it back is a full-weight copy, and every `state_dict()` ComfyUI
+    takes for an estimate or a LoRA key scan would pay it.
     """
 
     Params = BaseLayoutParams
@@ -88,8 +96,9 @@ class FeatherFP8E5M2PackedLayout(QuantizedLayout):
 
     @classmethod
     def state_dict_tensors(cls, qdata, params):
+        # The resident bytes, which is what `packed_marker` announces: no permutation, so no copy.
         return {
-            "": unprepack_transpose(qdata),
+            "": qdata,
             "_scale": params.scale,
         }
 
@@ -151,9 +160,10 @@ class FeatherInt8ConvRotPackedLayout(QuantizedLayout):
 
     @classmethod
     def state_dict_tensors(cls, qdata, params):
-        # The released form, which is what comfy-quants writes: rotated int8 rows and a [N, 1] scale.
+        # The resident bytes, which is what `packed_marker` announces: no permutation, so no copy. The
+        # scale keeps the `[N, 1]` shape comfy-quants writes.
         return {
-            "": unpack_int8_weight(qdata),
+            "": packed_state_view(qdata, params.orig_shape),
             "_scale": params.scale.reshape(-1, 1),
         }
 
@@ -190,9 +200,95 @@ def make_feather_int8_weight(weight, scale, orig_dtype):
     return QuantizedTensor(prepack_int8_weight(weight), FEATHER_INT8_LAYOUT, params)
 
 
+def packed_state_view(qdata: torch.Tensor, orig_shape: tuple[int, int]) -> torch.Tensor:
+    """`qdata` as the state dict states it: the weight's own `(N, K)` when that is a free view.
+
+    The bytes stay in the kernel's order (the `packed` marker says so), but the shape is what other
+    code reads: `comfy.lora.model_lora_keys_unet` splits a fused qkv LoRA by `state_dict()[k].shape[0] // 3`
+    and the safetensors header is built from these shapes, so exposing `(K/4, N/4, 4, 4)` there sent a
+    third of the rows to the LoRA. A padded fp8 pack (`K_pad > K`) cannot state `(N, K)`. Its marker
+    carries the logical shape instead.
+    """
+    n, k = int(orig_shape[0]), int(orig_shape[1])
+    return qdata.reshape(n, k) if qdata.numel() == n * k else qdata
+
+
+def fp8_packed_shape(orig_shape: tuple[int, int]) -> tuple[int, int, int]:
+    """The `(K_pad/16, N, 16)` storage shape this layout holds for an `(N, K)` weight."""
+    n, k = orig_shape
+    return -(-k // 128) * 128 // 16, n, 16
+
+
+def int8_packed_shape(orig_shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    """The `(K/4, N/4, 4, 4)` storage shape this layout holds for an `(N, K)` weight."""
+    n, k = orig_shape
+    return k // 4, n // 4, 4, 4
+
+
+def make_feather_packed_weight(qdata, scale, orig_dtype, orig_shape):
+    """Adopt a state-dict entry `state_dict_tensors` wrote, i.e. bytes already in the kernel's order.
+
+    This is the reload side of `packed_marker`: the permutation is skipped, so a model saved here loads
+    without the prepack pass. The storage shape is checked against `orig_shape` rather than trusted,
+    because this is the one direction the kernels cannot check: `scaled_mm` accepts a prepack at least
+    `K/16` deep (that is what makes the zero-padded K work), so a weight of the wrong depth would be
+    multiplied by a partial contraction instead of failing.
+    """
+    n, k = int(orig_shape[0]), int(orig_shape[1])
+    if qdata.dtype == torch.int8:
+        expected = int8_packed_shape((n, k))
+        if tuple(qdata.shape) != expected:
+            # A state dict states the weight's own `(N, K)`. The bytes are the same, so the storage
+            # shape is a free view away. Anything else is a real mismatch and must not slip through.
+            if qdata.numel() != math.prod(expected):
+                raise ValueError(f"int8 packed weight of {tuple(qdata.shape)} does not hold a ({n}, {k}) weight, which is {expected}")
+            qdata = qdata.reshape(expected)
+        scale = scale.reshape(-1, 1).to(device=qdata.device, dtype=torch.float32)
+        params = FeatherInt8ConvRotPackedLayout.Params(scale=scale, orig_dtype=orig_dtype, orig_shape=(n, k), is_weight=True, convrot=True, convrot_groupsize=CONVROT_GROUP)
+        return QuantizedTensor(qdata, FEATHER_INT8_LAYOUT, params)
+
+    expected = fp8_packed_shape((n, k))
+    if qdata.dtype == torch.float8_e5m2 and tuple(qdata.shape) != expected and qdata.numel() == math.prod(expected):
+        qdata = qdata.reshape(expected)
+    if qdata.dtype != torch.float8_e5m2 or tuple(qdata.shape) != expected:
+        raise ValueError(f"fp8 packed weight of {qdata.dtype} {tuple(qdata.shape)} does not hold a ({n}, {k}) weight, which is {expected}")
+    if scale is None:
+        scale = torch.ones((), device=qdata.device, dtype=torch.float32)
+    else:
+        scale = scale.to(device=qdata.device, dtype=torch.float32)
+    params = BaseLayoutParams(scale=scale, orig_dtype=orig_dtype, orig_shape=(n, k))
+    return QuantizedTensor(qdata, FEATHER_FP8E5M2_LAYOUT, params)
+
+
 @functools.lru_cache(maxsize=32)
 def _quant_marker(raw: bytes) -> dict:
     return json.loads(raw)
+
+
+# `comfy_quant` key announcing that `weight` is in this layout's storage order instead of the released
+# one. Everything this loader writes carries it (see `quant_marker`), so a reload adopts the bytes and a
+# `state_dict()` costs no copy. A comfy-quants checkpoint, which stores released rows, has no marker
+# value for it and is prepacked on load as before.
+PACKED_STATE_DICT = "packed"
+
+
+def packed_marker(raw: bytes | None) -> bool:
+    """Whether a `comfy_quant` payload says its weight is already in the kernel's storage order."""
+    return bool(raw) and bool(_quant_marker(raw).get(PACKED_STATE_DICT, False))
+
+
+def marker_shape(raw: bytes | None) -> tuple[int, int] | None:
+    """The `(N, K)` a packed entry stands for, as its marker records it, or None if it does not say.
+
+    The storage shape is not the logical one - int8 is `(K/4, N/4, 4, 4)` and fp8 pads K to 128 - and
+    model detection reads weight shapes, so the logical shape has to travel with the file. This is also
+    the only exact source for a padded fp8 K: `(K_pad/16, N, 16)` cannot tell you how much of the 128
+    block is padding.
+    """
+    if raw is None:
+        return None
+    shape = _quant_marker(raw).get("shape")
+    return None if shape is None else (int(shape[0]), int(shape[1]))
 
 
 def int8_convrot_eligible(weight, scale, marker: bytes | None) -> bool:
@@ -259,7 +355,7 @@ def take_stored_weight(state_dict: dict, prefix: str, orig_shape: tuple[int, int
     Three shapes of entry, and the caller only has to look at the dtype to tell the first two apart:
     - a float weight, returned as stored with its scale (e5m2 stays e5m2 so it can be prepacked without
       being quantized twice).
-    - an int8 weight, returned as stored for the same reason.
+    - an int8 weight or this loader's own packed entry, returned as stored for the same reason.
     - packed codes (nvfp4 / mxfp8 / int4 / grouped int8), which are dequantized to float through
       ComfyUI's own quantized loader, since the key-to-params table for those is its, not ours.
     """
@@ -273,8 +369,17 @@ def take_stored_weight(state_dict: dict, prefix: str, orig_shape: tuple[int, int
         scale = state_dict.get(prefix + "scale_weight")
     marker = state_dict.get(prefix + "comfy_quant")
     marker_bytes = bytes(marker.cpu().tolist()) if marker is not None else None
+    if marker_shape(marker_bytes) is not None and not packed_marker(marker_bytes):
+        # The two fields state the same thing - the entry is in this layout's storage order - so a file
+        # carrying one without the other cannot be read: adopting it would permute the packed bytes a
+        # second time, and reading it as released rows would multiply by a permutation of the weight.
+        # This loader is the only writer of `shape`, so the combination only appears if a file was edited.
+        raise ValueError(f"{prefix}comfy_quant records a logical shape without the packed flag, so the stored byte order is ambiguous")
 
-    if torch.is_floating_point(weight) or (weight.dtype == torch.int8 and (marker_bytes is None or int8_convrot_eligible(weight, scale, marker_bytes))):
+    # A packed entry of our own is not a 2D ConvRot weight, so it must not go through the eligibility
+    # test (which reads the shape as `(N, K)`). `packed_marker` is what tells the loader to adopt it.
+    as_stored = marker_bytes is None or packed_marker(marker_bytes) or int8_convrot_eligible(weight, scale, marker_bytes)
+    if torch.is_floating_point(weight) or (weight.dtype == torch.int8 and as_stored):
         for key in (prefix + "weight", prefix + "weight_scale", prefix + "scale_weight", prefix + "comfy_quant"):
             state_dict.pop(key, None)
         return weight, scale, marker_bytes
@@ -286,11 +391,13 @@ def take_stored_weight(state_dict: dict, prefix: str, orig_shape: tuple[int, int
 
 
 def packed_state_dict(weight: torch.Tensor, key: str) -> dict[str, torch.Tensor]:
-    """`{key}` and `{key}_scale` for a packed weight, without detaching the wrapper.
+    """`{key}` and `{key}_scale` for a packed weight, without detaching the wrapper or copying the bytes.
 
     `key` is the weight's own state-dict key (`...weight`), which is how the layout's suffixes line up with
     what `_load_from_state_dict` reads. `QuantizedTensor.detach()` builds a new wrapper, which torch
-    refuses once the tensor is an inference tensor. The layout's own tensors are what a state dict wants.
+    refuses once the tensor is an inference tensor. The layout's own tensors are what a state dict wants,
+    and they are the resident ones: `state_dict_tensors` hands back `_qdata` itself, so a
+    `state_dict()` here is a dict of views and costs nothing to build.
     """
     return cast(QuantizedTensor, weight).state_dict(key)
 
@@ -301,11 +408,20 @@ def quant_marker(weight: torch.Tensor) -> torch.Tensor:
     Saving one of these keeps a reload on the same layout instead of re-deriving it: an fp8 checkpoint is
     read back as fp8, and an int8 ConvRot one keeps its rotation marker (without it the rows could not be
     told apart from unrotated int8, which the kernel must not run).
+
+    `PACKED_STATE_DICT` says the weight is in this layout's storage order, and every entry this loader
+    writes carries it: `state_dict_tensors` keeps the resident bytes rather than permuting them back, so
+    a reload has to adopt them instead of prepacking them a second time. A checkpoint from comfy-quants
+    or a ComfyUI fp8 export has no such flag and takes the released path. `shape` is the logical
+    `(N, K)` of those bytes, which the storage shape no longer states.
     """
+    conf: dict[str, object]
     if is_feather_int8_weight(weight):
         conf = {"format": "int8_tensorwise", "per_row": True, "convrot": True, "convrot_groupsize": CONVROT_GROUP}
     else:
         conf = {"format": "float8_e5m2"}
+    conf[PACKED_STATE_DICT] = True
+    conf["shape"] = [int(x) for x in weight.shape]
     return torch.tensor(list(json.dumps(conf).encode("utf-8")), dtype=torch.uint8)
 
 

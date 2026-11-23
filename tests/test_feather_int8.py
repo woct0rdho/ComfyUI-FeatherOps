@@ -7,6 +7,7 @@ one float32 scale per output channel, plus a `comfy_quant` marker that says the 
 import json
 
 import comfy.lora
+import comfy.model_management
 import comfy.model_patcher
 import pytest
 import torch
@@ -105,14 +106,23 @@ def test_int8_layer_loads_packed_and_runs_the_int8_kernel(ops, monkeypatch):
     assert rel(out, ref) < 2e-2, "int8 ConvRot round trip of the weight"
 
 
-def test_int8_layer_keeps_the_checkpoint_bytes(ops):
-    """`state_dict_tensors` has to reproduce what the exporter wrote, not a re-quantization."""
+def test_int8_saved_model_is_the_storage_itself(ops):
+    """`state_dict_tensors` hands back the resident bytes, so saving costs no copy and no permutation.
+
+    The entry states the weight's own `(N, K)` while its bytes stay in the kernel's order, because that
+    shape is what other code reads: ComfyUI splits a fused qkv LoRA by `state_dict()[k].shape[0] // 3`
+    and builds the safetensors header from it. The view shares the storage, so saving is still free, and
+    the released rows are exactly reproducible from it (`unpack_int8_weight`), which is what a
+    comfy-quants checkpoint holds. The loader reads the packed form back through the marker.
+    """
     state, _ = int8_state()
     weight = q.FeatherInt8ConvRotPackedLayout
     packed = q.make_feather_int8_weight(state["weight"], state["weight_scale"], DTYPE)
-    restored = weight.state_dict_tensors(packed._qdata, packed._params)
-    assert torch.equal(restored[""], state["weight"])
-    assert torch.equal(restored["_scale"].reshape(-1), state["weight_scale"].reshape(-1))
+    saved = weight.state_dict_tensors(packed._qdata, packed._params)
+    assert saved[""].untyped_storage().data_ptr() == packed._qdata.untyped_storage().data_ptr(), "the entry must be a view of the storage"
+    assert tuple(saved[""].shape) == tuple(state["weight"].shape), "the entry states the weight's own shape"
+    assert torch.equal(q.unpack_int8_weight(saved[""].reshape(packed._qdata.shape)), state["weight"])
+    assert torch.equal(saved["_scale"].reshape(-1), state["weight_scale"].reshape(-1))
 
 
 def test_int8_requantize_round_trips_the_layout(ops):
@@ -160,10 +170,25 @@ def test_int8_state_dict_survives_inference_mode(ops):
         linear(x)
         saved = linear.state_dict()
     assert set(saved) == {"weight", "weight_scale", "bias", "comfy_quant"}
-    assert torch.equal(saved["weight"].cpu(), state["weight"]), "unprepacked, still in the rotated basis"
+    assert saved["weight"].untyped_storage().data_ptr() == linear.weight._qdata.untyped_storage().data_ptr(), "a state_dict must not copy the weight"
+    assert torch.equal(q.unpack_int8_weight(saved["weight"].cpu().reshape(linear.weight._qdata.shape)), state["weight"]), "still the rotated rows"
+    assert json.loads(bytes(saved["comfy_quant"].tolist()))[q.PACKED_STATE_DICT] is True
     reloaded, _, unexpected = load(ops, {"weight": saved["weight"], "weight_scale": saved["weight_scale"], "comfy_quant": saved["comfy_quant"]})
     assert not unexpected
     assert q.is_feather_int8_weight(reloaded.weight), "the marker keeps a saved int8 model on the int8 kernel"
+    assert torch.equal(reloaded.weight._qdata, linear.weight._qdata), "adopted as stored, not permuted again"
+
+
+def test_state_dict_and_module_size_do_not_copy_the_weight(ops):
+    """ComfyUI takes a state_dict for every memory estimate and LoRA key scan. It must stay free."""
+    state, _ = int8_state()
+    linear, _, _ = load(ops, state)
+    before = torch.cuda.memory_allocated()
+    saved = linear.state_dict()
+    assert torch.cuda.memory_allocated() == before, "state_dict must not allocate on the device"
+    assert saved["weight"].untyped_storage().data_ptr() == linear.weight._qdata.untyped_storage().data_ptr(), "the entry is a view of the resident storage"
+    # module_size sums `t.nbytes`, so it has to be the packed size, not the logical one
+    assert comfy.model_management.module_size(linear) == sum(t.nbytes for t in saved.values())
 
 
 def test_float_layer_of_an_int8_checkpoint_takes_the_fp8_path(ops):

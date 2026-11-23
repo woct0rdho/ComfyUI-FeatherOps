@@ -6,6 +6,8 @@ The LoRA policy is ComfyUI's, not ours: a patched weight is baked through `conve
 against `comfy.lora.calculate_weight`, which is the reference for every adapter type.
 """
 
+import json
+
 import comfy.lora
 import comfy.model_management
 import comfy.model_patcher
@@ -234,7 +236,9 @@ def test_state_dict_survives_inference_mode(ops):
         model.lin(x)
         saved = model.lin.state_dict()
     assert set(saved) == {"weight", "weight_scale", "bias", "comfy_quant"}
-    assert saved["weight"].dtype == torch.float8_e5m2, "storage dtype, unprepacked"
+    assert saved["weight"].dtype == torch.float8_e5m2, "storage dtype"
+    assert saved["weight"] is model.lin.weight._qdata, "the entry is the resident storage, so no copy"
+    assert json.loads(bytes(saved["comfy_quant"].tolist()))[q.PACKED_STATE_DICT] is True
     # the saved form loads back into the same layout, marker and all
     reloaded = ops.Linear(IN, OUT, bias=True)
     missing, unexpected, errors = [], [], []
@@ -242,6 +246,31 @@ def test_state_dict_survives_inference_mode(ops):
     assert not errors and not missing and not unexpected
     assert q.is_feather_fp8_weight(reloaded.weight)
     assert torch.equal(reloaded.weight._qdata, model.lin.weight._qdata)
+
+
+def test_k_padded_state_dict_round_trips(ops):
+    """The fp8 prepack zero-pads K to 128, so a padded entry keeps its storage shape.
+
+    An unpadded pack states the weight's own `(N, K)` as a view, but `K_pad > K` means the element count
+    no longer matches, and the padded `(K_pad/16, N, 16)` is what the kernel reads. The marker records the
+    logical shape, and it comes back from the layer on load.
+    """
+    k = IN + 16  # a multiple of 16, so it is packable, but not of 128
+    k_pad = -(-k // 128) * 128
+    linear = ops.Linear(k, OUT, bias=True)
+    linear._load_from_state_dict({"weight": torch.randn(OUT, k) * 0.05, "bias": None}, "", {}, False, [], [], [])
+    linear = linear.cuda()
+    saved = linear.state_dict()
+    assert tuple(saved["weight"].shape) == q.fp8_packed_shape((OUT, k))
+    assert saved["weight"].numel() == OUT * k_pad, "the storage the kernel reads, padding included"
+    reloaded = ops.Linear(k, OUT, bias=True)
+    missing, unexpected, errors = [], [], []
+    reloaded._load_from_state_dict(dict(saved), "", {}, False, missing, unexpected, errors)
+    assert not errors and not missing and not unexpected
+    assert tuple(reloaded.weight.shape) == (OUT, k), "the logical shape comes back from the layer"
+    x = torch.randn(64, k, device="cuda", dtype=DTYPE)
+    with torch.no_grad():
+        assert _rel(reloaded.cuda()(x), linear(x)) == 0.0, "same bytes in, same result out"
 
 
 def test_unquantized_linear_still_goes_through_comfy_ops(ops):
