@@ -1,6 +1,6 @@
 # gfx1151 HIP Prepacked-B fp8 Matmul Kernel Optimization Plan
 
-Scope: `feather_ops::scaled_mm` in `~/feather-ops` (`csrc/hip_kernel.cu`, `feather_ops/scaled_mm.py`), the forward `Y[M, N] = (X[M, K] fp16|bf16) @ (W[N, K] fp8)^T * scale + bias` against a weight prepacked once as `(K/16, N, 16)`. Forward only: there is no weight-gradient or input-gradient direction in this operator, and none is planned. gfx1151 only, one device, one kernel family.
+Scope: `feather_ops::scaled_mm` in `~/feather-ops` (`csrc/hip_kernel.cu`, `feather_ops/scaled_mm.py`), the forward `Y[M, N] = (X[M, K] fp16|bf16) @ (W[N, K] fp8)^T * scale + bias` against a weight prepacked once as `(K_pad/16, N, 16)`. Forward only: there is no weight-gradient or input-gradient direction in this operator, and none is planned. gfx1151 only, one device, one kernel family.
 
 ## Signature And Contract
 
@@ -14,16 +14,9 @@ Scope: `feather_ops::scaled_mm` in `~/feather-ops` (`csrc/hip_kernel.cu`, `feath
 
 The kernel is an implicit GEMM over `M = tokens`, `N = output width`, `K = reduction width`, with `v_wmma_f32_16x16x16_{f16,bf16}_w32` on wave32 and 8 fp32 accumulators per lane per tile. B is staged as raw fp8 and decoded to half in registers, because gfx11 has no fp8 arithmetic and no `global_load_lds`.
 
-The prepack keeps the weight physically as fp8: one pass at load time writes `(K_pad/16, N, 16)` and the kernel consumes those bytes as a raw `uint8_t*`. No dequantized copy of the weight exists at runtime, and the weight scale stays a per-tensor scalar applied in the epilogue.
+The prepack keeps the weight physically as fp8: one pass at load time writes `(K_pad/16, N, 16)` and the kernel consumes those bytes as a raw `uint8_t*`. No dequantized copy of the weight exists at runtime, and the weight scale stays a per-tensor scalar applied in the epilogue. The ComfyUI layer is described in ComfyUI Integration at the end.
 
-ComfyUI integration: the wrapper is two `comfy.quant_ops` layout classes whose `quantize`/`dequantize` are ComfyUI's own (`TensorCoreFP8E5M2Layout`/`TensorWiseINT8Layout`), so the prepack is the only thing this repo adds to either format. Two rules keep a Feather-loaded model numerically the same as one loaded natively:
-- Patches follow ComfyUI. `cast_bias_weight` applies LoRA/LyCORIS/DoRA/weight diffs. The merged weight is repacked only where ComfyUI would run the quantized GEMM itself (`quant.requantize_after_patch`). For a weight-only format that is always, which is why a patched int8 weight is byte-identical to the native path. For fp8 it is `model_management.supports_fp8_compute(device)`: where fp8 is emulated (gfx1151) ComfyUI multiplies by the merged float weight, and we follow, because rounding a merged weight back into e5m2 dithers 36x the LoRA delta of a rank-64 LoRA (`blocks.0.self_attn.q` of the Wan 2.2 A14B fp8 model: delta 0.1% of the weight, e5m2 step ~3.6%). Where fp8 GEMM exists, both requantize and the kernel stays on patched layers.
-- A packed `state_dict()` states the weight's own `(N, K)`, not the storage shape. The bytes stay in the kernel's order (the `comfy_quant` marker says so, and the loader adopts them without permuting), but the shape is read by other code: `comfy.lora.model_lora_keys_unet` splits a fused qkv LoRA by `state_dict()[k].shape[0] // 3` (MOSS-Image, Flux 3) and the safetensors header is built from it. Exposing `(K/4, N/4, 4, 4)` there gave a third of the qkv rows to the LoRA, which then failed its reshape inside `comfy.lora.calculate_weight` and silently skipped the patch - the effects measured below went from 1.03 to 1.14 of native's 1.16 once fixed. A padded fp8 pack (`K_pad > K`) cannot state `(N, K)`. Its marker carries the logical shape and the entry keeps the storage shape, and a marker that records a shape without the `packed` flag is rejected rather than guessed.
-- `comfy_force_forward = True` on the Linear. `comfy.ops.linear_input_act`/`linear()` fold an activation into a generic GEMM by taking over the weight cast, which both bypasses the layout's routing and (Wan's FFN down-projection is written that way) requantized a patched fp8 weight where the native `MixedPrecisionOps.Linear`, marked `full_precision_matrix_mult` on this device, did not. Declaring the module's own forward as the entry point makes ComfyUI apply the activation eagerly and then use the layout's kernel.
-
-Result on Wan 2.2 A14B fp8e5m2 (512^2, 4 steps, cfg 1, the 4-step distill LoRA): feather vs native rel 0.0021 without LoRA and 0.0099 with it, against 1.32 for the LoRA's own effect, i.e. the loader difference is at the sampling noise of the arithmetic, not a different model. The int8 Anima model is unchanged (0.109 latent, 1.056 vs 1.062 LoRA effect, the fp8-vs-native int8 kernel difference it had before) and its per-layer requantization is byte-identical to native's.
-
-Metric: kernel-only milliseconds from `bench/benchmark_scaled_mm_hip.py` and `~/tmp/feather_ops/fp8_shapes/`, converted to `2*M*N*K/t`, measured steady state and against `torch.mm` on an already-dequantized weight. Medians of per-round medians, per `~/evotensile/docs/noisy_measurements.md`. Session drift on this machine is ±3%. Accuracy gate for every change: relative L2 <= 1e-2 and max abs <= 1.0 against the float32 `feather_ops.naive.scaled_mm_naive`, both fp8 flavours and both output dtypes, which is the gate `tests/test_scaled_mm_hip.py` already enforces.
+Metric: kernel-only milliseconds from `bench/benchmark_scaled_mm_hip.py` and `~/tmp/feather_ops/fp8_shapes/`, converted to `2*M*N*K/t`, measured steady state and against `torch.mm` on an already-dequantized weight. Medians of per-round medians, per `~/evotensile/docs/noisy_measurements.md`. Session drift on this machine is ±3%. Accuracy gate for every change: relative L2 <= 1e-2 and max abs <= 1.0 against the float32 `feather_ops.naive.scaled_mm_naive`, both fp8 flavours and both output dtypes, which is the gate `tests/test_scaled_mm_hip.py` already enforces. Denormal and NaN exactness may be relaxed where a change still passes. The decode drops denormals in every flavour today. The gate has rejected every approximate decode tried so far (see Earlier Campaigns), so treat it as bit-exact in practice.
 
 ## The Shape Problem
 
@@ -37,7 +30,7 @@ The shape grid is the forward cell set of `int8_convrot_prepacked_fwd_bwd_plan.m
 
 The rejected set was not exotic: every Krea 2 cell at `M = 4112` and `M = 9232`, every Qwen-Image 2.1 cell at both of those M, every Z-Image cell at `M = 4128/9248`, every MOSS cell, H3's ragged `M = 5251`, all six Qwen3.5 text-encoder cells whose width is 4304, and H3's `adaln_proj` at `M = 1`. Those are the cells the image models generate at. The M values that did work (4096, 4608, 5376, 9216, 9728, 25344, 512, 2048) are the ones that happen to be 64- or 128-aligned. This audit is what the tails were built for, and it is kept because it is the reason the shape contract is what it is.
 
-The integration used to pay to avoid that error: `comfy_feather/ops.py` padded `M` up to a multiple of 16/32/64/128 (128 above 256 rows) before the call and sliced the output afterwards. So the production cost of a ragged M was a full activation copy plus the wasted MMA rows, not a fallback: on `4112 x 24576 x 4096` the pad is 34 MB read plus 35 MB written, ~0.33 ms against a ~2.1 ms GEMM, and 112 of 4224 rows are dead MMA (2.7%). The tails in the kernel removed both, and the padding block is gone from the wrapper. The N and K tails had no workaround at all: a 4304-wide layer passed the quantizer (`K % 16 == 0` was the only check) and then raised at the GEMM, which is why those six cells were a hard error rather than a slow path.
+The tails removed the need for a caller-side pad. The N and K tails had no caller-side workaround at all: a 4304-wide layer passed the quantizer (`K % 16 == 0` was the only check) and then raised at the GEMM, which is why those six cells were a hard error rather than a slow path. The old pad-and-slice wrapper and the activation cast are described in ComfyUI Integration.
 
 Why this is a cliff and not a slope. Each M tile re-reads its whole B panel (`block_n * K` bytes). The N-fastest grid lets L2 carry a panel from one M pass to the next only while the whole weight is a few MB, so for the 118 cells whose weight is larger than that the weight traffic of a cell is `ceil(M / block_m) * N * K`. Dividing flops by that traffic gives a roof that depends on the tile height alone:
 
@@ -49,10 +42,7 @@ That formula is a worst case rather than a law, and the measurements say where i
 
 Splitting the audit by weight footprint makes the priority order explicit: the 118 cells with `N * K > 8 MB` carry 99.5% of the forward flops and 33 of them are unavailable (21.8% of that class's flops), while the 21 cells with a small weight carry 0.5% of the flops and lose 6 cells to the same gate. For the 100 cells that ran, the formula explains the plateau they sat on: big-weight cells capped at a 128-row tile, i.e. a 50.1 TFLOPS roof against a 54.0 compute ceiling, measuring 41-42 under the cold-L2 protocol of the time.
 
-Three secondary findings from the same audit:
-- The two prepack helpers take opposite orientations: `feather_ops.scaled_mm.prepack_b_for_scaled_mm` takes the GEMM's B (`[K, N]`), `comfy_feather.quant.prepack_transpose` takes the weight (`[N, K]`). Nothing was wrong with either, but with no docstring and a square-only bench the difference was invisible, and a non-square run of the bench fed the helper the wrong way round. Both have docstrings now and every non-square test exercises one of them.
-- `tests/test_scaled_mm_hip.py` only generated square, divisible shapes, so no test exercised a tail, a non-square weight, or a 16-row tile. That is now the bulk of the file.
-- ComfyUI's fp8 path (`comfy_feather/ops.py`) cast `x` to fp16 and the result back to `dtype_orig` on every call, because the kernel only accepted fp16 A. On `4112 x 24576 x 4096` that was 67 MB of extra read+write for the activation cast, ~0.3 ms against a ~2.1 ms GEMM, on top of the M-padding copy above. The cast is gone.
+`tests/test_scaled_mm_hip.py` only generated square, divisible shapes, so no test exercised a tail, a non-square weight, or a 16-row tile. That is now the bulk of the file. The two integration-side findings from the same audit - the prepack orientations and the fp8 activation cast - are in ComfyUI Integration.
 
 ## Current Results
 
@@ -92,7 +82,7 @@ Readings:
 
 ## Where This Kernel Stands Against The Int8 One
 
-Both kernels are `[M, K] x [N, K]` GEMMs on the same part and both issue the same `16x16x16` WMMA, so achieved TFLOPS are directly comparable. `python -m bench.benchmark_kernels --backends fp8,int8_fwd,int8_bwd,bf16` measures all of them on the shared grid in one interleaved pass per cell, so the columns are paired. The numbers below are the 110-cell grid, one session:
+Both kernels are `[M, K] x [N, K]` GEMMs on the same part and both issue the same `16x16x16` WMMA, so achieved TFLOPS are directly comparable. `python -m bench.benchmark_kernels --backends fp16,fp8,int8_fwd,int8_bwd,bf16` measures all of them on the shared grid in one interleaved pass per cell, so the columns are paired. The numbers below are the 110-cell grid, one session:
 
 | backend | mean TFLOPS | median | what it computes |
 |---|---:|---:|---|
@@ -148,14 +138,16 @@ Padded prepack also removed a piece of the old design: the first attempt zero-fi
 
 ### Tile set: what the sweep actually picks
 
-`SCALED_MM_TILES` instantiates 31 tile boxes (the 28 the autotuner searched plus `64x64 (2,2,2,2,2)`, `256x128 (4,4,2,4,2)` and `256x256 (4,4,2,4,4)`), four of which also exist with `prefetch` for 35 rows in total. The measured winners over 139 cells:
+Status note from the fp16 optimization pass: the `prefetch=1` rows on 16x64/32x64/64x128 measured 30-50% slower than `prefetch=0` on every tested cell in the current build. They were removed from `SCALED_MM_TILES`, which is now 31 no-prefetch rows, and the shipped heuristic uses the no-prefetch form. The M/N/K boundaries were also refit: 128x256 is now used for `2048 <= N < 6144` at `M <= 512`, and 16x256 u2 for `2048 <= N <= 4096` at `224 < M <= 256`. The prefetch claims in the history below describe an earlier build and are kept as history, not as current behavior.
+
+`SCALED_MM_TILES` instantiates 31 tile boxes (the 28 the autotuner searched plus `64x64 (2,2,2,2,2)`, `256x128 (4,4,2,4,2)` and `256x256 (4,4,2,4,4)`). The `prefetch` column below is the historical measurement from the build that still had the rows. The measured winners over 139 cells:
 
 | tile | config | prefetch | wins on |
 |---|---|---|---|
 | 128x256 | `(1,8,4,8,2)`, u=4 | no | the wide-weight, wide-output bulk: H3, Qwen/Klein `24576`/`36864`, Krea `16384`, Z-Image `11520`/`10240`, text-encoder `25600`, `248320` |
 | 64x128 | `(1,4,2,4,2)` | yes | mid weights with `N <= 4096`, every `1152`-wide text-encoder cell, long-K narrow-output cells |
 | 128x128 | `(2,2,2,4,4)` | no | 512-row cells with `N` in 3072-6144 |
-| 128x256 | `(2,4,4,4,2)` | no | 512-row cells with `N <= 2560` |
+| 128x128 | `(2,4,4,4,2)` | no | 512-row cells with `N <= 2560` |
 | 32x128 | `(1,2,4,1,2)` | yes | `N <= 1024` |
 | 32x32 | `(1,2,2,2,2)` | yes | 512-row, `N <= 1280` |
 | 64x128 | `(1,4,2,4,2)` | yes | 129-256 rows: 1.3-1.4x the 64-wide tile (`192/256 x 2560 x 2560`, `256 x 4096 x 4096`) |
@@ -167,7 +159,7 @@ The 256-row tiers have never won a cell, in either protocol - but every one of t
 
 ### Heuristic instead of autotune
 
-`select_scaled_mm_config(M, N, K, a_dtype, b_dtype, out_dtype)` in `feather_ops/scaled_mm.py`, fitted to the 139-cell sweep, in the same style as `select_int8_config`: range rules on `(M, N, K)` so a new image size lands in the right class without a per-model table. The kernel keeps no shape heuristic of its own: it takes the tile as six integers (five tile parameters plus `prefetch`) and the only branch it still makes is `tail_free`, which is a property of the extents (`M`, `N`, `K` divide the tile) rather than tuned data.
+`select_mm_fp8_config(M, N, K)` in `feather_ops/scaled_mm.py`, fitted to the 139-cell sweep, in the same style as `select_mm_int8_config`: range rules on `(M, N, K)` so a new image size lands in the right class without a per-model table. The kernel keeps no shape heuristic of its own: it takes the tile as six integers (five tile parameters plus `prefetch`) and the only branch it still makes is `tail_free`, which is a property of the extents (`M`, `N`, `K` divide the tile) rather than tuned data.
 
 | condition | tile | prefetch |
 |---|---|---|
@@ -181,7 +173,7 @@ The 256-row tiers have never won a cell, in either protocol - but every one of t
 | `M > 512`, `N <= 1024` | 16x64 | yes |
 | `M > 512`, `1280 < N <= 1792` and `M <= 4608` | 16x64 | yes |
 | `M > 512`, `1025 <= N <= 1280` | 64x128 | yes |
-| `M > 512`, `N <= 2560`, `K <= 2048`, `M <= 4096` | 128x256 (`2,4,4,4,2`) | no |
+| `M > 512`, `N <= 2560`, `K <= 2048`, `M <= 4096` | 128x128 (`2,4,4,4,2`) | no |
 | `M > 512`, `N <= 4096` or weight `<= 8 MB` | 64x128 | yes |
 | else | 128x256 (`1,8,4,8,2`) | no |
 
@@ -195,19 +187,17 @@ What the fit is not: a proof. The rules are coarse on purpose, several 3-9% miss
 
 ### Python API, allocation, and `torch.compile`
 
-`scaled_mm_hip(a, b_prepacked, scale, bias, out_dtype, tile=None)` is the whole public surface. It picks the tile, allocates `out` in Python, and calls `torch.ops.feather_ops.scaled_mm.default(a, b_prepacked, scale, bias, out, *tile)`. The op returns nothing. Deleted with the autotuner: `_configured_op`, `_autotuned_op`, both fake kernels, `register_custom_op_autotuning`, `old_autotune`, the 28-config list, `autotune._config_compatible`, and the `torch.compiler.is_compiling()` branch. This is the shape `mm_hipblaslt.py` and `conv2d.py` already had, and `tests/test_scaled_mm_hip_compile.py` checks that `torch.compile(fullgraph=True)` at `dynamic=False` and `dynamic=True` matches eager on non-square, ragged shapes.
+`scaled_mm_hip(a, b_prepacked, scale=None, bias=None, out_dtype=torch.bfloat16)` is the public surface. It picks the tile, allocates `out` in Python, and calls `torch.ops.feather_ops.scaled_mm.default(a, b_prepacked, scale, bias, out, *tile)`. The op returns nothing. Tests, benchmarks, and profilers pin a tile by calling `torch.ops.feather_ops.scaled_mm.default` with their own output buffer. Deleted with the autotuner: `_configured_op`, `_autotuned_op`, both fake kernels, `register_custom_op_autotuning`, `old_autotune`, the 28-config list, `autotune._config_compatible`, and the `torch.compiler.is_compiling()` branch. This is the shape `mm_hipblaslt.py` and `conv2d.py` already had, and `tests/test_scaled_mm_hip_compile.py` checks that `torch.compile(fullgraph=True)` at `dynamic=False` and `dynamic=True` matches eager on non-square, ragged shapes.
 
 The autotuner is not missed: it resolved differences at its own noise floor (0.1-2.3% against the best fixed tile), and it cost 3.5 s on the first call of every new `(M, N, K)`, which for image models means every new resolution.
 
 ### Prepack
 
-`prepack_b_for_scaled_mm(b)` takes the GEMM's B, `[K, N]`, and writes `[K_pad/16, N, 16]` with `K_pad` rounded up to 128. `comfy_feather/quant.py::prepack_transpose` is the same permutation for a `[N, K]` weight and pads the same way. The two orientations are the one place where it is easy to lose an hour, so both have a docstring now and the kernel checks the padded row count.
+`prepack_b_for_scaled_mm(b)` takes the GEMM's B, `[K, N]`, and writes `[K_pad/16, N, 16]` with `K_pad` rounded up to 128. The kernel checks the padded row count. The ComfyUI-side `[N, K]` counterpart and the orientation trap are in ComfyUI Integration.
 
 ### bf16 activations: widen while staging, and do not use the bf16 MMA
 
 The A operand accepts fp16 or bf16. bf16 is widened to fp16 in the staging path (2 ops per pair of halves), so the whole body - decode, WMMA, epilogue - stays the fp16 one. Measured on five cells and four tiles (`~/tmp/feather_ops/fp8_shapes/ab_a_dtype.py`): the staging cast is within 1% of a native fp16 activation everywhere, while the native bf16 MMA is 1-25% slower on the cells that matter (`5376 x 21504 x 5376`: 41.15 with the cast against 37.32 with the bf16 MMA. `2048 x 248320 x 4096`: 40.66 against 38.12), because e5m2 -> bf16 decode costs a perm plus three ALU per pair where e5m2 -> fp16 is the perm alone. The native bf16 instantiation was deleted, which halved the kernel count.
-
-`comfy_feather/ops.py` no longer casts `x` to fp16, so a bf16 model now hands its activations straight to the kernel.
 
 ### Everything else, unchanged
 
@@ -226,10 +216,11 @@ Closed with measurements from this work:
 | `__syncthreads`-free single-buffer refill (the pre-tail loop) | unchanged, kept | nothing to win |
 | 256-row tiles (`256x128`, `256x256`) | never won a cell. The `u = 2` rows are 30-34% behind, and the `u = 4` retest (8 and 16 warps) is still 8% behind on average | the chunk size was a real handicap (`u = 4` recovers most of it: 27.3 -> 36.5 for `256x128`), but even rectified the tier loses to the short tiles everywhere the heuristic can reach, because the weight passes it saves are already amortized by L2 at 128 rows (T7, T15, T18) |
 
-Still closed from the previous campaign, with the evidence intact: direct-write decode staging (P1, +0.15% only), `cvt_pk_f16_fp8` (P2, gfx1250-only), `s_setprio` variants (P4/P7), stage4 and `stages > 2` as an LDS-buffer count (P8), hoisting the `v_perm` literals into VGPRs (P15, -2.7%), `kBPad`/`kCPad` padding stays removed (P17), M-tile grouping for B-panel reuse (0.5-2% of N-major, i.e. noise), and split-K / stream-K (net-negative on every starved cell of the sibling kernel).
+Still closed from the previous campaign, with the evidence intact: direct-write decode staging (P1, +0.15% only), `cvt_pk_f16_fp8` (P2, gfx1250-only), `s_setprio` variants (P4/P7), stage4 and `stages > 2` as an LDS-buffer count (P8), hoisting the `v_perm` literals into VGPRs (P15, -2.7%), `kBPad`/`kCPad` padding stays removed (P17), M-tile grouping for B-panel reuse (0.5-2% of N-major, i.e. noise), and split-K / stream-K (net-negative on every starved cell of the sibling kernel). The two predecessor plans this file merges contribute the rest. Their surviving rejections are in Earlier Campaigns below.
 
 Closed in this pass:
-- Overlap/prefetch (P10, P22, P23). The refill now overlaps with the WMMAs on the tiles that pay for it, and the earlier rejections are explained. Two designs were built and measured per tile over all 139 cells with the shipped protocol: a register image of the next chunk stored into the same LDS buffer after a barrier (no extra LDS), and the int8 kernel's two-LDS-buffer form (one barrier per chunk). The second is dominated: it doubles LDS, which halves the workgroups resident on the WGP's 128 KB, and it never beat the first by more than noise. The first is now the `prefetch` field of four tiles (`64x128`, `32x64`, `16x64`, `64x64`) and wins by +7.7% mean on the 64x128 tiles (50 cells), +14.6% on 32x64, +23.2% on 16x64 and +17.7..+53.1% on 64x64 (five small-M shapes), while losing 15% on 128x256 and 83% on 128x128, so it is a per-tile choice like `unroll_k` rather than a switch. What closed the question is that the win tracks how much of a chunk is refill: a 64x128 tile buys 64 flops per byte of chunk payload, a 128x256 tile 131, and only the short tile has enough exposed latency to recover. The same pass found a compiler artifact on one instantiation: `(2,2,2,2,2)` with `prefetch` and fp16 activations asked for 55296 B of LDS against its 6144-byte union, because `AMDGPUPromoteAlloca` promoted a 384-byte per-thread array there. Disabling that promotion (`tools/hip_flags.py`) fixes it, worth +19% on those four instantiations (`T16`).
+- Overlap/prefetch (P10, P22, P23). The refill now overlaps with the WMMAs on the tiles that pay for it, and the earlier rejections are explained. Two designs were built and measured per tile over all 139 cells with the shipped protocol: a register image of the next chunk stored into the same LDS buffer after a barrier (no extra LDS), and the int8 kernel's two-LDS-buffer form (one barrier per chunk). The second is dominated: it doubles LDS, which halves the workgroups resident on the WGP's 128 KB, and it never beat the first by more than noise.
+- The first is now the `prefetch` field of four tiles (`64x128`, `32x64`, `16x64`, `64x64`) and wins by +7.7% mean on the 64x128 tiles (50 cells), +14.6% on 32x64, +23.2% on 16x64 and +17.7..+53.1% on 64x64 (five small-M shapes), while losing 15% on 128x256 and 83% on 128x128, so it is a per-tile choice like `unroll_k` rather than a switch. What closed the question is that the win tracks how much of a chunk is refill: a 64x128 tile buys 64 flops per byte of chunk payload, a 128x256 tile 131, and only the short tile has enough exposed latency to recover. The same pass found a compiler artifact on one instantiation: `(2,2,2,2,2)` with `prefetch` and fp16 activations asked for 55296 B of LDS against its 6144-byte union, because `AMDGPUPromoteAlloca` promoted a 384-byte per-thread array there. Disabling that promotion (`tools/hip_flags.py`) fixes it, worth +19% on those four instantiations (`T16`).
 - The peak correction. The old "hard cap 45.7 / we are at 96%" framing is retracted. The measured issue ceiling is 54.0 TFLOPS. The 128x256 tile reaches 80% of it on the H3 cells (43.2), the class means are 32-41, and the cells the heuristic brings down to 64 rows are DRAM-bound at 79-97% of the 212 GB/s roof instead. The remaining gap is therefore two different gaps, traffic on the short tiles and issue efficiency on the tall ones, not a single unknown item.
 
 ## What Remains
@@ -239,6 +230,7 @@ Ranked by measured or estimated gain, with the mechanism and the gate each item 
 - The remaining heuristic gap, 1.8% of summed TFLOPS after the refit. The residue is concentrated in the wide cells where the best box flips non-monotonically: `4096 x 8192 x 2048` wants the pipelined 64x128 (+16.6%) while `5376 x 5376 x 7168` and `25344 x 5376 x 7168` both want 128x256. A boundary there needs a model of the tile's traffic, not another threshold. The per-cell data for it is the ten-tile sweep in `~/tmp/feather_ops/dual/refit_*.json`. Fourteen of the 31 baseline boxes still never win a cell, and dropping them would cut 14 of the 35 instantiations out of the dispatch chain.
 - M-tail split launch. The grid rounds `M` up to `block_m`, so `4112` at 128 rows computes 0.9 dead tiles (1.2%) and the ragged training rows (5251, 4352) 1-2%. The int8 kernel recovers its 5.8% (its tile is 256 rows) with a second launch over the remainder. Here the win is small enough to sit behind the items above.
 - e4m3 stays deferred: it costs 7.5% more than e5m2 in decode, the integration quantizes to e5m2 itself, and it only becomes interesting if native fp8 e4m3 checkpoints are routed here, at which point it becomes a class in the selector rather than its own kernel.
+- The B-fragment load placement (never measured). `wmma_compute_stage` loads, permutes and decodes all `repeat_n` B fragments before the first WMMA of a stage, so in source order the B reads and the WMMAs are serialized within a stage. Any overlap has to come from the compiler or from other waves. The old campaign listed interleaving them as Direction J and never ran it. Direction H does not cover it - that experiment removed instructions, this one overlaps them. The fragment-load ablation is 6.1% at `8192^3` (`P19-P21`), which is the rough ceiling and the gate: without a per-cell win at that scale it is not worth disturbing the current scheduling.
 
 ## History: The One-Shape Campaign
 
@@ -285,14 +277,14 @@ The previous version of this file tuned `8192^3` and only `8192^3`, with an auto
 | T13 | REJECT then DELETE | two LDS buffers, one barrier per chunk (the int8 design) | -28.3% mean on 128x256 and equal to T12 where T12 wins: halving the resident workgroups costs more than the second barrier |
 | T14 | KEEP analysis | fp8-vs-int8 head to head on 30 shared cells, with the per-tile resource report (`lds_attrs.cpp`, `int8_attrs.cpp`) | median 0.998, fp8 wins 15/30. This kernel is DRAM-bound (79-86% of 212 GB/s where it wins), the int8 one is issue-bound (73-78% of the 54 TF ceiling, 35-47% of the roof). The sign follows tile height and A-operand width, not dtype |
 | T15 | KEEP analysis | 256-row tiles measured against `128x256 u=4` | 256x128 `u=2` -30%, 256x256 `u=2` -33%, so the tall tier's negative is confounded by its chunk size. Turned T7 into an open item |
-| T16 | FIXED | LDS size audit per instantiation | `(2,2,2,2,2)` + `prefetch` with fp16 A was allocated 55296 B against its 6144 B union: `AMDGPUPromoteAlloca` promoted a 384 B per-thread alloca into LDS (128 threads x 384 B). `-mllvm -disable-promote-alloca-to-lds` (`tools/hip_flags.py`) removes it, and `tools/check_lds.py` - which compiles with the same flags - reports all 560 instantiations at exactly their union. The flag is neutral for bf16 (no bf16 instantiation was promoted) and worth +19% on the fp16 variants of that tile |
+| T16 | FIXED | LDS size audit per instantiation | `(2,2,2,2,2)` + `prefetch` with fp16 A was allocated 55296 B against its 6144 B union: `AMDGPUPromoteAlloca` promoted a 384 B per-thread alloca into LDS (128 threads x 384 B). `-mllvm -disable-promote-alloca-to-lds` (`tools/hip_flags.py`) removes it, and `tools/check_lds.py` - which compiles with the same flags - reports all 496 instantiations at exactly their union. The flag is neutral for bf16 (no bf16 instantiation was promoted) and worth +19% on the fp16 variants of that tile |
 | T17 | KEEP | selector refit on the ten-tile sweep | +1.65% summed / +2.16% mean per cell over 139 cells, 26 better and 5 worse. The 19 cells that change tile gain 14.4% on their own sum. The 1536-wide class alone went from 19-30 to 26-32 TFLOPS |
 | T18 | REJECT | tall tier at `unroll_k = 4` (`256x128`, `256x256`, 8 and 16 warps) | `u=4` recovers the chunk-size handicap (`256x128` 27.3 -> 36.5 on `4112x6144x6144`) but still loses 8-19% on average to the short tiles and only wins cells where the heuristic was already wrong. Pruned from the table |
 | T19 | KEEP | rotation instead of reversal in `bench/protocol.py` | removes a 1.6% middle-position bias measured on two identical providers in a three-provider run |
 | T20 | CLOSE, unsubstantiated | the 5-16% scheduling gap against the pre-tail kernel | not reproducible from the tree: `4096 x 2048 x 2048` measures 30.0 with the same tile as the old build's 35.7, and the other cell of the claim (`4096 x 8192 x 2048`) reaches the old number (38.7) with `(1,4,2,4,2)` plus the overlap. The claim came from a pre-protocol session. A rebuild of the pre-tail kernel would be needed to pursue it |
 | T22 | KEEP | the shared grid (`bench/cells.py`) replacing two per-family lists | 106 cells instead of 139 + 68, both GEMM benches and a cross-kernel one consume it, and the regimes the plans call special are now cells rather than prose. It found the tiny-M class on its first run |
 | T23 | KEEP | small-M tile classes refitted: 16x64 below 128 rows, 32x64 where the grid needs it, 64x128 at 129-256 | 1.6-2.7x on the `M <= 16` cells (16x256 was the shipped tile), 1.2-2.4x at `M <= 128` (64x64 was), 1.3-1.4x at 129-256. No grid cell is slower than `torch.mm` any more and the median rose 1.90x -> 1.95x |
-| T24 | KEEP with workaround | the fp16 LDS allocation audit (`tools/check_lds.py`) | checks all 560 instantiations against the union their source asks for. It is what found the 55296-byte fp16 variant. With 64x64 no longer returned by the heuristic that instantiation is unreachable from the selector, so the dtype routing was dropped |
+| T24 | KEEP with workaround | the fp16 LDS allocation audit (`tools/check_lds.py`) | checks all 496 instantiations against the union their source asks for. It is what found the 55296-byte fp16 variant. With 64x64 no longer returned by the heuristic that instantiation is unreachable from the selector, so the dtype routing was dropped |
 | T25 | REJECT (int8 kernel) | LDS stage padding, 0 / 32 / 48 bytes against the shipped 16 | measured on the int8 kernel, where the bank-conflict count is non-zero: 16 B is already the best of the four (0 is -1.3%, 32 and 48 are -0.4% and -0.5%). This kernel's conflicts are already 0, so the pad is not a knob left on the table for either |
 | T21 | CLOSE, superseded | a cell-level `prefetch` condition | the refit moved the cells it existed for (the 1536-wide class is now a 16-row tile, `4112 x 1536 x 6144` is 27.3 instead of 23.6) and the residue is inside the cell-to-cell spread |
 
@@ -311,37 +303,108 @@ Durable findings that still hold, kept so they do not have to be relearned:
 - An instantiation's real LDS footprint is `group_segment_fixed_size` in the code object, not the union size in the source. Read it from the built artifact for every tile. When they disagree the usual cause is a promoted alloca rather than the source: `AMDGPUPromoteAlloca` charges `workgroup_size * size` of LDS for a per-thread array it decides to promote, which is how one fp16 variant came to ask for 55296 B for 5632 B of code. `-mllvm -disable-promote-alloca-to-lds` is the cure here. `tools/check_lds.py` is the guard.
 - Interleaving only pairs fairly if every provider visits every position. Reversing the order per round leaves the middle position to the same provider, which measured two identical providers 1.6% apart. Rotating one place per round does not.
 - A tile family that loses can be losing for a reason you chose: the 256-row tier was priced while all its instantiations had half the chunk size of the winners. Rectify the handicap before retiring a family (`T15`, `T18`).
+- Reducing LDS instructions is not a goal by itself. The old 256x128 `(2,4,2,8,2)` reshuffle cut LDS 43% and VALU 40% and measured -0.2%, because the B reads and the decode were filling each other's stalls. Change the pair together or not at all.
+- A benchmark win is the decision metric. Profile time, PMCs and instruction counts are supporting evidence. Session drift (±3%) and cell-to-cell spread are larger than most profile deltas, so a counter improvement with a flat benchmark is not a keep.
 
 What the refill ablation adds, and why the overlap item is config-gated rather than a single switch: the exposed cost of the global->LDS refill is strongly config-dependent at `8192^3`-scale cells. Wide `repeat_m=1` `(1,8,4,1,2)` at `2048^3` is clearly B-dominated (`reuse_a` 4%, `reuse_b` 14%, `reuse_ab` 15%). The balanced `(1,4,4,4,2)` at `4096^3` splits evenly (both 6%). The tall WSGR-on `(4,2,2,2,4)` at `(8192, 2048, 12288)` is A-dominated (`reuse_a` 15%, `reuse_b` 8%), and the large square winner `(2,4,4,4,4)` at `8192^3` gains only 2%, i.e. it is not refill-dominated. So dual buffering should be expected to pay on the 2048-6144-class cells and on the tall tiers, and to do little on the largest square cell.
 
 One old conclusion needs qualifying rather than deleting: "the winner path is not DRAM-bandwidth-limited" is true of `8192^3`, but only just (B traffic there is 4.3 GB, ~83% of the 212 GB/s roof at 24.4 ms), and it is false for most of the real cells, where the 128-row tile ceiling puts the weight-traffic roof at 50.1 TFLOPS. The two statements are the same identity evaluated at different tile heights. Neither contradicts the other.
 
+## Earlier Campaigns
+
+Two predecessor plans tuned earlier shapes of this kernel and are folded in here: `hip_optimization_plan.md` (the fp16-out 128x256 `(2,4,2,4,4)` generation) and `hip_optimization_plan_prepacked.md` (the first prepacked-B 128x256 `(1,8,2,8,2)` generation). Their full ledgers remain in git history. Their absolute numbers, their 59.4 TFLOPS issue-formula peak and their perf snapshots are stale - they predate `unroll_k = 4`, `prefetch`, the tails and the static heuristic - so only the findings below are carried forward.
+
+Notation: the old ledgers write a tile as `warps_m, warps_n, unroll_k, stages, repeat_m, repeat_n`. This file writes `warps_m, warps_n, unroll_k, repeat_m, repeat_n[, prefetch]`. The old winner `1,8,2,2,8,2` is `(1,8,2,8,2)` here, and `2,4,2,2,4,4` is `(2,4,2,4,4)`.
+
+The diagnosis moved with the design, which is why neither old instruction mix should be reused. The old body was LDS-issue-bound: LDS was ~37% of wave32 instructions but ~48% of issue cycles against VALU's ~23%. The first prepacked body was decode/issue-bound: VALU ~58%, LDS ~14%, other ~28% of wave32 instructions. The shipped kernel is at ~80% of the 54 TF issue ceiling on the tall cells and at 79-97% of the DRAM roof on the short ones. Re-profile the current tile. The old percentages are not a prior.
+
+| finding | evidence (then) | why it still matters |
+|---|---|---|
+| fp16-prepack transport | 24 TFLOPS, the fp8-byte prepack recovered the path | the weight must stay fp8 at rest. A dequantized fp16 copy is traffic for nothing |
+| K-pair interleaved B, `ds_read_b32`, `pk_u16` | -5.1%, -2.6%, -6.1% (the E.2 profile: LDS -69%, VALU +28%) | removing B LDS reads moves the work into VALU/per-wave conversion and loses the read/decode interleaving/ Instruction count is not the metric |
+| ASM `ds_load_u16` batching of the 64 d16 WAW waits | -2.3%, and separate statements were reordered past `s_waitcnt` | the waits are already hidden. Rigid ASM loses the compiler's scheduling |
+| Direction H: the old 256x128 `(2,4,2,8,2)` reshuffle | -43% LDS, -40% VALU, +4.3% busy cycles, -0.2% speed | reshuffling LDS reads between A and B is neutral. A resource can be removed only together with the latency-hiding it was filling |
+| `rn`-outer loop reorder | -4% | keep `rm` outer / `rn` inner, with the `rn` B fragments preloaded once per stage |
+| B physical/inverse row mapping | -3% | the mapping stays on A. B stores direct |
+| compile-time `has_scale`/`has_bias`, half2 bias | -1% each | the epilogue is not worth specializing. The runtime ints are fine |
+| `s_waitcnt_depctr` tweak | neutral | depctr is not a knob |
+| `s_setprio` scope | compute-only strong regression. A-only/B-only broke correctness | the `s_setprio 1` belongs around the refill's global loads, and narrowing it is not safe |
+| decode rewrites | exp-only and spread-multiply fail the gate (not bit-exact, carry coupling). Packed-u8 -3%, ASM-u8 -16% | approximation slack is small and exact rewrites have not paid either. The perm + signfold pair-build stays |
+| lazy decode at `rm == 0` | no robust gain, profile worse | the B decode stays before the `rm` loop. Moving it later does not overlap better |
+| B layout alternatives: K0xNxK1, K-major global loads, `ds_load_2addr_b32`, uint32 B reads | dead end / -3.2% | the prepacked NxK vec16 store + uint4 read is the shape. K-major destroys coalescing, and the 2-address read fails 4-byte alignment on odd lanes |
+
+The body's shapes were each bought in that generation: the split A-then-B preload order +5.4%, compile-time staging specialization +1.7%, selective `s_setprio` +5.0%, A physical/inverse row mapping plus the then-current WSGR A-store +6.2% (the WSGR half was later removed by `T10`. The mapping remains), C-shuffle physical row mapping +1.0%, packed fp8 -> fp16 `fp8x4_to_half2x2` +2.1%, and register-tiled compute (B fragments once per stage) +1.8%, all at `N = 8192` on `(2,4,2,4,4)`. The TFLOPS is stale but those steps are load-bearing: they are not free refactors.
+
+The old claim that conversion VALU was free because it filled the d16 WAW stalls is superseded - the unpack is understood as a front-end/issue cost now - but its conclusion held. Direction A (six conversion-reduction variants) was all negative, and no decode rewrite since has paid.
+
 ## Verification
 
-- `tests/test_scaled_mm_hip.py`: forward against `scaled_mm_naive` for both fp8 flavours, both output dtypes and both activation dtypes. `M` in 1, 17, 128, 256, 512, 2048, 4096, 4111, 4112, 4304 and 5376. Every one of the 35 tiles (31 boxes, 4 of them also with `prefetch`) on a shape with an M, an N and a K tail (`67 x 272 x 304`). A check that every tile the heuristic can return is instantiated.
+- `tests/test_scaled_mm_hip.py`: forward against `scaled_mm_naive` for both fp8 flavours, both output dtypes and both activation dtypes. `M` in 1, 17, 128, 256, 512, 2048, 4096, 4111, 4112, 4304 and 5376. Every one of the 31 tiles (all no-prefetch) on a shape with an M, an N and a K tail (`67 x 272 x 304`). A check that every tile the heuristic can return is instantiated.
 - `tests/test_scaled_mm_hip_compile.py`: `torch.compile(fullgraph=True, dynamic=False)` and `dynamic=True` over an eager-equal check, non-square, with the allocation visible as `empty_strided_cuda` in the Inductor output.
 - `bench/cells.py`: the shared grid, 106 cells over 20 groups, consumed by every bench below.
-- `~/tmp/feather_ops/wan_e2e.py` / `wan_all_layers.py`: the ComfyUI parity checks above (one process per configuration, then per-layer comparison of the weight each Linear hands to the GEMM). `delegate_verify.py` checks that both layouts' `quantize`/`dequantize` agree byte-for-byte with `comfy.quant_ops`. `--groups` selects a subset by group name in all of them.
 - `python -m bench.benchmark_scaled_mm_hip`: the whole grid against `torch.mm`, `--tiles` to sweep tiles as providers (six integers per tile: `warps_m, warps_n, unroll_k, repeat_m, repeat_n, prefetch`), `--square` as the `8192^3` regression guard, `--json` for the per-round samples.
 - `python -m bench.benchmark_kernels --backends fp8,int8_fwd,int8_bwd,bf16`: every kernel on the same cell, one interleaved pass, `bf16` as the control. This is the command the cross-kernel section quotes.
 - `bench/protocol.py`: the benchmark protocol every benchmark in `bench/` uses (steady state, adaptive iteration count, interleaved providers, paired ratios, p20/p80 spread). It is not part of the installed package, and `bench/` and `tests/` do not import each other.
 - `~/tmp/feather_ops/fp8_shapes/sweep_short.py` + `cell_sweep_steady.csv`: the 139-cell tile sweep the heuristic was fitted on. `verify_fit.py` reports the per-cell loss. It times launches the same way `bench/protocol.py` does.
 - `~/tmp/feather_ops/dual/`: `compare_fp8_int8.py` (the 30-cell cross-kernel comparison), `dual_fit.py` + `fit_*.json` (the per-cell `prefetch` A/B over all 139 cells), `refit_sweep.py` + `refit_*.json` (the ten-tile sweep the selector was refitted on), `selector_ab.py` (the paired old-vs-new selector A/B), `fit_tree.py` / `score_rule.py` (offline rule fitting against the sweep), `tall_tiles.py` / `tall_fit.py` (the tall-tier retest), `probe_fp16_lds.py` / `fp16_route.py` (the fp16 LDS artifact), `lds_attrs.cpp` / `int8_attrs.cpp` (per-instantiation LDS/VGPR/scratch and the occupancy model), `isa_mix.py`, `lds_offsets.py`, `count_scratch.py`, `order_bias.py`.
-- `python tools/check_lds.py`: compiles the kernel to gfx1151 assembly with the shipped flags and checks every instantiation's `group_segment_fixed_size` against the LDS union its source asks for (560 instantiations, ~40 s, so it is not part of the test suite). It is what found the fp16 55296-byte allocation, and it prints "every allocation matches" on the shipped build.
+- `python tools/check_lds.py`: compiles the kernel to gfx1151 assembly with the shipped flags and checks every instantiation's `group_segment_fixed_size` against the LDS union its source asks for (496 instantiations, ~40 s, so it is not part of the test suite). It is what found the fp16 55296-byte allocation, and it prints "every allocation matches" on the shipped build.
 - `tools/hip_flags.py`: the device backend flags shared by `setup.py` and the audit tool, so the two cannot drift. Today it carries `-mllvm -disable-promote-alloca-to-lds` and the reason it is there.
-- kernel-only suites: 695 passed. `~/ComfyUI-FeatherOps` 18 passed.
+- kernel-only suites: 695 passed.
 
 ## Files And Artifacts
 
 - `~/feather-ops/csrc/hip_kernel.cu`: kernel, tail-free/masked instantiations, the `FEATHER_SCALED_MM_TILES` table, `scaled_mm` out= op.
-- `~/feather-ops/feather_ops/scaled_mm.py`: public entry point, `select_scaled_mm_config`, padded prepack helper.
+- `~/feather-ops/feather_ops/scaled_mm.py`: public entry point, `select_mm_fp8_config`, padded prepack helper.
 - `~/feather-ops/feather_ops/autotune.py`: unchanged, still used by `mm_fp16` and the Triton kernels. The scaled_mm path no longer imports it.
 - `~/feather-ops/tests/test_scaled_mm_hip.py`, `tests/test_scaled_mm_hip_compile.py`, `tests/test_tiles.py`.
 - `~/feather-ops/tools/`: `gen_tiles.py` (renders `csrc/feather_tiles.h` from `feather_ops/tiles.py`), `hip_flags.py` (the device backend flags), `check_lds.py` (the per-instantiation LDS audit).
 - `~/feather-ops/bench/protocol.py`: the shared benchmark protocol, including the rotating provider order.
 - `~/feather-ops/bench/cells.py` and `bench/benchmark_kernels.py`: the shape grid and the cross-kernel report.
-- `~/ComfyUI-FeatherOps/comfy_feather/ops.py` and `quant.py`: the cast removal, measured separately in that repo.
+- `~/feather-ops/profile/profile_scaled_mm_hip.py` (kernel target, `--config warps_m,warps_n,unroll_k,repeat_m,repeat_n,prefetch` pins the tile) and `profile_scaled_mm_torch.py` (control): the rocprofv3 targets.
 - `~/tmp/feather_ops/fp8_shapes/`: `cells.py`, `compat_audit.py` + `compat_audit.csv`, `bench_cells.py` + `cells_baseline.csv`, `dtype_probe.py`, `wmma_peak_f16.cu`.
 - `~/feather-ops/csrc/hip_kernel_int8.cu` and `int8_convrot_prepacked_fwd_bwd_plan.md`: the sibling kernel this one is measured against. Its occupancy model and prepack layout are the reference for the resource numbers here.
 - `~/tmp/feather_ops/mixed_precision_analysis/`: the P6/P19-P23 ablations, sweeps and PC-sampling plots referenced by the history table.
 - `~/rdna35-isa-markdown/`, `~/amd-llvm-project/llvm/docs/AMDGPUUsage.rst`: instruction and compiler reference.
+
+## ISA, Profiling, And ASM Notes
+
+Hardware and tooling facts that outlive the tile set. The decode and staging work is where they get used:
+- Issue model: LDS instructions never dual-issue (VOPD is VALU-only), so each LDS op costs a full issue cycle, while VALU can dual-issue. An LDS-heavy profile is issue-bound even when LDS bandwidth is idle.
+- Register budget: 1536 VGPRs per SIMD (192 KB at wave32), so 192 VGPRs per wave is 8 waves/SIMD. Occupancy is the minimum of the VGPR and LDS limits. `gfx1151_reference.md` has the model.
+- VOPD-eligible opcodes, for any scheduling or decode rewrite. X: `FMAC`, `FMAAK`, `FMAMK`, `MUL_F32`, `ADD_F32`, `SUB_F32`, `SUBREV_F32`, `MUL_DX9_ZERO_F32`, `MOV_B32`, `CNDMASK_B32`, `MAX_F32`, `MIN_F32`, `DOT2ACC_F32_F16`, `DOT2ACC_F32_BF16`. Y: those plus `ADD_NC_U32`, `LSHLREV_B32`, `AND_B32`. `V_PK_*` (`LSHLREV_B16`, `ADD_U16`, `MUL_F16`, `ADD_F16`, `FMA_F16`, `FMAC_F16`) are VOP3P and not eligible.
+- `ds_load_2addr_b32` reads 32 bits from `ADDR + OFF0*4` and `ADDR + OFF1*4` (offsets 0-255). It cannot fix B's odd-lane reads because the 4-byte alignment fails there.
+- `ds_load_u16` is reachable from inline ASM by passing the LDS offset as `static_cast<uint32_t>(reinterpret_cast<uintptr_t>(shared_ptr))`. Verified on gfx1151. The batched use of it for B still lost -2.3% (above), so it is a tool, not a direction.
+- No native fp8 conversion: e5m2 -> fp16 is a `v_perm_b32`, e5m2 -> bf16 and e4m3 -> fp16 need the extra ALU in `fp8x4_to_half2x2`. `cvt_pk_f16_fp8` is gfx1250-only.
+- PMC: rocprofv3 on gfx1151 takes at most 6 counters per run (more crashes). Two runs: `SQ_BUSY_CYCLES SQ_INSTS_LDS SQ_INSTS_TEX_LOAD SQ_INSTS_VALU SQ_WAVES SQ_WAVE_CYCLES`, then `SQ_INSTS_FLAT SQ_INSTS_SALU SQ_INSTS_SMEM SQ_INSTS_TEX_STORE SQ_INSTS_WAVE32_VALU SQ_WAVE32_INSTS`. Target: `python -u profile/profile_scaled_mm_hip.py --config <tile>`. Results land in the rocprofv3 output directory (`x2/<pid>_results.db` in the old sessions). Read them by joining `rocpd_pmc_event_<UUID>` to `rocpd_info_pmc_<UUID>`. Counters are supporting evidence, not the decision.
+- ASM: `hipcc -save-temps ... -c csrc/hip_kernel.cu` leaves `hip_kernel-hip-amdgcn-amd-amdhsa-gfx1151.s` with every instantiation. Match a tile by the mangled literals (`Li1ELi8ELi4ELi8ELi2E` plus five `Lb..E` flags) rather than by line numbers. `tools/check_lds.py` is the faster per-instantiation source for LDS bytes.
+
+## ComfyUI Integration
+
+The wrapper and loaders live in `~/ComfyUI-FeatherOps`. The wrapper is two `comfy.quant_ops` layout classes whose `quantize`/`dequantize` are ComfyUI's own (`TensorCoreFP8E5M2Layout`/`TensorWiseINT8Layout`), so the prepack is the only thing this repo adds to either format.
+
+### Patches, state_dict, and force_forward
+
+Three rules keep a Feather-loaded model numerically the same as one loaded natively:
+- Patches follow ComfyUI. `cast_bias_weight` applies LoRA/LyCORIS/DoRA/weight diffs. The merged weight is repacked only where ComfyUI would run the quantized GEMM itself (`quant.requantize_after_patch`). For a weight-only format that is always, which is why a patched int8 weight is byte-identical to the native path. For fp8 it is `model_management.supports_fp8_compute(device)`: where fp8 is emulated (gfx1151) ComfyUI multiplies by the merged float weight, and we follow, because rounding a merged weight back into e5m2 dithers 36x the LoRA delta of a rank-64 LoRA (`blocks.0.self_attn.q` of the Wan 2.2 A14B fp8 model: delta 0.1% of the weight, e5m2 step ~3.6%). Where fp8 GEMM exists, both requantize and the kernel stays on patched layers.
+- A packed `state_dict()` states the weight's own `(N, K)`, not the storage shape. The bytes stay in the kernel's order (the `comfy_quant` marker says so, and the loader adopts them without permuting), but the shape is read by other code: `comfy.lora.model_lora_keys_unet` splits a fused qkv LoRA by `state_dict()[k].shape[0] // 3` (MOSS-Image, Flux 3) and the safetensors header is built from it. Exposing `(K/4, N/4, 4, 4)` there gave a third of the qkv rows to the LoRA, which then failed its reshape inside `comfy.lora.calculate_weight` and silently skipped the patch - the effects measured below went from 1.03 to 1.14 of native's 1.16 once fixed. A padded fp8 pack (`K_pad > K`) cannot state `(N, K)`. Its marker carries the logical shape and the entry keeps the storage shape, and a marker that records a shape without the `packed` flag is rejected rather than guessed.
+- `comfy_force_forward = True` on the Linear. `comfy.ops.linear_input_act`/`linear()` fold an activation into a generic GEMM by taking over the weight cast, which both bypasses the layout's routing and (Wan's FFN down-projection is written that way) requantized a patched fp8 weight where the native `MixedPrecisionOps.Linear`, marked `full_precision_matrix_mult` on this device, did not. Declaring the module's own forward as the entry point makes ComfyUI apply the activation eagerly and then use the layout's kernel.
+
+### Shape workarounds before the tails
+
+Before the kernel tails, the integration paid to avoid the ragged-`M` error: `comfy_feather/ops.py` padded `M` up to a multiple of 16/32/64/128 (128 above 256 rows) before the call and sliced the output afterwards. So the production cost of a ragged M was a full activation copy plus the wasted MMA rows, not a fallback: on `4112 x 24576 x 4096` the pad is 34 MB read plus 35 MB written, ~0.33 ms against a ~2.1 ms GEMM, and 112 of 4224 rows are dead MMA (2.7%). The kernel tails made the pad unnecessary, and the padding block is gone from the wrapper.
+
+The activation cast was the other integration-side cost: ComfyUI's fp8 path (`comfy_feather/ops.py`) cast `x` to fp16 and the result back to `dtype_orig` on every call, because the kernel only accepted fp16 A. On `4112 x 24576 x 4096` that was 67 MB of extra read+write for the activation cast, ~0.3 ms against a ~2.1 ms GEMM, on top of the M-padding copy above. The cast is gone. `comfy_feather/ops.py` no longer casts `x` to fp16, so a bf16 model hands its activations straight to the kernel.
+
+### Prepack orientation
+
+The two prepack helpers take opposite orientations: `feather_ops.scaled_mm.prepack_b_for_scaled_mm` takes the GEMM's B (`[K, N]`), `comfy_feather.quant.prepack_transpose` takes the weight (`[N, K]`). Nothing was wrong with either, but with no docstring and a square-only bench the difference was invisible, and a non-square run of the bench fed the helper the wrong way round. Both have docstrings now and every non-square test exercises one of them.
+
+### Parity results
+
+Result on Wan 2.2 A14B fp8e5m2 (512^2, 4 steps, cfg 1, the 4-step distill LoRA): feather vs native rel 0.0021 without LoRA and 0.0099 with it, against 1.32 for the LoRA's own effect, i.e. the loader difference is at the sampling noise of the arithmetic, not a different model. The int8 Anima model is unchanged (0.109 latent, 1.056 vs 1.062 LoRA effect, the fp8-vs-native int8 kernel difference it had before) and its per-layer requantization is byte-identical to native's.
+
+### Verification and files
+
+- `~/tmp/feather_ops/wan_e2e.py` / `wan_all_layers.py`: the ComfyUI parity checks above (one process per configuration, then per-layer comparison of the weight each Linear hands to the GEMM). `delegate_verify.py` checks that both layouts' `quantize`/`dequantize` agree byte-for-byte with `comfy.quant_ops`. `--groups` selects a subset by group name in all of them.
+- `~/ComfyUI-FeatherOps`: 18 tests pass.
+- `~/ComfyUI-FeatherOps/comfy_feather/ops.py` and `quant.py`: the layout classes, the cast removal, and the prepack/state-dict rules above.

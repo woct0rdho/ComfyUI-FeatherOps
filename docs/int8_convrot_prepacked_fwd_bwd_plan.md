@@ -52,7 +52,7 @@ One templated kernel, two instantiations (`kTransposedB` = forward / backward), 
 - Epilogue: the fp8 kernel's C-shuffle (accumulator -> LDS in the gfx11 interleaved row order -> row-major 16 B global stores), with the scale in float and an RNE bf16 conversion. Partial M/N tiles are masked on the store only. Staging clamps indices so no read is out of range.
 - Pipelining: two LDS buffers plus one register image of the chunk being fetched (`int4`/`uint4` per thread, ~12 VGPRs). The next chunk's global reads issue before this chunk's WMMAs and land in the other buffer, so there is one barrier per chunk instead of two, and only the buffer that nothing has read since the previous barrier is written. `s_setprio 1` covers the read region. Deeper staging was not needed: gfx1151 has no `global_load_lds`, so a third stage would cost VGPRs and LDS without removing the barrier that is left. The two halves of this design have since been priced separately on the fp8 sibling (+7.7-23% from the overlap, -28% from the second buffer where LDS binds), so a single-buffer + register prefetch form is an open item below. Here the second buffer buys one barrier per chunk at 12-16 KB of the workgroups' LDS budget, and it is only free where VGPRs cap occupancy.
 - Grid: output-dim-major (`blockIdx.x` = output tile) so all output tiles of one M tile run together and the A panel stays in L2.
-- Dispatch: the schedule comes in as five integers from `select_int8_config`. The kernel's only shape decision is the tail split, which is a property of `M` and the tile rather than tuned data.
+- Dispatch: the schedule comes in as five integers from `select_mm_int8_config`. The kernel's only shape decision is the tail split, which is a property of `M` and the tile rather than tuned data.
 
 ## Schedule table
 
@@ -182,7 +182,7 @@ Two calls per quantized Linear, one per direction, and no other int8-specific ke
 
 ## Results
 
-Kernel-only, `bench/benchmark_int8_convrot.py --heuristic` over the shared grid in `bench/cells.py` (110 cells, both directions): the schedule `select_int8_config` picks, three rounds, medians of per-round medians. Absolute TFLOPS drifts ~3% between sessions with the clock state, so compare the pairs inside a row. bf16 is the same session's `torch.matmul` on the same shapes, and the CK column is that document's shipped heuristic from a different session.
+Kernel-only, `bench/benchmark_int8_convrot.py` over the shared grid in `bench/cells.py` (110 cells, both directions): the schedule `select_mm_int8_config` picks, three rounds, medians of per-round medians. Absolute TFLOPS drifts ~3% between sessions with the clock state, so compare the pairs inside a row. bf16 is the same session's `torch.matmul` on the same shapes, and the CK column is that document's shipped heuristic from a different session.
 
 Forward and backward, shipped schedules:
 
@@ -371,7 +371,9 @@ The measured prerequisite: on the narrow `1536x6144` cell the old forward-only k
 
 A chunk-grouped weight layout (`(K/128, N, 128)`) would lengthen the forward's B runs but make the backward's contraction stride 128 bytes, i.e. 16 scattered byte loads per fragment - a second copy or a large regression. A layer's forward and gradient flops are equal, so a layout that buys the forward `+x%` and costs the gradient `-y%` only pays if `x > y`, and here `y` is structural. Decision: keep the direction-symmetric micro-tile. The tiled A is A-only. That removes any load-time weight-layout decision.
 
-The A layout itself is selected per call: the producer always runs immediately before its GEMM, and the GEMM id comes from `select_int8_config(M, N, K, transposed_b)` with the runtime M, so `tiled` is a property of the selected id and row-major is emitted below the threshold (the forward-only plan used `M >= 4096`). A per-`(weight, direction)` hint can cache the decision at load time from `(N, K)`: the fwd cell is `(M, N, K)` and the gradient cell is `(M, K, N)`, the model's M class comes from the table above (Krea 2 256-aligned 1280-9728, H3 ragged 2k-25k, text encoders 5-4096), and the default is tiled for the classes that trail CK. Implementation stages: (1) extend the cell matrix and keep the bit-identity harness, (2) add `unroll_k = 8` staging variants for 256x256 (A 32 KB + B 32 KB single-buffered = 64 KB, still 2 workgroups/WGP because VGPR caps it) and 128x256 (48 KB), with the tiled addressing as a template parameter and the `tiled <=> chunk_k == 128` guard, (3) producer output layout `q[m_tile][k_tile=128][128][128]` (all group-256 axes in the tables are multiples of 256 and Krea 2 pads M to 256. The tail store still masks M for H3 and the text encoders), (4) measure per cell and both directions, keep the id only where the fwd+dgrad sum improves beyond the +-3% session spread.
+The A layout itself is selected per call: the producer always runs immediately before its GEMM, and the GEMM id comes from `select_mm_int8_config(M, N, K, transposed_b)` with the runtime M, so `tiled` is a property of the selected id and row-major is emitted below the threshold (the forward-only plan used `M >= 4096`). A per-`(weight, direction)` hint can cache the decision at load time from `(N, K)`: the fwd cell is `(M, N, K)` and the gradient cell is `(M, K, N)`, the model's M class comes from the table above (Krea 2 256-aligned 1280-9728, H3 ragged 2k-25k, text encoders 5-4096), and the default is tiled for the classes that trail CK.
+
+Implementation stages: (1) extend the cell matrix and keep the bit-identity harness, (2) add `unroll_k = 8` staging variants for 256x256 (A 32 KB + B 32 KB single-buffered = 64 KB, still 2 workgroups/WGP because VGPR caps it) and 128x256 (48 KB), with the tiled addressing as a template parameter and the `tiled <=> chunk_k == 128` guard, (3) producer output layout `q[m_tile][k_tile=128][128][128]` (all group-256 axes in the tables are multiples of 256 and Krea 2 pads M to 256. The tail store still masks M for H3 and the text encoders), (4) measure per cell and both directions, keep the id only where the fwd+dgrad sum improves beyond the +-3% session spread.
 
 ### Small-M cells: split-K, stream-K, or a schedule rule?
 
@@ -413,7 +415,7 @@ What the cells actually lose to. Sweeping all 16 configs per cell (`--parts 2,4`
 
 Verdict. No split-K and no stream-K. The mechanism only pays where the grid is starved and the cell is large enough to absorb a fixup pass, and there is no such cell in a training step: the whole small-M class is 6 ms per Anima step (0.27%, the cross-attn kv forward plus its input gradient) and the text encoder's 512-row cells are 1-2% of a step only when the TE itself is trained. torch-ggml-ops reached the same conclusion on packed quantized GEMMs from the other side: their split-contraction body needed exact-shape instantiations to reach parity at one slice and then won 1.92x at M=64, 1.28x at M=128, 1.20x at M=256 and 1.06x at M=512, and they screened stream-K out over 100 deployed keys because any contraction of 2048 rows or more already yields 64+ slices. Below M=256 a 64x64 tile recovers most of it for free.
 
-Done (the tile rules). `select_int8_config` now carries the small-M tier and the bounded exception:
+Done (the tile rules). `select_mm_int8_config` now carries the small-M tier and the bounded exception:
 
 | condition | schedule |
 |---|---|

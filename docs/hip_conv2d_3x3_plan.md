@@ -15,7 +15,7 @@ def prepack_conv2d_weight_3x3(weight: Tensor) -> Tensor:
     """[C_out, C_in, 3, 3] -> [ceil(C_in/16) * 18, C_out, 8] in the kernel's k order."""
 
 
-def conv3x3_prepacked(x: Tensor, w_packed: Tensor, bias: Tensor | None = None, block_m: int | None = None, block_n: int | None = None, rows: int | None = None) -> Tensor:
+def conv3x3_prepacked(x: Tensor, w_packed: Tensor, bias: Tensor | None = None) -> Tensor:
     """3x3, stride 1, padding 1 over a prepacked weight. No fall back, no extra checking."""
 
 

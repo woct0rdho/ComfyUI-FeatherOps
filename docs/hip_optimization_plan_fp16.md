@@ -2,57 +2,90 @@
 
 ## Scope and Metric
 
-- Current gap-closing branch focuses on the single fixed problem size `M=N=K=8192`.
-- Current baseline prepack contract:
-  - B is pre-transposed into identity-order `(K/8, N, 8)` layout, preserving vec8 / 128-bit chunks.
-  - The C++ kernel consumes this prepacked storage to perform direct loads into LDS without additional transposition.
-- Better input layouts are allowed for this branch if they are needed to match the hipBLASLt kernel family more closely.
-  - Treat layout as part of the kernel design space.
-  - Keep prepack out of the timed region when comparing kernel performance.
-- Accuracy gate: `relative L2 <= 0.01`, `max abs <= 1.0`.
-- Primary performance metric for gap-closing: native C++ fixed-config benchmark (`~/feather-ops/cpp_benchmarks/build/benchmark_mm_hip_fp16`).
-- Secondary integration metric: `~/feather-ops/bench/benchmark_mm_hip_fp16.py` TFLOPS.
-  - C++ and Python results are not directly comparable because Python/Torch overhead is different.
-  - Only compare absolute TFLOPS within the same harness.
-- Keep rule:
-  - correctness passes,
-  - native C++ `8192^3` fixed-config performance improves,
-  - no obvious codegen dead-end is introduced (`vgpr` spills, pathological LDS growth, unstable timing outliers).
-  - Python/autotune regression checks are deferred until the single-config gap is materially reduced.
+- Pure-FP16 forward `mm_fp16` (`csrc/hip_kernel_fp16.cu`, `feather_ops/mm_fp16.py`): fp16 A, fp16 prepacked B, fp16 C, optional fp16 bias. A is the usual row-major `[M, K]`. B is prepacked once. No backward, no bf16.
+- Prepack contract: `[K, N]` fp16 -> `[K_pad/8, N, 8]`, with `K_pad = ceil(K/128)*128`. The padded rows are zero, which is what lets the kernel run a ragged K without a staging branch.
+- Accuracy gate: relative L2 <= 1e-2 and max abs <= 1.0 against the fp32 naive reference.
+- Metric: kernel-only milliseconds on the shared grid in `bench/cells.py`, converted to `2*M*N*K/t` TFLOPS.  Prepack and output allocation are outside the timed region. Report fp16 beside the fp8 control.
+- fp8 control: the best compatible tile from `SCALED_MM_TILES` on the same cell, so the comparison measures kernel quality rather than a stale heuristic. The shipped fp8 heuristic is also reported where it differs.
+- Keep rule: correctness passes and paired TFLOPS improve or hold on the grid. There is no fixed promotion threshold. A change is kept on repeated paired evidence and its cell-to-cell profile.
+- The production path in this repo is `scaled_mm` (fp8e5m2 weight, fp16/bf16 activations), not `mm_fp16`.  The FP16 family is the pure-FP16 baseline and the reference for the quantization comparison.
 
-## Current Baseline
+## Current Status
 
-- Primary gap-closing baseline, native C++ fixed-config:
-  - our current HIP kernel, forced `(1,8,2,8,2)`: `28.7 TFLOPS`
-  - hipBLASLt native benchmark, `solution_index 1112`: `37.6 TFLOPS`
-  - current gap: `8.9 TFLOPS` (`31%`)
-- Latest full benchmark (`python ~/feather-ops/bench/benchmark_mm_hip_fp16.py`):
-  - `N=2048`: 15.7 TFLOPS
-  - `N=4096`: 34.3 TFLOPS
-  - `N=8192`: 27.9 TFLOPS
-- Current autotuned winner:
-  - `N=2048`: `(4,2,2,2,4)`
-  - `N=4096`: `(1,8,2,8,2)`
-  - `N=8192`: `(1,8,2,8,2)`
-- Autotune is out of scope for the current branch.
-- Current reference hipBLASLt kernel at `8192^3` maps to:
-  - `warps_m=4`
-  - `warps_n=1`
-  - `unroll_k=4`
-  - `repeat_m=2`
-  - `repeat_n=6`
-  - equivalent tile: `128x96x64`
-- Current B path keeps 128-bit transport via identity-order prepack `(K/8, N, 8)` plus identity B LDS loads.
+- The fp16 kernel now owns the full shape contract: M >= 1, N % 16 == 0, K % 16 == 0, zero-padded prepack, and a tail-free fast path when the extents divide the tile. The old kernel required M % block_m == 0 and could not run most of the grid.
+- The runtime autotuner is gone. `feather_ops/tiles.py::MM_FP16_TILES` is a static 15-tile table, the heuristic picks one of them, and the public wrapper allocates the output outside the custom-op boundary.
+- Native C++/direct-op `8192^3`, tile `(2,8,2,8,2)` (256x256): `~35-37 TFLOPS`, up from `28.8` for the old `(1,8,2,8,2)` kernel. The fp8 best-of-tiles control is `39.9`. fp8/fp16 = `1.15`.
+- Representative paired results (prepack and output excluded, medians, one session. Session drift is ±3%, so read them as representative, not as a leaderboard):
+
+| shape | fp16 TFLOPS | fp16 tile | fp8 best TFLOPS | fp8/fp16 |
+|---|---:|---|---:|---:|
+| `2048^3` | 39.1 | `(2,4,2,4,2)` 128x128 | 37.8 | 0.97 |
+| `4096^3` | 35.3 | `(2,4,2,4,2)` 128x128 | 35.8 | 1.01 |
+| `8192^3` | 34.8 | `(2,8,2,8,2)` 256x256 | 39.9 | 1.15 |
+| `512x5120x5120` | 32.9 | `(2,4,2,4,2)` 128x128 | 39.8 | 1.21 |
+| `512x13824x5120` | 34.4 | `(2,8,2,8,2)` 256x256 | 39.1 | 1.14 |
+| `256x2560x2560` | 28.5 | `(2,4,2,4,2)` 128x128 | 31.7 | 1.11 |
+| `128x1024x5120` | 13.1 | `(1,1,2,1,1)` 16x16 | 11.4 | 0.87 |
+| `16x3072x3072` | 6.7 | `(1,1,2,1,1)` 16x16 | 4.4 | 0.66 |
+| `512x248320x4096` | 36.0 | `(2,8,2,8,2)` 256x256 | 39.9 | 1.11 |
+| `4096x4608x4608` | 38.1 | `(2,8,2,8,2)` 256x256 | 39.5 | 1.04 |
+| `12032x5120x5120` | 34.8 | `(2,8,2,8,2)` 256x256 | 42.6 | 1.22 |
+| `25344x21504x5376` | 39.6 | `(2,8,2,8,2)` 256x256 | 40.2 | 1.02 |
+| `1024x1280x1280` | 34.5 | `(2,4,2,4,2)` 128x128 | 34.4 | 1.00 |
+| `2304x1280x1280` | 34.2 | `(2,4,2,4,2)` 128x128 | 36.0 | 1.05 |
+| `4096x4096x12288` | 33.8 | `(1,8,2,8,2)` 128x256 | 32.8 | 0.97 |
+| `4112x6144x6144` | 26.4 | `(1,8,2,8,2)` 128x256 | 36.1 | 1.37 |
+
+- fp16 now wins or ties the compute-bound cells (`2048^3`, `4096^3`, `1024x1280`, `2304x1280`, `4096x4096x12288`) and the small-M cells (`16x3072`, `128x1024`). fp8 keeps a 1.1-1.4x advantage where the weight footprint or the 2-byte LDS payload binds: `8192^3`, `512x5120`, `12032x5120`, `248320x4096`, and the ragged `4112x6144` cell.
+- The shipped fp8 heuristic was also repaired: the `prefetch=1` rows on 16x64/32x64/64x128 measured 30-50% slower than `prefetch=0` on every tested cell, so the heuristic now uses the no-prefetch form and the four bad rows were removed from `SCALED_MM_TILES`.
+- `1x96768x2688` remains the outlier: 0.24 fp16 vs 0.44 fp8 TFLOPS. The weight is a single 260 MB pass and a 16-row WMMA tile wastes 16x the compute. Both are DRAM-bound. A dedicated GEMV/dot-product path is the only way to close it, and it is not worth it for one cell.
+- The production `scaled_mm` path still measures `45.5-45.9 TFLOPS` at `8192^3`, so the pure-fp16 kernel is not the throughput path. CK is still absent. The current hipBLASLt is slower than this fp16 kernel in the current session.
+
+## Implemented Plan
+
+### Tails and shape contract
+
+- M is masked, N is clamped/masked at 16-column granularity, K is zero-padded in the prepack. A staging clamps out-of-range rows/K to in-bounds memory. The epilogue drops the dead rows/columns.
+- `kTailFree` is selected by `M % block_m == 0 && N % block_n == 0 && K % chunk_k == 0`. The masked path is never entered for the common divisible shapes.
+- `prepack_b_for_mm_fp16` pads `K` to 128 and the C++ op checks `K_pad/8`. The Python wrapper raises on a stale prepack shape.
+
+### Static tiles and heuristic
+
+`MM_FP16_TILES` keeps the union of the winning families from the 106-cell sweep:
+- `16x16`, `32x16`, `32x64`, `32x128` for small M. `64x64` for narrow N with a short K.
+- `128x64` for M <= 128 and wide N. `128x128` as the general default.
+- `128x192`/`128x256` for long-K / odd-N. `256x128` and `256x256` for wide N and weight-bound cells.
+- `16x256` is the M <= 16 wide-N tile. `32x16`, `256x128 u2`, `64x128 u4`, and the 8-warp `128x128` are retained as sweep alternatives.
+
+`select_mm_fp16_config` is the range heuristic in `feather_ops/mm_fp16.py`, fitted on the shared grid. It is deliberately small: tiny M uses 16x16, 16x256 at M<=16 with N>=16384, and 32x128 at M=32 with wide N. M <= 128 uses 128x64 for wide N. M <= 256 uses 256x128 u4 for wide N. M <= 512 uses 64x64 for narrow N with a short K, 128x128 as the general default, and 256x256 for N >= 12288. Above 512 the default is 128x128, with the long-K and wide-N exceptions. It returns 11 of the 15 instantiated tiles. The other four stay for sweeps and future shape classes.
+
+### Pipeline experiments
+
+- Kept: the existing B-only register prefetch on the tiles whose heuristic enables it.
+- A double-buffering: tested and rejected. A second LDS A buffer, selected when the occupancy model said it was free, regressed `128x8192` 24.3 -> 16.3 TFLOPS, `512x5120` 34.3 -> 30.7, `2048^3` 40.1 -> 35.7, `512x13824` 35.9 -> 33.2, and `25344x21504` 41.0 -> 37.6, while helping only a few cells. The LDS model was not sufficient: the extra A stores contend with the LDS reads and change the compiler schedule.
+- 2D block grouping: only the weight-stream exception survives. `group_m x group_n` was swept on the measured cells. The default 1x1 (N-fastest) is best almost everywhere. Grouping generally loses the A-panel locality. The exception is a small-M cell with `weight_bytes >= 512 MiB`, where `group_m=8, group_n=1` improved `512x248320x4096` from ~34.6 to ~37-39 in paired runs. Applying it to a large-M weight-stream cell (`25344x21504x5376`) regressed, so the policy is gated on `M <= 512`. The kernel keeps the general 2D mapping with that one policy.
+- 512-row tiles: tested, never selected. `512x128`, `512x64`, `512x256` were swept. None won a cell. They were removed from the final tile table.
+
+### API, autotune, and repo cleanup
+
+- `mm_fp16_hip(a, b_prepacked, bias=None)` allocates outside the op and calls `torch.ops.feather_ops.mm_fp16`. `_mm_fp16_auto` is the opaque mutating op that applies the heuristic, so `torch.compile` sees one graph. Tests, benchmarks, and profilers pin a tile by calling `torch.ops.feather_ops.mm_fp16.default` with their own output buffer.
+- Removed `feather_ops/autotune.py`, `_CONFIGS`, `_configured_op`, `_autotuned_op`, `register_custom_op_autotuning`, `old_autotune`, and the bf16/out-dtype branches from the fp16 path.
+- `feather_ops/tiles.py` now owns `MM_FP16_TILES`. `tools/gen_tiles.py` emits `FEATHER_MM_FP16_TILES`. The kernel dispatch is generated from it. `tests/test_tiles.py` checks the header.
+- `tests/test_mm_hip_fp16.py` covers the heuristic and every tile on a tail shape with a preallocated low-level output buffer.  `tests/test_mm_hip_fp16_compile.py` covers `torch.compile` eager parity.
+- `bench/benchmark_mm_hip_fp16.py` uses the shared grid, preallocates output, excludes prepack, reports TFLOPS for fp16 and fp8, and supports `--tiles`/`--fp8-tiles`.
+- The C++ benchmark pads B to 128 so ragged K can be measured. Prepack remains outside timing.
 
 ## Hardware Profiling Insights
 
+The P1-P6 sections below are the earlier `(1,8,2,8,2)` campaign. They are kept because the relative deltas and the heuristics carried forward. The current kernel and its results are above. Absolute TFLOPS are session-specific, and the autotune references in P1-P6 are historical: the current `mm_fp16.py` has no autotuner.
+
 ### The FP16 vs FP8 Gap
 
-We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieves 44 TFLOPS. The primary difference between our optimized FP8 kernel and this baseline FP16 kernel is the memory footprint and LDS layout:
+We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieves 45.5-45.9 TFLOPS in the native C++ harness. The primary difference between our optimized FP8 kernel and this baseline FP16 kernel is the memory footprint and LDS layout:
 - LDS Footprint: FP16 data is 2 bytes per element, whereas FP8 is 1 byte. To load an equivalent `128x256` chunk, the FP16 kernel requires exactly twice as much LDS memory (`32 KB` vs `16 KB`).
 - VGPR Footprint: Loading and holding FP16 data requires twice as many vector registers (`uint4` loads 8 `fp16` elements instead of 16 `fp8` elements).
 - LDS Banking: The old swizzled-B baseline had a substantial LDS bank-conflict rate (`14.8%`), but the current identity-order B path reduces that to `0.0%` without increasing LDS usage.
-- Latency Hiding Limitation: Because FP16 uses double the LDS memory, large block sizes like `(1, 8, 4, 8, 2)` (which corresponds to `128x256`) use nearly 32KB of LDS per wave group. This drastically lowers the hardware occupancy compared to FP8. Reduced occupancy means the macro-level scheduler cannot easily hide the `vmcnt` (global memory) stall latency, leading to a performance drop-off at large matrix sizes (e.g. 27.4 TFLOPS at N=8192).
+- Latency Hiding Limitation: Because FP16 uses double the LDS memory, the old `(1,8,2,8,2)` tile used 24 KB of LDS and the `u=4` variant `(1,8,4,8,2)` nearly 32 KB per workgroup. This drastically lowers the hardware occupancy compared to FP8. Reduced occupancy means the macro-level scheduler cannot easily hide the `vmcnt` (global memory) stall latency, leading to a performance drop-off at large matrix sizes (the current 256x256 tile reaches 35.7 TFLOPS at N=8192. The old 128x256 tile reached 28.8).
 
 ### P1: Identity-Order B Prepack/Load - KEEP
 
@@ -292,93 +325,45 @@ We have established a highly optimized FP8 kernel (`scaled_mm_hip`) that achieve
   - square `128x128` / `u=2` tiles are consistently WSGR-positive.
   - tall `128x128` / `repeat_m=2` tiles are WSGR-positive, but the `u=4` family needs `M >= 512`.
   - most N-heavy `repeat_m=4` families stay negative or too mixed to justify enabling by default.
-- The hipBLASLt `8192^3` winner is not a minor variant of our current winner:
-  - it is a different kernel family: `128x96x64` with `(4,1,4,2,6)`,
-  - it uses `128` threads, `256 VGPR`, and `30336 B` LDS,
-  - it is a single-LDS-buffer software-pipelined kernel,
-  - it does not use direct-to-LDS or direct-to-VGPR.
-- Existing `u=4` configs already present in our current search space are much slower at `8192^3`, so the gap is not just an autotune miss inside the current family.
-- The remaining gap should be treated as a kernel-family / schedule / layout gap.
-- If source-level comparison becomes ambiguous, assembly inspection is explicitly in scope.
-  - Because ROCm is open source, every optimization used by the hipBLASLt kernel should be reproducible in principle.
-  - Do not stop at "compiler magic" unless the asm proves the effect cannot be expressed cleanly in our source path.
+- The hipBLASLt `8192^3` winner is a different kernel family: `128x96x64` with `(4,1,4,2,6)`, 128 threads, 256 VGPR, `30336 B` LDS, a single-LDS-buffer software pipeline, and no direct-to-LDS/VGPR. See Native Library References.
+- Cloning that family was not needed: the current `(1,8,2,8,2)` kernel is faster in the current session, and `(4,1,4,2,6)` was never added to the search space. The hipBLASLt resource facts are kept below as a reference for reading a tuned library kernel, not as a target.
+- If a future library kernel is faster, compare its schedule and assembly rather than assuming compiler magic. ROCm is open source. Every optimization it uses should be reproducible in principle.
 
-## Non-Negotiable Run Protocol
+## Closed Directions
 
-- Never run two benchmark/profile jobs at the same time. Before benchmark/profile, use `ps` to check for any running job.
-- Per-step order:
-  - `python -m pytest ~/feather-ops/tests/test_mm_hip_fp16.py -q`
-  - for the current `8192^3` gap-closing branch, use `~/feather-ops/cpp_benchmarks/build/benchmark_mm_hip_fp16` as the primary performance check with a single forced config
-  - only after a promising C++ win, optionally run `python ~/feather-ops/bench/benchmark_mm_hip_fp16.py` as a secondary integration check
-  - never compare absolute TFLOPS between C++ and Python
-  - If it regresses, explain the reason by inspecting the generated code and/or profiling.
-- Revert failed steps via scoped `git diff` rollback. Skip test/benchmark/profile after revert.
-- If a new baseline is kept, commit the kernel immediately.
-- After every experiment, update this file with findings, keep/reject, regression reason, next steps.
-- Do not repeat experiments already completed in this file unless there is a clearly new precondition.
-- If source-level comparison is not sufficient, inspect the generated asm / disassembly of both our kernel and the hipBLASLt kernel before making another blind source-level change.
-- Continue autonomously to the next experiment. Do not stop and wait for the user's confirmation, unless blocked by unrecoverable error or the user explicitly interrupted.
+The gap-closing campaign against hipBLASLt is closed: the current kernel is faster than the available CK/hipBLASLt references, and the production path is `scaled_mm`. Do not restart these without a new, faster library reference:
+- G1, clone the `128x96x64` `(4,1,4,2,6)` hipBLASLt family: not pursued. The current `(1,8,2,8,2)` with B-prefetch is faster, and the family differs in K depth, N width, wave count and VGPR budget (reference below).
+- G2, a true single-LDS-buffer pipeline: the kept overlap is the B-only full-chunk prefetch (P3/P5/P6), still inside the original two-barrier structure. The remaining A-side refill is the main known exposed cost (P2 measured B-side 34% and A-side 13.5% before the B prefetch), but with the current references beaten there is no active target for it.
+- G3, asm diff against hipBLASLt: keep as a method only if a future library kernel wins. The source-level comparison was enough to show that the two kernels are different families.
+- G4, a new layout branch: identity-order B prepack `(K/8, N, 8)` is the kept layout. No layout work is pending.
+- G5, reconnect Python/autotune: done. The fp16 autotuner is removed. The static heuristic and the native out= path are what ship. The Python/C++ split remains useful for isolating wrapper overhead.
 
-## Next Experiments
+## Native Library References
 
-### G1: Clone The hipBLASLt Kernel Family For `8192^3`
+Kept from the three predecessor reference files because the schedules and failure modes are still useful when reading a library kernel or reviving a comparison. They are not performance targets: the current kernel is faster. Numbers are historical unless marked current.
 
-- Target config: start with a single forced config matching the hipBLASLt winner as closely as possible:
-  - `(warps_m, warps_n, unroll_k, repeat_m, repeat_n) = (4,1,4,2,6)`
-- Rationale: the current gap is against a different kernel family, not just against a better version of `(1,8,2,8,2)`.
-- Method:
-  - add a dedicated long-K kernel path for this one config,
-  - ignore autotune and small/medium-N crossover logic for now,
-  - allow a kernel-specific fast layout if the current identity-order B prepack is not a good fit.
-- Decision: keep only if fixed-config C++ `8192^3` materially improves over 28.7 TFLOPS without spills or pathological timing instability.
+### CK
 
-### G2: Rebuild The Main Loop As A True Single-Buffer Software Pipeline
+- Old wrapper flow: `fp8_to_half_kernel` upcast the whole B from fp8e4m3fn to fp16 in global memory, then `gemm_impl_wmma_noswap` instantiated `DeviceGemmWmma_CShuffle`, then an optional `scale_bias_kernel`. CK received fp16 B. The fp8 decode was not fused.
+- Instance: `128x256x64`, 256 threads, `MPerWmma/NPerWmma=16`, `MRepeat/NRepeat=4`. A used vectorized global reads (`SrcScalarPerVector=8`), vectorized LDS writes (`DstScalarPerVector=8`) and `M+1` LDS padding. B used `SrcScalarPerVector=1` on the global read (not vectorized), vec8 LDS writes, and extra N padding. The epilogue was C-shuffle.
+- The wrapper (`kernel/ck`) is no longer in this tree and the current kernel is faster. The durable lesson is the A-path bundle: vectorized read, vectorized LDS write and `M+1` padding were designed together. Matching only one of them is usually not enough. CK's non-vectorized B global read is the opposite trade.
+- If CK is ever revived, the entry points are `DeviceGemmWmma_CShuffle` / `GridwiseGemm_Wmma` in `~/rocm-libraries/projects/composablekernel/`.
 
-- Rationale: the hipBLASLt winner uses a single-LDS-buffer pipelined schedule, while our current winner still exposes chunk-boundary refill and synchronization.
-- Target behavior:
-  - overlap next-chunk global reads and local writes with current-chunk WMMA,
-  - reduce exposed chunk-boundary synchronization,
-  - do not assume the current two-barrier structure must be preserved once the kernel family changes.
-- Method:
-  - first try to express the schedule at source level,
-  - if the compiler does not realize the intended schedule, use asm-guided source changes or inline asm where justified,
-  - avoid full AB ping-pong LDS buffering unless the new family proves it can afford the LDS cost.
-- Decision: keep only if the generated code stays spill-free and C++ `8192^3` improves materially.
+### hipBLASLt
 
-### G3: Inspect And Diff The hipBLASLt Assembly
+- Identify the selected kernel from the log, not the integer index: `HIPBLASLT_LOG_MASK=96 ~/feather-ops/cpp_benchmarks/build/benchmark_mm_hipblaslt_fp16 --warmup 0 --iters 1 --workspace-mb 64`, then match `Cijk_Ailk_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x96x64_MI16x16x1_...`. The old public index `1112` mapped to Tensile `SolutionIndex: 71`. Both are version-dependent. Tensile logic: `~/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx1151/GridBased/gfx1151_Cijk_Ailk_Bljk_HHS_BH_Bias_HAS_SAV_UserArgs.yaml`.
+- The 128x96x64 family: MacroTile `128x96`, DepthU `64`, `MatrixInstruction=[16,16,16,1]`, wave32, 128 threads, `WorkGroup=[64,2,1]`, `MIWaveGroup=[4,1]`, `MIWaveTile=[2,6]`, `ThreadTile=[16,6]`. Equivalent custom tuple `(4,1,4,2,6)` (`128=16*4*2`, `96=16*1*6`, `64=16*4`). `LDSB1`, LDS `30336 B`, `LdsPadA/B=8`, `GRVWA/B=8`, `LRVW=16`, `NumLoadsA/B=8/6`, `PGR2`, `PLR0`, `SIA3`, `TransposeLDS1`, `UnrollMajorLDSB=true`, `SourceSwap=true`, `StaggerU=32`, `WorkGroupMapping=8`, `DirectToLds/Vgpr=false`. `VGPR=256`, `SGPR=128`.
+- Interpretation: single-LDS-buffer software pipeline, no direct global->LDS or direct-to-VGPR. 4 waves/block, 256 VGPR -> 6 waves/SIMD (37.5%), deeper K (64 vs 32), narrower N (96 vs 256), higher register pressure than the FP16 winner.
+- ABI pitfall: build any extension against the installed system headers that match the loaded `libhipblaslt.so`. A local-`rocm-libraries` header build produced mismatched `hipblaslt_ext::GemmPreference`/`GemmInputs` layouts, `setMaxWorkspaceBytes` wrote garbage offsets, hipBLASLt rejected the fast solution and fell back to a 26-28 TFLOPS kernel. The chosen solution used 0 MiB of workspace, but the preference still had to be ABI-correct.
+- The wrapper and benches live in `csrc/hipblaslt_kernel_fp16.cu`, `feather_ops/mm_hipblaslt.py`, `bench/benchmark_mm_hipblaslt_fp16.py`, and `cpp_benchmarks/benchmark_mm_hipblaslt_fp16.cpp`.
+- Profiling: single-iteration `rocprofv3` runs are useful for kernel metadata (`vgpr_count`, `sgpr_count`, `lds_size`, `workgroup`), not for timing. Performance is ROCm-version and thermal sensitive, see `benchmark_tracking.md`. The old `32-38 TFLOPS` range is not a constant, and the current session's `25.8` is below the current FP16 kernel's `35-37`.
 
-- Rationale: if C-like source comparison is insufficient, the steady-state loop schedule must be compared at the asm level.
-- Method:
-  - dump/disassemble the selected hipBLASLt kernel and our kernel,
-  - annotate the steady-state loop:
-    - global-read issue order,
-    - local-write timing,
-    - `s_waitcnt` / `s_barrier` placement,
-    - `ds_read_b128` ordering,
-    - WMMA cadence,
-    - pointer-swap / `SourceSwap` / `TransposeLDS` effects,
-    - register and LDS usage,
-  - implement each missing optimization explicitly in our kernel.
-- Decision: do not proceed with another blind source-level experiment if the previous step failed and the asm diff has not been understood.
+### torch.compile
 
-### G4: Layout Branch If The New Kernel Family Needs It
-
-- Rationale: single-config performance is the priority. A better layout is acceptable if it unlocks the hipBLASLt-class schedule.
-- Candidate directions:
-  - kernel-specific B prepack tuned for `128x96x64`,
-  - optional A-side layout/prepack if it simplifies vectorized global->LDS scheduling,
-  - keep 128-bit transport and clean LDS access as hard constraints.
-- Method:
-  - benchmark layout variants only in the native C++ harness,
-  - keep prepack out of the timed region,
-  - compare only within the same harness and layout contract.
-- Decision: keep only if the layout change enables a faster kernel. Do not keep layout churn by itself.
-
-### G5: Reconnect Python And Autotune Only After The Single-Config Gap Is Mostly Closed
-
-- Rationale: autotune and Python overhead obscure the kernel-design problem we are trying to solve.
-- Milestone for switching back:
-  - the native C++ single-config kernel is close enough to the hipBLASLt reference that the remaining gap is small enough to be explained by wrapper/runtime effects rather than kernel design.
-- Until then:
-  - do not spend time on autotune heuristics,
-  - do not use Python-vs-C++ comparisons as evidence of kernel improvement or regression.
+The target is `profile/profile_scaled_mm_torch.py` at `N=8192`:
+- torch.compile decomposes the graph into three kernels: a Triton fp8->fp16 cast (`triton_poi_fused__to_copy_0`), an ATen/rocBLAS/Tensile GEMM (`extern_kernels.mm`), and a Triton fused `mul(scale)+add(bias)` epilogue (`triton_poi_fused__to_copy_add_mul_1`). The cast is not fused into the GEMM. At `8192^3` it moved ~201 MB (fp8 read + fp16 write) in ~0.95 ms in that session, and the separate epilogue was ~1.04 ms. The fused fp8-in-LDS design avoids both passes.
+- CK is not used on gfx1151 by torch.compile: the default GEMM backends are `ATEN,TRITON,CPP`, and the ROCm CK arch list is gfx90a/gfx942/gfx950. The GEMM therefore comes from rocBLAS/Tensile, not Inductor CK.
+- The selected Tensile GEMM then: `MT128x128x32`, `1LDSB1`, `WG32_4_1` (128 threads), 4 waves/block, `17408 B` LDS, `256 VGPR`, `128 SGPR`, 6 waves/SIMD (37.5% occupancy), `PGR1`, `PLR0`, `SIA3`, `SU32/SUS256`, `WSGRA1/WSGRB1`, `LRVW16`, `WGM8`, grid `(8192,64,1)`. Its GEMM time was ~40.2 ms at `8192^3` in that session. The symbol begins `Cijk_Ailk_Bljk_HHS_BH_MT128x128x32_MI16x16x16x1_SN_...`.
+- Matching tile/workgroup geometry alone was not enough: the remaining difference was fine-grained pipeline/dataflow scheduling (`PGR/PLR`, `SIA`, stagger-U, wave-separated global reads), not occupancy. That is the lesson to carry to any future library comparison.
+- Token decoding (Tensile naming): `MT` macro tile, `MI` matrix instruction, `WG` workgroup, `TT` thread tile, `LDSB` LDS-buffer count, `PGR/PLR` global/local-read prefetch, `GRVW/GLVW` global-read vector width, `LRVW` local-read vector width, `LPA/LPB/LBSPP` LDS padding, `SIA` schedule iteration algorithm, `SU/SUS` stagger-U, `TLDS/UMLDS` transpose/unroll-major LDS, `WSGR` wave-separated global read, `WGM` workgroup mapping, `ISA` target. Parameter semantics: `~/rocm-libraries/shared/tensile/docs/src/conceptual/kernel-parameters.rst`, `Tensile/Common.py`, `Tensile/SolutionStructs.py`. Scheduling: `KernelWriter.py`. Stagger-U: `KernelWriterAssembly.py`.
+- Thread tracing of that Tensile kernel: the global pipeline was fully interlocked and the fp8->fp16 tax was zero inside the loop (the cast was a previous kernel), but ~35% of the math loop went to LDS reads and pointer arithmetic, leaving WMMA active ~65%. With 256 VGPR and 37.5% occupancy there was less latency-hiding headroom than the 8-wave FP16 kernel. That is the mechanism behind a well-tuned library GEMM losing to the fused custom kernel, and it is why the cast + separate epilogue are not automatically a better trade.
